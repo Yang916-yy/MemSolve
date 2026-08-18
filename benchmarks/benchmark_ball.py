@@ -1,0 +1,294 @@
+"""Full-mixer timings for MemSolve, FlashAttention, and official Vim BiMamba-v2.
+
+The direct baseline reuses timm.layers.Attention without normalization or gates:
+https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/attention.py
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import nullcontext
+from importlib import import_module
+import statistics
+import time
+
+import torch
+import torch.nn as nn
+
+from memsolve import CoreMode, MemSolve, MemSolveConfig
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Benchmark complete MemSolve, FlashAttention, or BiMamba mixers on one CUDA device."
+    )
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--length", type=int, default=512)
+    parser.add_argument("--dim", type=int, default=192)
+    parser.add_argument("--heads", type=int, default=3)
+    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="equilibrium")
+    parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--graph", action="store_true", help="Capture a complete gradient-accumulation cycle.")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="Microbatches per parameter-gradient reset.",
+    )
+    parser.add_argument("--operator", choices=("memsolve", "flashattention", "bimamba"), default="memsolve")
+    parser.add_argument(
+        "--bimamba-module", default="mamba_ssm.modules.mamba_simple",
+        help="Module containing Vim's official BiMamba-v2 Mamba class.",
+    )
+    parser.add_argument("--sdpa-backend", choices=("auto", "flash"), default="auto")
+    parser.add_argument("--profile", action="store_true", help="Print one step's CUDA kernels after timing.")
+    parser.add_argument("--mode", choices=("forward", "train"), default="train")
+    parser.add_argument(
+        "--implementation",
+        choices=("reference", "cuda"),
+        default="cuda",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default="bfloat16",
+    )
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
+
+
+def _dtype(name: str) -> torch.dtype:
+    return {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[name]
+
+
+class _BenchmarkMixer(nn.Module):
+    """Present the three mixers through one tensor-only benchmark surface."""
+
+    def __init__(
+        self,
+        mixer: nn.Module,
+        *,
+        operator: str,
+        implementation: str,
+    ) -> None:
+        super().__init__()
+        self.mixer = mixer
+        self.operator = operator
+        self.implementation = implementation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.operator == "memsolve":
+            assert isinstance(self.mixer, MemSolve)
+            return self.mixer(
+                x,
+                implementation=self.implementation,
+            )
+        return self.mixer(x)
+
+
+def run(args: argparse.Namespace) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("the benchmark requires a CUDA device")
+    if args.steps <= 0 or args.warmup < 0 or args.repeats <= 0:
+        raise ValueError("warmup must be nonnegative; steps and repeats must be positive")
+    if args.grad_accum <= 0:
+        raise ValueError("grad_accum must be positive")
+    if args.steps % args.grad_accum:
+        raise ValueError("steps must be divisible by grad_accum")
+    if args.graph and args.operator == "memsolve" and args.implementation != "cuda":
+        raise ValueError("MemSolve graph benchmarking requires implementation=cuda")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    dtype = _dtype(args.dtype)
+    torch.backends.cuda.matmul.fp32_precision = "tf32" if args.tf32 else "ieee"
+    torch.backends.cudnn.fp32_precision = "tf32" if args.tf32 else "ieee"
+    if args.operator == "memsolve":
+        mixer: nn.Module = MemSolve(
+            MemSolveConfig(
+                dim=args.dim,
+                num_heads=args.heads,
+                rank=args.rank,
+                core_mode=args.core_mode,
+                bias=args.bias,
+            )
+        ).to(device)
+    elif args.operator == "flashattention":
+        # Reuse timm's batch-first packed QKV -> SDPA -> output projection.
+        from timm.layers import Attention
+
+        mixer = Attention(
+            args.dim, num_heads=args.heads, qkv_bias=args.bias,
+            proj_bias=args.bias, attn_drop=0.0, proj_drop=0.0,
+        ).to(device)
+        mixer.fused_attn = True
+    else:
+        Mamba = import_module(args.bimamba_module).Mamba
+        mixer = Mamba(
+            args.dim, d_state=16, d_conv=4, expand=2,
+            bimamba_type="v2", if_divide_out=True, use_fast_path=True,
+            bias=args.bias,
+        ).to(device)
+    layer = _BenchmarkMixer(
+        mixer,
+        operator=args.operator,
+        implementation=args.implementation,
+    )
+    if args.mode == "forward":
+        layer.eval()
+    else:
+        layer.train()
+    x = torch.randn(
+        args.batch,
+        args.length,
+        args.dim,
+        device=device,
+        dtype=dtype,
+    )
+    if args.mode == "train":
+        x.requires_grad_(True)
+    if args.operator == "memsolve" and args.implementation == "cuda":
+        from memsolve.ball import cuda
+
+        cuda.load(device=device)
+
+    def step() -> None:
+        if args.mode == "forward":
+            with torch.inference_mode():
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=dtype,
+                    enabled=dtype is not torch.float32,
+                ):
+                    layer(x)
+            return
+        with torch.autocast(
+            device_type="cuda",
+            dtype=dtype,
+            enabled=dtype is not torch.float32,
+        ):
+            (layer(x).float().square().mean() / args.grad_accum).backward()
+
+    def clear_parameter_gradients() -> None:
+        layer.zero_grad(set_to_none=True)
+
+    def clear_input_gradient() -> None:
+        if x.grad is not None:
+            x.grad = None
+
+    clear_parameter_gradients()
+    for step_index in range(args.warmup):
+        clear_input_gradient()
+        step()
+        if (step_index + 1) % args.grad_accum == 0:
+            clear_parameter_gradients()
+    clear_parameter_gradients()
+    clear_input_gradient()
+    torch.cuda.synchronize()
+
+    # Graph replay reuses its private pool without allocator calls. Reset before
+    # capture so the reported peak includes training intermediates allocated
+    # during capture, rather than only tensors still live after capture.
+    torch.cuda.reset_peak_memory_stats()
+    graph = None
+    if args.graph:
+        def cycle() -> None:
+            clear_parameter_gradients()
+            for _ in range(args.grad_accum):
+                clear_input_gradient()
+                step()
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                cycle()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            cycle()
+        for _ in range(args.warmup):
+            graph.replay()
+        torch.cuda.synchronize()
+
+    samples: list[float] = []
+    gpu_samples: list[float] = []
+    for _ in range(args.repeats):
+        if graph is None:
+            clear_parameter_gradients()
+            clear_input_gradient()
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        start = time.perf_counter()
+        for step_index in range(args.steps):
+            if graph is not None:
+                if step_index % args.grad_accum == 0:
+                    graph.replay()
+                continue
+            clear_input_gradient()
+            step()
+            if (step_index + 1) % args.grad_accum == 0:
+                clear_parameter_gradients()
+        end_event.record()
+        torch.cuda.synchronize()
+        samples.append(1000.0 * (time.perf_counter() - start) / args.steps)
+        gpu_samples.append(start_event.elapsed_time(end_event) / args.steps)
+
+    properties = torch.cuda.get_device_properties(device)
+    implementation = {
+        "memsolve": args.implementation,
+        "flashattention": "timm_flash_sdpa",
+        "bimamba": "vim_bimamba_v2_fused",
+    }[args.operator]
+    rank = str(args.rank) if args.operator == "memsolve" else "na"
+    position = "external"
+    core_mode = args.core_mode if args.operator == "memsolve" else "na"
+    print(
+        f"device={properties.name} sm={properties.major}.{properties.minor} "
+        f"torch={torch.__version__} cuda={torch.version.cuda} "
+        f"operator={args.operator} implementation={implementation} mode={args.mode} core_mode={core_mode} "
+        f"dtype={args.dtype} tf32={args.tf32} graph={args.graph} bias={args.bias} "
+        f"sdpa_backend={args.sdpa_backend} "
+        f"batch={args.batch} grad_accum={args.grad_accum} length={args.length} "
+        f"dim={args.dim} heads={args.heads} rank={rank} position={position} "
+        f"parameters={sum(p.numel() for p in layer.parameters())} "
+        f"median_ms={statistics.median(samples):.3f} "
+        f"median_gpu_ms={statistics.median(gpu_samples):.3f} "
+        f"min_ms={min(samples):.3f} max_ms={max(samples):.3f} "
+        f"peak_allocated_mib={torch.cuda.max_memory_allocated() / 2**20:.2f}"
+    )
+    if args.profile:
+        clear_parameter_gradients()
+        clear_input_gradient()
+        with torch.profiler.profile(activities=[
+            torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
+        ]) as prof:
+            step()
+            torch.cuda.synchronize()
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+        kernels = sorted({event.name for event in prof.events()
+                          if event.device_type == torch.autograd.DeviceType.CUDA})
+        print(f"cuda_kernels={kernels}")
+
+
+def main() -> None:
+    args = parse_args()
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    if args.operator == "flashattention":
+        args.sdpa_backend = "flash"
+    backend = sdpa_kernel(SDPBackend.FLASH_ATTENTION) if args.sdpa_backend == "flash" else nullcontext()
+    with backend:
+        run(args)
+
+
+if __name__ == "__main__":
+    main()

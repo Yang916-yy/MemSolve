@@ -1,4 +1,4 @@
-"""Distributed ImageNet-1K training with the official DeiT III recipes.
+"""Distributed ImageNet-1K training with the plain ViT³-derived recipes.
 
 The model itself intentionally lives outside this entrypoint.  The runner calls
 ``integrations.timm.create_lsso_deit3`` so classification, detection, and
@@ -41,14 +41,14 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "experiments" / "configs" / "imagenet_deit3.toml"
+DEFAULT_CONFIG = ROOT / "experiments" / "configs" / "imagenet_vit3.toml"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-OFFICIAL_DEIT3_URL = (
-    "https://github.com/facebookresearch/deit/blob/"
-    "7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md"
+OFFICIAL_VIT3_URL = (
+    "https://github.com/LeapLabTHU/ViTTT/tree/"
+    "e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt"
 )
-IMAGENET_CHECKPOINT_FORMAT = 5
+IMAGENET_CHECKPOINT_FORMAT = 7
 IMAGENET_WDS_SOURCE = "timm/imagenet-1k-wds"
 IMAGENET_WDS_MANIFEST_SHA256 = (
     "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f"
@@ -205,7 +205,7 @@ class ImageNetRun:
             "operator": self.operator,
             "train": self.train,
             "overrides": list(self.overrides),
-            "official_deit3_recipe": OFFICIAL_DEIT3_URL,
+            "official_vit3_recipe": OFFICIAL_VIT3_URL,
             "batching": batching_plan.as_dict(),
             "data": dict(data_contract),
             "checkpoint_contract_digest": self.checkpoint_contract_digest(
@@ -215,58 +215,15 @@ class ImageNetRun:
         }
 
 
-class _GaussianBlur:
-    def __init__(self, *, probability: float = 1.0, radius_min: float = 0.1, radius_max: float = 2.0) -> None:
-        self.probability = probability
-        self.radius_min = radius_min
-        self.radius_max = radius_max
-
-    def __call__(self, image: Any) -> Any:
-        from PIL import ImageFilter
-
-        if random.random() > self.probability:
-            return image
-        return image.filter(
-            ImageFilter.GaussianBlur(
-                radius=random.uniform(self.radius_min, self.radius_max)
-            )
-        )
-
-
-class _Solarization:
-    def __init__(self, *, probability: float = 1.0) -> None:
-        self.probability = probability
-
-    def __call__(self, image: Any) -> Any:
-        from PIL import ImageOps
-
-        if random.random() < self.probability:
-            return ImageOps.solarize(image)
-        return image
-
-
-class _GrayScale:
-    def __init__(self, *, probability: float = 1.0) -> None:
-        from torchvision import transforms
-
-        self.probability = probability
-        self.transform = transforms.Grayscale(num_output_channels=3)
-
-    def __call__(self, image: Any) -> Any:
-        if random.random() < self.probability:
-            return self.transform(image)
-        return image
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train LSSO DeiT III S/B/L on ImageNet-1K with torchrun."
+        description="Train LSSO with plain ViT³ T/S/B recipes on ImageNet-1K with torchrun."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--tier", choices=("small", "base", "large"), required=True)
+    parser.add_argument("--tier", choices=("tiny", "small", "base"), required=True)
     parser.add_argument(
         "--phase",
-        choices=("pretrain", "finetune_224"),
+        choices=("pretrain",),
         default="pretrain",
     )
     parser.add_argument(
@@ -288,16 +245,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--resume",
         type=Path,
         help="Resume an epoch-boundary checkpoint with its captured RNG state.",
-    )
-    parser.add_argument(
-        "--init-checkpoint",
-        type=Path,
-        help="Required 192px pretraining checkpoint for B/L 224px fine-tuning.",
-    )
-    parser.add_argument(
-        "--allow-lamb-fallback",
-        action="store_true",
-        help="Use timm's non-fused LAMB only when Apex FusedLAMB is unavailable.",
     )
     parser.add_argument(
         "--epochs",
@@ -401,6 +348,8 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         "mlp_ratio": defaults["mlp_ratio"],
         "layer_scale_init_value": defaults["layer_scale_init_value"],
         "norm_eps": defaults["norm_eps"],
+        "drop_path_schedule": "linear",
+        "position_encoding": defaults["position_encoding"],
         **tier_values,
     }
     train = {**defaults, **phase_values}
@@ -425,10 +374,6 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         overrides.append("implementation")
 
     _validate_run(args.tier, args.phase, model, operator, train)
-    if args.phase == "finetune_224" and args.init_checkpoint is None and args.resume is None:
-        raise ValueError("--phase finetune_224 requires --init-checkpoint on a new run")
-    if args.resume is not None and args.init_checkpoint is not None:
-        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.eval and args.resume is None:
         raise ValueError("--eval requires --resume")
 
@@ -493,7 +438,7 @@ def _validate_run(
             "mixup_switch_prob",
             "mixup_mode",
             "ema",
-            "ema_decay",
+            "clip_grad",
             "amp_dtype",
             "save_every",
             "optimizer",
@@ -553,37 +498,29 @@ def _validate_run(
     _probability(train["mixup_prob"], "mixup_prob")
     _probability(train["mixup_switch_prob"], "mixup_switch_prob")
     _probability(train["label_smoothing"], "label_smoothing")
-    _probability(train["ema_decay"], "ema_decay")
+    _positive_float(train["clip_grad"], "clip_grad")
     if train["mixup_mode"] != "batch":
-        raise ValueError("the published DeiT III recipes use batch-mode Mixup/CutMix")
-    if train["amp_dtype"] != "float16":
-        raise ValueError("the CUDA LSSO path requires train.amp_dtype = 'float16'")
-    if train["optimizer"] not in {"fusedlamb", "adamw"}:
-        raise ValueError("optimizer must be 'fusedlamb' or 'adamw'")
-    if train["augmentation"] not in {"three_augment", "rand_augment"}:
-        raise ValueError("augmentation must be 'three_augment' or 'rand_augment'")
-    if not isinstance(train["repeated_aug"], bool):
-        raise ValueError("repeated_aug must be boolean")
-    if not isinstance(train["bce_loss"], bool):
-        raise ValueError("bce_loss must be boolean")
-    if not isinstance(train["ema"], bool) or train["ema"] is not True:
-        raise ValueError("the published DeiT III recipe requires EMA")
+        raise ValueError("the plain ViT³ recipes use batch-mode Mixup/CutMix")
+    if train["amp_dtype"] != "bfloat16":
+        raise ValueError("the current ImageNet contract requires train.amp_dtype = 'bfloat16'")
+    if train["optimizer"] != "fused_adamw":
+        raise ValueError("the current ImageNet recipe uses fused AdamW")
+    if train["augmentation"] != "rand_augment":
+        raise ValueError("plain ViT³ uses RandAugment")
+    for key in ("repeated_aug", "bce_loss", "ema"):
+        if train[key] is not False:
+            raise ValueError(f"plain ViT³ requires {key} = false")
 
     expected = {
         "small": (384, 12, 6, 32),
         "base": (768, 12, 12, 48),
-        "large": (1024, 24, 16, 64),
+        "tiny": (192, 12, 6, 16),
     }[tier]
     actual = (model["embed_dim"], model["depth"], model["num_heads"], model["rank"])
     if actual != expected:
         raise ValueError(f"{tier} geometry must be {expected}, got {actual}")
-    if phase == "pretrain" and train["optimizer"] != "fusedlamb":
-        raise ValueError("the 800-epoch pretraining phase requires FusedLAMB")
-    if phase == "finetune_224":
-        if tier == "small":
-            raise ValueError("DeiT III does not define a 224px fine-tuning phase for small")
-        if model["image_size"] != 224 or train["optimizer"] != "adamw":
-            raise ValueError("the B/L 224px fine-tuning phase requires 224px AdamW")
+    if phase != "pretrain" or image_size != 224:
+        raise ValueError("plain ViT³ trains at 224px in a single pretraining phase")
 
 
 def _validate_batching_contract(value: object) -> None:
@@ -880,42 +817,9 @@ def _restore_resume_rng_state(
         raise ValueError("resume checkpoint has an invalid RNG state") from error
 
 
-def build_three_augment(image_size: int, color_jitter: float) -> Any:
-    """Reproduce DeiT III's public ``augment.py`` 3-Augment transform."""
-
-    from torchvision import transforms
-    from torchvision.transforms import InterpolationMode
-
-    transforms_list: list[Any] = [
-        transforms.RandomResizedCrop(
-            image_size,
-            scale=(0.08, 1.0),
-            interpolation=InterpolationMode.BICUBIC,
-        ),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomChoice(
-            [_GrayScale(), _Solarization(), _GaussianBlur()]
-        ),
-    ]
-    if color_jitter > 0:
-        transforms_list.append(
-            transforms.ColorJitter(color_jitter, color_jitter, color_jitter)
-        )
-    transforms_list.extend(
-        (
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        )
-    )
-    return transforms.Compose(transforms_list)
-
-
 def build_train_transform(run: ImageNetRun) -> Any:
     train = run.train
     image_size = int(run.model["image_size"])
-    if train["augmentation"] == "three_augment":
-        return build_three_augment(image_size, float(train["color_jitter"]))
-
     from timm.data import create_transform
 
     return create_transform(
@@ -1780,6 +1684,8 @@ def build_model(run: ImageNetRun) -> nn.Module:
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
         drop_path_rate=float(model["drop_path_rate"]),
+        drop_path_schedule=str(model["drop_path_schedule"]),
+        position_encoding=str(model["position_encoding"]),
         layer_scale_init_value=float(model["layer_scale_init_value"]),
         norm_eps=float(model["norm_eps"]),
         no_embed_class=True,
@@ -1814,7 +1720,7 @@ def interpolate_position_embedding(
     source: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
-    """Bicubically resize a learned 2D patch table for DeiT III fine-tuning."""
+    """Bicubically resize a learned 2D patch table for downstream checkpoint transfer."""
 
     if source.ndim != 3 or target.ndim != 3 or source.shape[0] != target.shape[0]:
         raise ValueError("position embeddings must have shape [batch, tokens, channels]")
@@ -1842,65 +1748,6 @@ def interpolate_position_embedding(
     )
     result = torch.cat((extra.float(), patch), dim=1).to(dtype=target.dtype)
     return result
-
-
-def load_finetune_checkpoint(model: nn.Module, path: Path, run: ImageNetRun) -> None:
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict):
-        raise ValueError("fine-tuning checkpoint must be a mapping")
-    checkpoint_contract = validate_checkpoint_contract(checkpoint)
-    source_tier = checkpoint_contract["tier"]
-    if source_tier != run.tier:
-        raise ValueError(
-            f"fine-tuning checkpoint tier is {source_tier!r}, expected {run.tier!r}"
-        )
-    if checkpoint_contract["phase"] != "pretrain":
-        raise ValueError("fine-tuning checkpoint must originate from ImageNet pretraining")
-    source_model = checkpoint_contract["model"]
-    if not isinstance(source_model, dict) or not isinstance(
-        checkpoint_contract["operator"], dict
-    ):
-        raise ValueError("fine-tuning checkpoint has an invalid ImageNet model contract")
-    shared_model_keys = (
-        "patch_size",
-        "num_classes",
-        "mlp_ratio",
-        "layer_scale_init_value",
-        "norm_eps",
-        "embed_dim",
-        "depth",
-        "num_heads",
-        "rank",
-        "drop_path_rate",
-    )
-    if any(source_model.get(key) != run.model.get(key) for key in shared_model_keys):
-        raise ValueError("fine-tuning checkpoint model contract does not match the run")
-    if checkpoint_contract["operator"] != run.operator:
-        raise ValueError("fine-tuning checkpoint operator contract does not match the run")
-    source = _checkpoint_model_state(checkpoint)
-    destination = model.state_dict()
-    source_position_key = _position_embedding_key(source)
-    destination_position_key = _position_embedding_key(destination)
-    if source_position_key is not None and destination_position_key is not None:
-        if source[source_position_key].shape != destination[destination_position_key].shape:
-            source[source_position_key] = interpolate_position_embedding(
-                source[source_position_key], destination[destination_position_key]
-            )
-    incompatible = model.load_state_dict(source, strict=False)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise ValueError(
-            "fine-tuning checkpoint does not match the current model: "
-            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
-        )
-
-
-def _position_embedding_key(state: Mapping[str, Any]) -> str | None:
-    keys = [key for key in state if key == "pos_embed" or key.endswith(".pos_embed")]
-    if not keys:
-        return None
-    if len(keys) != 1:
-        raise ValueError(f"model has ambiguous learned position embeddings: {keys}")
-    return keys[0]
 
 
 def _no_weight_decay(model: nn.Module) -> set[str]:
@@ -1935,74 +1782,38 @@ def _no_weight_decay(model: nn.Module) -> set[str]:
     return resolved
 
 
-def build_optimizer(
-    model: nn.Module,
-    run: ImageNetRun,
-    *,
-    allow_lamb_fallback: bool,
-) -> tuple[torch.optim.Optimizer, str]:
-    from timm.optim import Lamb, param_groups_weight_decay
+def build_optimizer(model: nn.Module, run: ImageNetRun) -> tuple[torch.optim.Optimizer, str]:
+    from timm.optim import param_groups_weight_decay
 
     groups = param_groups_weight_decay(
-        model,
-        weight_decay=float(run.train["weight_decay"]),
+        model, weight_decay=float(run.train["weight_decay"]),
         no_weight_decay_list=_no_weight_decay(model),
     )
-    lr = float(run.train["lr"])
-    if run.train["optimizer"] == "adamw":
-        return (
-            torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.999), eps=1.0e-8),
-            "torch.adamw",
-        )
-
-    try:
-        from apex.optimizers import FusedLAMB
-
-        return (
-            FusedLAMB(
-                groups,
-                lr=lr,
-                betas=(0.9, 0.999),
-                eps=1.0e-8,
-                adam_w_mode=True,
-            ),
-            "apex.fused_lamb",
-        )
-    except ImportError as error:
-        if not allow_lamb_fallback:
-            raise RuntimeError(
-                "the canonical DeiT III pretraining recipe requires Apex FusedLAMB; "
-                "install Apex or pass --allow-lamb-fallback to record a non-fused LAMB run"
-            ) from error
-        return (
-            Lamb(
-                groups,
-                lr=lr,
-                betas=(0.9, 0.999),
-                eps=1.0e-6,
-                max_grad_norm=1.0,
-            ),
-            "timm.lamb (explicit fallback)",
-        )
+    return (
+        torch.optim.AdamW(groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8, fused=True),
+        "torch.adamw.fused",
+    )
 
 
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     run: ImageNetRun,
+    updates_per_epoch: int,
 ) -> Any:
+    _positive_int(updates_per_epoch, "updates_per_epoch")
     from timm.scheduler import CosineLRScheduler
 
     return CosineLRScheduler(
         optimizer,
-        t_initial=int(run.train["epochs"]),
+        t_initial=int(run.train["epochs"]) * updates_per_epoch,
         lr_min=float(run.train["min_lr"]),
         cycle_mul=1.0,
         cycle_decay=1.0,
         cycle_limit=1,
-        warmup_t=int(run.train["warmup_epochs"]),
+        warmup_t=int(run.train["warmup_epochs"]) * updates_per_epoch,
         warmup_lr_init=float(run.train["warmup_lr"]),
         warmup_prefix=False,
-        t_in_epochs=True,
+        t_in_epochs=False,
     )
 
 
@@ -2026,8 +1837,6 @@ def build_mixup_and_loss(run: ImageNetRun) -> tuple[Any | None, nn.Module]:
             label_smoothing=float(run.train["label_smoothing"]),
             num_classes=int(run.model["num_classes"]),
         )
-    if bool(run.train["bce_loss"]):
-        return mixup, nn.BCEWithLogitsLoss()
     if mixup_active:
         return mixup, SoftTargetCrossEntropy()
     if float(run.train["label_smoothing"]) > 0:
@@ -2063,41 +1872,8 @@ def apply_virtual_group_mixup(
     return images, torch.cat(mixed_targets, dim=0)
 
 
-def build_ema(model: nn.Module, run: ImageNetRun) -> Any:
-    from timm.utils import ModelEma
-
-    return ModelEma(model, decay=float(run.train["ema_decay"]), device="", resume="")
-
-
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DistributedDataParallel) else model
-
-
-def update_ema(ema: Any, model: nn.Module) -> None:
-    """Update timm EMA while preserving immutable non-tensor state-dict entries."""
-
-    if not hasattr(ema, "ema") or not hasattr(ema, "decay"):
-        ema.update(model)
-        return
-
-    source_state = _unwrap_model(model).state_dict()
-    ema_state = ema.ema.state_dict()
-    if source_state.keys() != ema_state.keys():
-        raise RuntimeError("EMA model state does not match the training model")
-    with torch.no_grad():
-        for key, ema_value in ema_state.items():
-            source_value = source_state[key]
-            if not isinstance(ema_value, torch.Tensor):
-                if ema_value != source_value:
-                    raise RuntimeError(f"EMA non-tensor state differs at {key!r}")
-                continue
-            if not isinstance(source_value, torch.Tensor):
-                raise RuntimeError(f"EMA tensor state differs in type at {key!r}")
-            source_value = source_value.detach()
-            device = getattr(ema, "device", "")
-            if device:
-                source_value = source_value.to(device=device)
-            ema_value.copy_(ema_value * ema.decay + source_value * (1.0 - ema.decay))
 
 
 def _reduce_metrics(
@@ -2118,7 +1894,7 @@ def _reduce_metrics(
 
 
 def _autocast() -> Any:
-    return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
@@ -2136,9 +1912,8 @@ def train_epoch(
     epoch_controller: Any,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
     mixup: Any | None,
-    ema: Any,
+    scheduler: Any,
     *,
     epoch: int,
     state: DistributedState,
@@ -2170,8 +1945,6 @@ def train_epoch(
                 mixup,
                 batching_plan.augmentation_group_size,
             )
-        if bool(run.train["bce_loss"]):
-            targets = targets.gt(0.0).to(dtype=targets.dtype)
 
         update_boundary = (step + 1) % batching_plan.grad_accum == 0
         sync_context = nullcontext()
@@ -2185,12 +1958,13 @@ def train_epoch(
                 data_loss = criterion(logits, targets)
                 loss = data_loss / batching_plan.grad_accum
             _assert_finite_loss(data_loss, epoch=epoch, step=step)
-            scaler.scale(loss).backward()
+            loss.backward()
         if update_boundary:
-            scaler.step(optimizer)
-            scaler.update()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(run.train["clip_grad"]))
+            optimizer.step()
             model.zero_grad(set_to_none=True)
-            update_ema(ema, model)
+            # Match upstream zero-based update indexing, once per accumulated batch.
+            scheduler.step_update(epoch * batching_plan.updates_per_epoch + optimizer_updates)
             optimizer_updates += 1
 
         batch = images.shape[0]
@@ -2320,7 +2094,6 @@ def _record_runtime_metadata(
     resolved_optimizer: str,
     run: ImageNetRun,
     batching_plan: BatchingPlan,
-    allow_lamb_fallback: bool,
 ) -> None:
     path = output / "metadata.json"
     metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -2328,12 +2101,10 @@ def _record_runtime_metadata(
         raise ValueError("metadata.json must contain an object")
     metadata["model"] = {"trainable_parameters": parameter_count}
     metadata["optimizer_resolved"] = resolved_optimizer
-    metadata["lamb_fallback_permitted"] = allow_lamb_fallback
     metadata["recipe_fidelity"] = _recipe_fidelity(
         run,
         batching_plan=batching_plan,
         resolved_optimizer=resolved_optimizer,
-        allow_lamb_fallback=allow_lamb_fallback,
     )
     _atomic_json(path, metadata)
 
@@ -2343,7 +2114,6 @@ def _recipe_fidelity(
     *,
     batching_plan: BatchingPlan,
     resolved_optimizer: str,
-    allow_lamb_fallback: bool,
 ) -> str:
     non_semantic_overrides = {
         "batch_size",
@@ -2352,18 +2122,28 @@ def _recipe_fidelity(
         "val_workers",
         "save_every",
     }
+    # A custom TOML can alter hyperparameters without creating CLI overrides.
+    with DEFAULT_CONFIG.open("rb") as handle:
+        canonical = tomllib.load(handle)
+    canonical_train = {
+        **canonical["defaults"],
+        **canonical["tiers"][run.tier][run.phase],
+    }
+    canonical_train.pop("input_size")
+    matches_recipe = all(
+        run.train.get(key) == value
+        for key, value in canonical_train.items()
+        if key not in non_semantic_overrides
+    )
     if (
-        not (set(run.overrides) - non_semantic_overrides)
-        and not allow_lamb_fallback
+        matches_recipe
+        and not (set(run.overrides) - non_semantic_overrides)
         and batching_plan.effective_batch_size == int(run.train["effective_batch"])
         and batching_plan.augmentation_group_size
         == int(run.train["augmentation_group_size"])
-        and (
-            resolved_optimizer == "apex.fused_lamb"
-            or run.train["optimizer"] == "adamw"
-        )
+        and resolved_optimizer == "torch.adamw.fused"
     ):
-        return "deit3-derived"
+        return "vit3-derived"
     return "explicitly-modified"
 
 
@@ -2427,10 +2207,8 @@ def _checkpoint(
     *,
     epoch: int,
     model: nn.Module,
-    ema: Any,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
-    scaler: torch.amp.GradScaler,
     run: ImageNetRun,
     batching_plan: BatchingPlan,
     data_contract: Mapping[str, Any],
@@ -2445,10 +2223,8 @@ def _checkpoint(
         "contract": contract,
         "contract_digest": checkpoint_contract_digest(contract),
         "model": _unwrap_model(model).state_dict(),
-        "model_ema": ema.ema.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(),
         "rng": dict(rng),
     }
 
@@ -2457,10 +2233,8 @@ def _load_resume(
     path: Path,
     *,
     model: nn.Module,
-    ema: Any,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
-    scaler: torch.amp.GradScaler,
     run: ImageNetRun,
     batching_plan: BatchingPlan,
     data_contract: Mapping[str, Any],
@@ -2478,11 +2252,7 @@ def _load_resume(
     rng_state = checkpoint.get("rng")
     _resume_rng_state_for_rank(rng_state, state=state)
     _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint), strict=True)
-    ema_state = checkpoint.get("model_ema")
-    if not isinstance(ema_state, dict):
-        raise ValueError("resume checkpoint is missing model_ema")
-    ema.ema.load_state_dict(ema_state, strict=True)
-    for key, owner in (("optimizer", optimizer), ("scheduler", scheduler), ("scaler", scaler)):
+    for key, owner in (("optimizer", optimizer), ("scheduler", scheduler)):
         serialized_state = checkpoint.get(key)
         if not isinstance(serialized_state, dict):
             raise ValueError(f"resume checkpoint is missing {key}")
@@ -2520,10 +2290,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             requested_grad_accum=args.grad_accum,
         )
         model = build_model(run)
-        if args.init_checkpoint is not None:
-            load_finetune_checkpoint(model, args.init_checkpoint, run)
         model.to(state.device)
-        ema = build_ema(model, run)
         model_without_ddp = model
         if state.enabled:
             model = DistributedDataParallel(model, device_ids=[state.local_rank])
@@ -2531,10 +2298,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         optimizer, resolved_optimizer = build_optimizer(
             model_without_ddp,
             run,
-            allow_lamb_fallback=args.allow_lamb_fallback,
         )
-        scheduler = build_scheduler(optimizer, run)
-        scaler = torch.amp.GradScaler("cuda")
+        scheduler = build_scheduler(optimizer, run, batching_plan.updates_per_epoch)
         mixup, criterion = build_mixup_and_loss(run)
         criterion.to(state.device)
         start_epoch = 0
@@ -2543,18 +2308,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             start_epoch, best_acc1 = _load_resume(
                 args.resume,
                 model=model,
-                ema=ema,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                scaler=scaler,
                 run=run,
                 batching_plan=batching_plan,
                 data_contract=data_contract,
                 state=state,
                 generators=generators,
             )
-            # This matches the public DeiT entrypoint after restoring scheduler state.
-            scheduler.step(start_epoch)
 
         output = _prepare_output(
             args.output,
@@ -2574,7 +2335,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 resolved_optimizer=resolved_optimizer,
                 run=run,
                 batching_plan=batching_plan,
-                allow_lamb_fallback=args.allow_lamb_fallback,
             )
             print(
                 json.dumps(
@@ -2624,18 +2384,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 train_dataset,
                 criterion,
                 optimizer,
-                scaler,
                 mixup,
-                ema,
+                scheduler,
                 epoch=epoch,
                 state=state,
                 run=run,
                 batching_plan=batching_plan,
                 print_freq=args.print_freq,
             )
-            # timm's epoch scheduler receives the next epoch at the end of
-            # this one. The constructor already provides epoch zero's 1e-6 LR.
-            scheduler.step(epoch + 1)
             val_loss, val_acc1, val_acc5 = evaluate(model, val_loader, state=state)
             record = {
                 "event": "epoch",
@@ -2674,10 +2430,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         checkpoint = _checkpoint(
                             epoch=epoch,
                             model=model,
-                            ema=ema,
                             optimizer=optimizer,
                             scheduler=scheduler,
-                            scaler=scaler,
                             run=run,
                             batching_plan=batching_plan,
                             data_contract=data_contract,

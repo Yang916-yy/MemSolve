@@ -31,18 +31,14 @@ from experiments.imagenet import (
     _recipe_fidelity,
     _restore_resume_rng_state,
     apply_virtual_group_mixup,
-    build_ema,
     build_loaders,
     build_optimizer,
     build_scheduler,
     checkpoint_contract_digest,
-    interpolate_position_embedding,
-    load_finetune_checkpoint,
     load_run,
     parse_args,
     resolve_batching_plan,
     train_epoch,
-    update_ema,
 )
 
 
@@ -91,15 +87,15 @@ def _checkpoint_batching_plan() -> BatchingPlan:
     return BatchingPlan(
         world_size=1,
         physical_batch_size=256,
-        effective_batch_size=2048,
-        augmentation_group_size=256,
-        grad_accum=8,
-        samples_per_epoch=1_280_000,
-        updates_per_epoch=625,
+        effective_batch_size=1024,
+        augmentation_group_size=128,
+        grad_accum=4,
+        samples_per_epoch=1_281_024,
+        updates_per_epoch=1251,
     )
 
 
-def _data_contract(*, source_views: int = 3) -> dict[str, object]:
+def _data_contract(*, source_views: int = 1) -> dict[str, object]:
     return {
         "format": "webdataset-v1",
         "source": imagenet.IMAGENET_WDS_SOURCE,
@@ -236,7 +232,7 @@ def _worker_random_loader(generator: torch.Generator) -> DataLoader[torch.Tensor
     )
 
 
-def test_small_recipe_preserves_deit3_geometry_and_800_epoch_contract(tmp_path: Path) -> None:
+def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
     run = load_run(_args(tmp_path))
     assert run.model == {
         "image_size": 224,
@@ -249,19 +245,22 @@ def test_small_recipe_preserves_deit3_geometry_and_800_epoch_contract(tmp_path: 
         "depth": 12,
         "num_heads": 6,
         "rank": 32,
-        "drop_path_rate": 0.05,
+        "drop_path_rate": 0.1,
+        "drop_path_schedule": "linear",
+        "position_encoding": "cpe",
     }
     assert (run.train["epochs"], run.train["optimizer"], run.train["augmentation"]) == (
-        800,
-        "fusedlamb",
-        "three_augment",
+        300,
+        "fused_adamw",
+        "rand_augment",
     )
-    assert run.train["repeated_aug"] and run.train["bce_loss"]
+    assert not any(run.train[k] for k in ("repeated_aug", "bce_loss", "ema"))
+    assert run.train["amp_dtype"] == "bfloat16"
     assert (
         run.train["batch_size"],
         run.train["effective_batch"],
         run.train["augmentation_group_size"],
-    ) == (256, 2048, 256)
+    ) == (512, 1024, 128)
     assert (run.train["train_workers"], run.train["val_workers"]) == (10, 4)
     assert run.operator == {
         "core_mode": "dynamic",
@@ -668,7 +667,7 @@ def test_webdataset_loaders_recreate_workers_and_keep_independent_generators(
     assert val_loader.generator is generators.validation
     assert not torch.equal(generators.train.get_state(), generators.validation.get_state())
     assert train_dataset.training
-    assert data["streaming"]["source_views"] == 3
+    assert data["streaming"]["source_views"] == 1
 
 
 def test_source_revision_records_a_dirty_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -689,11 +688,11 @@ def test_source_revision_records_a_dirty_worktree(monkeypatch: pytest.MonkeyPatc
 @pytest.mark.parametrize(
     ("tier", "expected"),
     (
-        ("base", (768, 12, 12, 48, 192, 0.20)),
-        ("large", (1024, 24, 16, 64, 192, 0.45)),
+        ("base", (768, 12, 12, 48, 224, 0.4)),
+        ("tiny", (192, 12, 6, 16, 224, 0.0)),
     ),
 )
-def test_base_and_large_pretraining_recipes(tmp_path: Path, tier: str, expected: tuple[int, ...]) -> None:
+def test_base_and_tiny_pretraining_recipes(tmp_path: Path, tier: str, expected: tuple[int, ...]) -> None:
     args = _args(tmp_path, "--tier", tier)
     run = load_run(args)
     assert (
@@ -704,101 +703,25 @@ def test_base_and_large_pretraining_recipes(tmp_path: Path, tier: str, expected:
         run.model["image_size"],
         run.model["drop_path_rate"],
     ) == expected
-    assert run.train["optimizer"] == "fusedlamb"
+    assert run.train["optimizer"] == "fused_adamw"
 
 
-@pytest.mark.parametrize("tier", ("base", "large"))
-def test_224_finetuning_requires_a_pretraining_checkpoint(tmp_path: Path, tier: str) -> None:
-    with pytest.raises(ValueError, match="requires --init-checkpoint"):
-        load_run(_args(tmp_path, "--tier", tier, "--phase", "finetune_224"))
-
-    run = load_run(
-        _args(
-            tmp_path,
-            "--tier",
-            tier,
-            "--phase",
-            "finetune_224",
-            "--init-checkpoint",
-            str(tmp_path / "pretrain.pt"),
-        )
-    )
-    assert (run.model["image_size"], run.train["epochs"], run.train["optimizer"]) == (
-        224,
-        20,
-        "adamw",
-    )
-    assert not run.train["repeated_aug"]
-    assert not run.train["bce_loss"]
-
-
-def test_batching_plan_preserves_the_effective_deit3_update(tmp_path: Path) -> None:
-    dataset_size = 1_281_167
-    small_single = resolve_batching_plan(
-        load_run(_args(tmp_path, "--batch-size", "512")),
-        _cpu_state(),
-        dataset_size=dataset_size,
-        requested_grad_accum=None,
-    )
-    assert small_single.as_dict() == {
-        "world_size": 1,
-        "physical_batch_size": 512,
-        "effective_batch_size": 2048,
-        "augmentation_group_size": 256,
-        "grad_accum": 4,
-        "samples_per_epoch": 1_280_000,
-        "updates_per_epoch": 625,
-    }
-
-    small_eight_gpu = resolve_batching_plan(
-        load_run(_args(tmp_path)),
-        _cpu_state(world_size=8),
-        dataset_size=dataset_size,
-        requested_grad_accum=None,
-    )
-    assert (small_eight_gpu.physical_batch_size, small_eight_gpu.grad_accum) == (256, 1)
-
-    large_single = resolve_batching_plan(
-        load_run(_args(tmp_path, "--tier", "large", "--batch-size", "128")),
-        _cpu_state(),
-        dataset_size=dataset_size,
-        requested_grad_accum=None,
-    )
-    assert (
-        large_single.physical_batch_size,
-        large_single.augmentation_group_size,
-        large_single.grad_accum,
-        large_single.updates_per_epoch,
-    ) == (128, 64, 16, 625)
-
-    finetune = resolve_batching_plan(
-        load_run(
-            _args(
-                tmp_path,
-                "--tier",
-                "base",
-                "--phase",
-                "finetune_224",
-                "--init-checkpoint",
-                str(tmp_path / "pretrain.pt"),
-            )
-        ),
-        _cpu_state(),
-        dataset_size=dataset_size,
-        requested_grad_accum=None,
-    )
-    assert (
-        finetune.effective_batch_size,
-        finetune.augmentation_group_size,
-        finetune.grad_accum,
-        finetune.updates_per_epoch,
-    ) == (512, 64, 8, 2502)
+@pytest.mark.parametrize("world_size,batch,accum", [(1, 512, 2), (2, 512, 1), (8, 128, 1)])
+def test_batching_plan_preserves_selected_global_batch(tmp_path, world_size, batch, accum):
+    run = load_run(_args(tmp_path, "--batch-size", str(batch)))
+    plan = resolve_batching_plan(run, _cpu_state(world_size=world_size),
+                                dataset_size=1_281_167, requested_grad_accum=None)
+    assert plan.effective_batch_size == 1024
+    assert plan.grad_accum == accum
+    assert plan.augmentation_group_size == 128
+    assert plan.updates_per_epoch == 1251
+    assert plan.samples_per_epoch == 1_281_024
 
 
 def test_batching_plan_rejects_non_equivalent_physical_schedules(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="physical batch_size"):
         resolve_batching_plan(
-            load_run(_args(tmp_path, "--batch-size", "128")),
+            load_run(_args(tmp_path, "--batch-size", "64")),
             _cpu_state(),
             dataset_size=1_281_167,
             requested_grad_accum=None,
@@ -826,101 +749,34 @@ def test_webdataset_contract_rejects_a_changed_manifest_or_streaming_policy() ->
         imagenet._validate_webdataset_contract(changed_streaming)
 
 
-def test_finetune_position_interpolation_keeps_a_no_cls_patch_table() -> None:
-    source = torch.arange(1 * 9 * 4, dtype=torch.float32).reshape(1, 9, 4)
-    target = torch.empty(1, 16, 4)
-    resized = interpolate_position_embedding(source, target)
-    assert resized.shape == target.shape
-    assert torch.isfinite(resized).all()
-
-
-def test_finetune_loader_interpolates_the_shared_encoder_position_key(tmp_path: Path) -> None:
-    class Encoder(torch.nn.Module):
-        def __init__(self, tokens: int) -> None:
-            super().__init__()
-            self.pos_embed = torch.nn.Parameter(torch.randn(1, tokens, 4))
-
-    class Model(torch.nn.Module):
-        def __init__(self, tokens: int) -> None:
-            super().__init__()
-            self.encoder = Encoder(tokens)
-
-    source = Model(9)
-    target = Model(16)
-    checkpoint = tmp_path / "pretrain.pt"
-    run = load_run(_args(tmp_path))
-    contract = run.checkpoint_contract(_checkpoint_batching_plan(), _data_contract())
-    torch.save(
-        {
-            "format_version": imagenet.IMAGENET_CHECKPOINT_FORMAT,
-            "contract": contract,
-            "contract_digest": checkpoint_contract_digest(contract),
-            "model": source.state_dict(),
-        },
-        checkpoint,
-    )
-    load_finetune_checkpoint(target, checkpoint, run)
-    assert target.encoder.pos_embed.shape == (1, 16, 4)
-
-
-def test_finetune_loader_rejects_a_checkpoint_without_current_contract(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "pretrain.pt"
-    torch.save({"model": {}}, checkpoint)
-    with pytest.raises(ValueError, match="current ImageNet contract"):
-        load_finetune_checkpoint(torch.nn.Linear(2, 2), checkpoint, load_run(_args(tmp_path)))
-
-
-def test_scheduler_uses_epoch_zero_warmup_then_advances_to_epoch_one(tmp_path: Path) -> None:
+def test_scheduler_uses_optimizer_updates_and_restores_exactly(tmp_path):
     pytest.importorskip("timm")
     run = load_run(_args(tmp_path))
-    parameter = torch.nn.Parameter(torch.ones(()))
-    optimizer = torch.optim.SGD([parameter], lr=float(run.train["lr"]))
-    scheduler = build_scheduler(optimizer, run)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-6)
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=.001)
+    scheduler = build_scheduler(optimizer, run, 1251)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-6)
+    scheduler.step_update(1251)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-6 + (.001 - 1e-6) / 20)
+    scheduler.step_update(20 * 1251)
+    expected = 1e-5 + (.001 - 1e-5) * (1 + __import__('math').cos(__import__('math').pi * 20 / 300)) / 2
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(expected)
+    restored_opt = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=.001)
+    restored = build_scheduler(restored_opt, run, 1251)
+    restored_opt.load_state_dict(optimizer.state_dict())
+    restored.load_state_dict(scheduler.state_dict())
+    assert restored_opt.param_groups[0]["lr"] == optimizer.param_groups[0]["lr"]
+    for update in (20 * 1251 + 1, 150 * 1251, 300 * 1251):
+        scheduler.step_update(update)
+        restored.step_update(update)
+        assert restored_opt.param_groups[0]["lr"] == optimizer.param_groups[0]["lr"]
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
 
-    scheduler.step(1)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(
-        1.0e-6 + (0.004 - 1.0e-6) / 5
-    )
 
-
-def test_explicit_lamb_fallback_permission_is_never_canonical(tmp_path: Path) -> None:
-    run = load_run(_args(tmp_path))
-    assert _recipe_fidelity(
-        run,
-        batching_plan=_checkpoint_batching_plan(),
-        resolved_optimizer="apex.fused_lamb",
-        allow_lamb_fallback=False,
-    ) == "deit3-derived"
-    assert _recipe_fidelity(
-        run,
-        batching_plan=_checkpoint_batching_plan(),
-        resolved_optimizer="apex.fused_lamb",
-        allow_lamb_fallback=True,
-    ) == "explicitly-modified"
-
-    large_physical_run = load_run(_args(tmp_path, "--batch-size", "512"))
-    large_physical_plan = resolve_batching_plan(
-        large_physical_run,
-        _cpu_state(),
-        dataset_size=1_281_167,
-        requested_grad_accum=None,
-    )
-    assert _recipe_fidelity(
-        large_physical_run,
-        batching_plan=large_physical_plan,
-        resolved_optimizer="apex.fused_lamb",
-        allow_lamb_fallback=False,
-    ) == "deit3-derived"
-    assert run.checkpoint_contract_digest(
-        _checkpoint_batching_plan(),
-        _data_contract(),
-    ) != (
-        large_physical_run.checkpoint_contract_digest(
-            large_physical_plan,
-            _data_contract(),
-        )
-    )
+def test_recipe_fidelity_marks_diagnostic_duration(tmp_path):
+    for extra, expected in [((), "vit3-derived"), (("--epochs", "30"), "explicitly-modified")]:
+        run = load_run(_args(tmp_path, *extra))
+        assert _recipe_fidelity(run, batching_plan=_checkpoint_batching_plan(),
+                               resolved_optimizer="torch.adamw.fused") == expected
 
 
 def test_virtual_group_mixup_never_crosses_group_boundaries() -> None:
@@ -957,26 +813,12 @@ def test_gradient_accumulation_matches_one_effective_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class RecordingScaler:
-        def __init__(self) -> None:
-            self.steps = 0
-            self.updates = 0
-
-        def scale(self, loss: torch.Tensor) -> torch.Tensor:
-            return loss
-
-        def step(self, optimizer: torch.optim.Optimizer) -> None:
-            self.steps += 1
-            optimizer.step()
-
-        def update(self) -> None:
-            self.updates += 1
-
-    class RecordingEma:
+    class RecordingScheduler:
         def __init__(self) -> None:
             self.updates = 0
 
-        def update(self, _model: torch.nn.Module) -> None:
+        def step_update(self, index: int) -> None:
+            assert index == 0
             self.updates += 1
 
     features = torch.tensor(
@@ -990,18 +832,18 @@ def test_gradient_accumulation_matches_one_effective_batch(
 
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
     criterion(reference(features), targets).backward()
+    torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
     reference_optimizer.step()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    scaler = RecordingScaler()
-    ema = RecordingEma()
+    scheduler = RecordingScheduler()
     run = ImageNetRun(
         config_path=tmp_path / "test.toml",
         tier="test",
         phase="test",
         model={},
         operator={},
-        train={"bce_loss": False},
+        train={"bce_loss": False, "clip_grad": 0.1},
         overrides=(),
     )
     batching_plan = BatchingPlan(
@@ -1020,9 +862,8 @@ def test_gradient_accumulation_matches_one_effective_batch(
         SequentialSampler(dataset),
         criterion,
         optimizer,
-        scaler,  # type: ignore[arg-type]
         None,
-        ema,
+        scheduler,
         epoch=0,
         state=_cpu_state(),
         run=run,
@@ -1030,34 +871,7 @@ def test_gradient_accumulation_matches_one_effective_batch(
         print_freq=0,
     )
     torch.testing.assert_close(model.weight, reference.weight)
-    assert (scaler.steps, scaler.updates, ema.updates) == (1, 1, 1)
-
-
-def test_timm_ema_updates_lsso_tensor_state_without_averaging_contract(
-    tmp_path: Path,
-) -> None:
-    pytest.importorskip("timm")
-    from lsso import LSSO, LSSOConfig
-
-    model = LSSO(LSSOConfig(16, 2, rank=4))
-    run = ImageNetRun(
-        config_path=tmp_path / "test.toml",
-        tier="test",
-        phase="test",
-        model={},
-        operator={},
-        train={"ema_decay": 0.5},
-        overrides=(),
-    )
-    ema = build_ema(model, run)
-    initial = model.core_base_raw.detach().clone()
-    with torch.no_grad():
-        model.core_base_raw.add_(2.0)
-
-    update_ema(ema, model)
-
-    torch.testing.assert_close(ema.ema.core_base_raw, initial + 1.0)
-    assert ema.ema.state_dict()["_extra_state"] == model.state_dict()["_extra_state"]
+    assert scheduler.updates == 1
 
 
 def test_checkpoint_model_state_preserves_lsso_contract_entries() -> None:
@@ -1097,30 +911,25 @@ def test_evaluate_preserves_weighted_metrics_across_batches(
     assert accuracy5 == 100.0
 
 
-def test_checkpoint_round_trip_uses_timm_model_ema(
+def test_checkpoint_round_trip_has_no_ema(
     tmp_path: Path,
 ) -> None:
     pytest.importorskip("timm")
-    from timm.utils import ModelEma
 
     torch.manual_seed(3)
     source = torch.nn.Linear(2, 2)
-    source_ema = ModelEma(source)
     source_optimizer = torch.optim.SGD(source.parameters(), lr=0.1)
     source_scheduler = torch.optim.lr_scheduler.StepLR(source_optimizer, step_size=3)
     source_optimizer.step()
     source_scheduler.step()
-    source_scaler = torch.amp.GradScaler("cpu")
     run = load_run(_args(tmp_path))
     batching_plan = _checkpoint_batching_plan()
     source_generators = _loader_generators(23)
     payload = _checkpoint(
         epoch=4,
         model=source,
-        ema=source_ema,
         optimizer=source_optimizer,
         scheduler=source_scheduler,
-        scaler=source_scaler,
         run=run,
         batching_plan=batching_plan,
         data_contract=_data_contract(),
@@ -1131,18 +940,14 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
     torch.save(payload, path)
 
     target = torch.nn.Linear(2, 2)
-    target_ema = ModelEma(target)
     target_optimizer = torch.optim.SGD(target.parameters(), lr=0.1)
     target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=3)
-    target_scaler = torch.amp.GradScaler("cpu")
     target_generators = _loader_generators(47)
     start_epoch, best_acc1 = _load_resume(
         path,
         model=target,
-        ema=target_ema,
         optimizer=target_optimizer,
         scheduler=target_scheduler,
-        scaler=target_scaler,
         run=run,
         batching_plan=batching_plan,
         data_contract=_data_contract(),
@@ -1156,14 +961,9 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         strict=True,
     ):
         torch.testing.assert_close(target_parameter, source_parameter)
-    for source_parameter, target_parameter in zip(
-        source_ema.ema.parameters(),
-        target_ema.ema.parameters(),
-        strict=True,
-    ):
-        torch.testing.assert_close(target_parameter, source_parameter)
+    assert "model_ema" not in payload
+    assert "scaler" not in payload
     assert target_scheduler.state_dict() == source_scheduler.state_dict()
-    assert target_scaler.state_dict() == source_scaler.state_dict()
 
     changed_physical_plan = BatchingPlan(
         world_size=1,
@@ -1178,10 +978,8 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         _load_resume(
             path,
             model=target,
-            ema=target_ema,
             optimizer=target_optimizer,
             scheduler=target_scheduler,
-            scaler=target_scaler,
             run=run,
             batching_plan=changed_physical_plan,
             data_contract=_data_contract(),
@@ -1195,10 +993,8 @@ def test_checkpoint_round_trip_uses_timm_model_ema(
         _load_resume(
             path,
             model=target,
-            ema=target_ema,
             optimizer=target_optimizer,
             scheduler=target_scheduler,
-            scaler=target_scaler,
             run=run,
             batching_plan=batching_plan,
             data_contract=changed_data,
@@ -1272,24 +1068,16 @@ def test_nonpersistent_worker_rng_replays_from_its_loader_generator() -> None:
 
 
 def test_resume_rejects_missing_rng_before_loading_model(tmp_path: Path) -> None:
-    class Ema:
-        def __init__(self, model: torch.nn.Module) -> None:
-            self.ema = copy.deepcopy(model)
-
     run = load_run(_args(tmp_path))
     batching_plan = _checkpoint_batching_plan()
     source = torch.nn.Linear(2, 2)
-    source_ema = Ema(source)
     source_optimizer = torch.optim.SGD(source.parameters(), lr=0.1)
     source_scheduler = torch.optim.lr_scheduler.StepLR(source_optimizer, step_size=3)
-    source_scaler = torch.amp.GradScaler("cpu")
     payload = _checkpoint(
         epoch=0,
         model=source,
-        ema=source_ema,
         optimizer=source_optimizer,
         scheduler=source_scheduler,
-        scaler=source_scaler,
         run=run,
         batching_plan=batching_plan,
         data_contract=_data_contract(),
@@ -1302,18 +1090,14 @@ def test_resume_rejects_missing_rng_before_loading_model(tmp_path: Path) -> None
 
     target = torch.nn.Linear(2, 2)
     target_before = copy.deepcopy(target.state_dict())
-    target_ema = Ema(target)
     target_optimizer = torch.optim.SGD(target.parameters(), lr=0.1)
     target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=3)
-    target_scaler = torch.amp.GradScaler("cpu")
     with pytest.raises(ValueError, match="RNG state"):
         _load_resume(
             path,
             model=target,
-            ema=target_ema,
             optimizer=target_optimizer,
             scheduler=target_scheduler,
-            scaler=target_scaler,
             run=run,
             batching_plan=batching_plan,
             data_contract=_data_contract(),
@@ -1353,24 +1137,40 @@ def test_atomic_checkpoint_write_round_trips(tmp_path: Path) -> None:
     assert torch.equal(restored["value"], expected["value"])
 
 
-def test_fused_lamb_uses_the_fixed_deit3_epsilon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_adamw_parameters_and_weight_decay_exclusions(tmp_path):
     pytest.importorskip("timm")
-    captured: dict[str, object] = {}
+    model = torch.nn.Linear(4, 2)
+    optimizer, name = build_optimizer(model, load_run(_args(tmp_path)))
+    assert name == "torch.adamw.fused"
+    assert optimizer.defaults["eps"] == 1e-8
+    assert optimizer.defaults["fused"] is True
+    assert optimizer.defaults["betas"] == (.9, .999)
+    for group in optimizer.param_groups:
+        assert group["lr"] == .001
+        for parameter in group["params"]:
+            assert group["weight_decay"] == (0 if parameter is model.bias else .05)
 
-    class FusedLAMB:
-        def __init__(self, _groups: object, **kwargs: object) -> None:
-            captured.update(kwargs)
 
-    apex = ModuleType("apex")
-    optimizers = ModuleType("apex.optimizers")
-    optimizers.FusedLAMB = FusedLAMB  # type: ignore[attr-defined]
-    apex.optimizers = optimizers  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "apex", apex)
-    monkeypatch.setitem(sys.modules, "apex.optimizers", optimizers)
 
-    build_optimizer(
-        torch.nn.Linear(4, 2),
-        load_run(_args(tmp_path)),
-        allow_lamb_fallback=False,
-    )
-    assert captured["eps"] == 1.0e-8
+def test_custom_recipe_is_not_mislabeled_as_vit3(tmp_path):
+    run = load_run(_args(tmp_path))
+    run.train["lr"] = .002
+    assert _recipe_fidelity(run, batching_plan=_checkpoint_batching_plan(),
+                            resolved_optimizer="torch.adamw.fused") == "explicitly-modified"
+
+
+def test_vit3_transforms_and_soft_targets(tmp_path):
+    pytest.importorskip("timm")
+    from PIL import Image
+    run = load_run(_args(tmp_path))
+    transform = imagenet.build_train_transform(run)
+    validation = imagenet.build_eval_transform(run)
+    assert validation.transforms[0].size == 256
+    image = Image.new("RGB", (300, 280), (100, 150, 200))
+    assert transform(image).shape == (3, 224, 224)
+    assert validation(image).shape == (3, 224, 224)
+    mixup, loss = imagenet.build_mixup_and_loss(run)
+    images, targets = mixup(torch.zeros(2, 3, 224, 224), torch.tensor([0, 1]))
+    torch.testing.assert_close(targets.sum(1), torch.ones(2))
+    assert (targets > 0).all()  # smoothing, not binary multi-label targets
+    assert torch.isfinite(loss(torch.zeros(2, 1000), targets))

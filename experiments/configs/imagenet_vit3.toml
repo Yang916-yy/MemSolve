@@ -1,0 +1,73 @@
+# Plain ViT³ training, official commit e3477587d099e6b9e83e9e7c80b1b999e0989a20.
+# Selected global batch 1024 / LR .001, following upstream linear LR scaling.
+# The LSSO backbone is retained; ranks are LSSO choices, not ViT³ parameters.
+# Virtual Mixup groups retain the source default of 128; accumulation is local adaptation.
+[defaults]
+num_classes = 1000
+patch_size = 16
+mlp_ratio = 4.0
+layer_scale_init_value = 1.0e-4
+norm_eps = 1.0e-6
+position_encoding = "cpe"
+epochs = 300
+warmup_epochs = 20
+warmup_lr = 1.0e-6
+min_lr = 1.0e-5
+weight_decay = 0.05
+clip_grad = 5.0
+seed = 0
+train_workers = 10
+val_workers = 4
+eval_crop_ratio = 0.875
+reprob = 0.25
+mixup = 0.8
+cutmix = 1.0
+mixup_prob = 1.0
+mixup_switch_prob = 0.5
+mixup_mode = "batch"
+ema = false
+amp_dtype = "bfloat16"
+save_every = 1
+batch_size = 512
+effective_batch = 1024
+augmentation_group_size = 128
+lr = 0.001
+optimizer = "fused_adamw"
+augmentation = "rand_augment"
+color_jitter = 0.4
+auto_augment = "rand-m9-mstd0.5-inc1"
+repeated_aug = false
+bce_loss = false
+label_smoothing = 0.1
+
+[operator]
+core_mode = "dynamic"
+bias = true
+implementation = "cuda"
+
+[tiers.tiny]
+embed_dim = 192
+depth = 12
+num_heads = 6
+rank = 16
+drop_path_rate = 0.0
+[tiers.tiny.pretrain]
+input_size = 224
+
+[tiers.small]
+embed_dim = 384
+depth = 12
+num_heads = 6
+rank = 32
+drop_path_rate = 0.1
+[tiers.small.pretrain]
+input_size = 224
+
+[tiers.base]
+embed_dim = 768
+depth = 12
+num_heads = 12
+rank = 48
+drop_path_rate = 0.4
+[tiers.base.pretrain]
+input_size = 224

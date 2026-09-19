@@ -1,4 +1,4 @@
-"""Launch the shared ImageNet DeiT III training workflow."""
+"""Launch the shared ImageNet plain ViT³-derived training workflow."""
 
 from __future__ import annotations
 

@@ -443,3 +443,68 @@ solves continue to use MathDx; the shared-memory lifetime pattern follows the
 [cuBLASDx examples](https://docs.nvidia.com/cuda/cublasdx/0.7.0/examples.html).
 No FLA source has been copied into the operator. Performance probes and
 unselected implementations are retained outside the source tree.
+
+## 2026-09-19 implementation audit
+
+The no-frame token backward now uses a fixed 32-token tile for all core modes
+and ranks. Its algebra and mixed-precision products are unchanged. Statistics
+and readout retain their separate 128-token tiles. This follows the bounded
+live-state and selective-fusion approach of
+[FLA's token backward](https://github.com/fla-org/flash-linear-attention/blob/864a87f6ce5be8828bef81eb22baafd41937cdf2/fla/ops/common/chunk_o.py),
+without copying its causal operator or introducing a model-path heuristic.
+
+An A800 profile at B=512, N=197, H=6, rank=48 and head dimension 64 localized
+the previous regression to token backward: about 17.9 ms of a 33.4 ms profiled
+layer step. Triton reported 3116 spills for the 128-token/4-warp kernel.
+The 32-token/4-warp version reported zero spills and took about 0.80 ms in
+an isolated kernel probe. Reducing to 64 tokens was insufficient. Compiler
+register/spill diagnostics matter here; removing a token-sized tensor alone
+does not establish an efficient implementation.
+
+The upstream reuse review found:
+
+- Cholesky, triangular solves and compact GEMMs already call PyTorch's mature
+  implementations. Keep these until a fused replacement wins an end-to-end
+  forward/backward comparison under the same numerical contract.
+- The hand-written general Gauss-Jordan solve repeats elimination in backward
+  and for each RHS tile. Upstream
+  [LU factorization](https://docs.pytorch.org/docs/2.14/generated/torch.linalg.lu_factor_ex.html)
+  and [adjoint LU solve](https://docs.pytorch.org/docs/2.14/generated/torch.linalg.lu_solve.html)
+  can reuse factors. A local FP32 probe at batch-head count 3072 and 64 RHS
+  columns reduced rank-48 forward-plus-adjoint solve time from 2.63 to 1.98 ms
+  when cuSOLVER was explicitly selected, but rank 16 slowed from 0.437 to
+  0.465 ms. The default PyTorch backend failed Graph capture at rank 32 on
+  this installation. This experiment is not installed as a global backend
+  switch or a new shape-based dispatcher.
+- The existing native cuSOLVERDx partial-pivot LU factor/solve components are
+  the next reusable building blocks for the compact no-frame system.
+  [GETRS supports transposed solves](https://docs.nvidia.com/cuda/cusolverdx/get_started/getrs.html),
+  so a dedicated compact boundary can retain the forward factors for backward.
+  Adapting that boundary requires its own ABI, Graph, gradient and latency
+  validation; the current public no-frame path still uses the general solver.
+- [FLA solve_tril](https://github.com/fla-org/flash-linear-attention/blob/864a87f6ce5be8828bef81eb22baafd41937cdf2/fla/ops/utils/solve_tril.py)
+  computes a unit-lower-triangular inverse. The LSSO core system is general
+  dense and cannot use it directly. The QR-coordinate triangular factor is
+  also non-unit; converting it merely to use this inverse is not justified
+  over the existing triangular solve.
+
+Same-process paired CUDA Graph measurements of the complete Dynamic LSSO
+layer (including projections and loss backward, excluding MLP, optimizer and
+DDP) used B=512, N=197, BF16 activations and FP32 parameters on A800:
+
+| Shape | Previous 128-token backward | Retained 32-token backward |
+|---|---:|---:|
+| T / rank 32 | 6.474 ms | 6.668 ms |
+| T / rank 48 | 11.728 ms | 12.203 ms |
+| S / rank 48 | 33.010 ms | 16.018 ms |
+| B / rank 48 | 67.453 ms | 33.565 ms |
+
+The measured T cases trade about 3–4% latency for the uniform bounded tile;
+S/B rank 48 improve about 50%. The T/S/B rank sweep did not change PyTorch's
+measured peak tensor allocation. Register spill elimination is not a claim
+of reduced allocator-visible activation memory. Timings use 50 Graph warmup
+replays followed by five groups of ten replays and report the median.
+
+The retained change passed 263 core/CUDA tests without relaxing tolerances.
+The sparse-mask cancellation TODO above remains open. Local probes and
+profiler artifacts remain outside the repository; no task results were added.

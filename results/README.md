@@ -27,7 +27,7 @@ comparison values in the paper remain attributed to their original sources.
 ## Historical evidence versus current source
 
 The published CUDA metadata records native contract **6**. Current source uses
-native ABI **9** and model contract **13**, including a revised mixed-precision
+native ABI **10** and model contract **13**, including a revised mixed-precision
 policy, biased projection fusion and removal of internal feature rotation. These source updates do not rewrite the
 CSV measurements or establish new task results. Consult each panel's metadata
 for its actual runtime and protocol; do not label historical tables as current

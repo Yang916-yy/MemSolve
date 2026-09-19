@@ -16,7 +16,7 @@ the surrounding model. DYNAMIC, STATIC and ZERO have native CUDA inference
 and an analytic first-order backward. On the measured RTX 5070 Ti long-sequence
 workloads, the complete mixer reaches up to 1.79x the forward speed and 2.30x
 the forward-backward speed of PyTorch MHA backed by Flash SDPA. Those historical measurements use an earlier operator (native contract 6);
-current ABI-9 changes have not rerun
+current ABI-10 changes have not rerun
 those formal panels. See [result provenance](results/README.md).
 
 Read the current paper: **[LSSO: Solving Contextual Adaptation with Certified
@@ -30,7 +30,7 @@ Global Mixing](paper/main.pdf)**. The LaTeX source is in
 | Mathematics, dtypes and checkpoint contracts | [Core contract](docs/CORE_CONTRACT.md) |
 | Code ownership and execution paths | [Architecture](docs/ARCHITECTURE.md) |
 | Native build, Triton JIT and GPU validation | [CUDA contract](docs/CUDA_CONTRACT.md) |
-| ImageNet pretraining and checkpoint transfer | [DeiT III workflow](docs/IMAGENET_DEIT3.md) |
+| ImageNet pretraining and checkpoint transfer | [Plain ViT³ training workflow](docs/IMAGENET_VIT3.md) |
 | COCO detection/instance segmentation and ADE20K semantic segmentation | [Dense downstream protocols](docs/DOWNSTREAM_PROTOCOLS.md) |
 | Assembly101 data and validation protocol | [Assembly101 workflow](docs/ASSEMBLY101.md) |
 | GenomicBenchmarks and LRA | [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) |
@@ -65,7 +65,7 @@ y = layer(x, implementation="cuda")
 ~~~
 
 The current source requires `torch==2.14.0+cu132`, CUDA `13.2`, native
-contract `9`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
+contract `10`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
 must not be mixed with this newer source contract; build matching native
 artifacts from this checkout:
 
@@ -100,6 +100,11 @@ workflows.
 Supported ablations include DYNAMIC, STATIC, and ZERO core ownership, skew coupling, and the scalar complement. See
 [`docs/CORE_CONTRACT.md`](docs/CORE_CONTRACT.md) for the canonical mathematical
 and numerical contract.
+
+The public CUDA runtime uniformly uses a no-frame Triton/PyTorch schedule.
+It shares token statistics/readout/VJPs
+across Dynamic, Static and Zero and avoids storing token-sized P. No extra flag
+is needed; see [CUDA scheduling and numerical policy](docs/CUDA_CONTRACT.md#default-cuda-scheduling-without-an-explicit-frame).
 
 ## CUDA wall clock
 
@@ -219,8 +224,8 @@ results, exact recipes, data layout, and protocol boundaries. The final
 per-seed metrics, dataset fingerprints, certificate summaries, and wall-clock
 protocol are published as machine-readable artifacts in [`results/`](results/README.md).
 
-ImageNet-1K uses the official DeiT III S/B/L training recipes with LSSO ranks
-32/48/64; see [docs/IMAGENET_DEIT3.md](docs/IMAGENET_DEIT3.md). COCO 2017
+ImageNet-1K uses plain ViT³-derived T/S/B training (300 epochs, AdamW, no EMA)
+with LSSO ranks 16/32/48; see [docs/IMAGENET_VIT3.md](docs/IMAGENET_VIT3.md). COCO 2017
 Mask R-CNN + FPN 3x and ADE20K UperNet 160k use the shared dense DeiT III
 backbone and explicit padded-image masking. Their protocol provenance and
 launch commands are in [docs/DOWNSTREAM_PROTOCOLS.md](docs/DOWNSTREAM_PROTOCOLS.md).

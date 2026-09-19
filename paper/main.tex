@@ -1417,10 +1417,10 @@ Pathfinder-32           & 1024 & $256/6/4$ & $0.1510$ & $3.2212$  & $4.7$ \\
 
 \subsection{Current implementation contract}
 
-The current backend uses native ABI 9 and model checkpoint contract 13.
+The current backend uses native ABI 10 and model checkpoint contract 13.
 It implements \textsc{Dynamic}, \textsc{Static}, and \textsc{Zero} with the
 same masking and compact-state definition as Section~\ref{sec:method}.
-All three modes support inference and analytic first-order training.
+All three modes support inference and first-order training.
 The no-skew and no-complement variants require the reference backend;
 unsupported requests fail explicitly rather than selecting another backend.
 
@@ -1449,16 +1449,34 @@ $Y=\eta C+P[2U-(1+\eta)Z]$. It constructs the soft frame using a tiled
 Gram--Cholesky schedule algebraically equivalent to the positive-diagonal QR
 form, then computes $Z=P^\T C$. \textsc{Dynamic} constructs and factors an
 input-conditioned system per sample and head. \textsc{Static} factors one
-system per head and shares its LU factors across samples; each sample still
-has its own compact right-hand side. \textsc{Zero} skips core construction
-and LU solves, using $U=Z/2$ in the shared readout. No factors are cached
-across forward calls.
+system per head. For sufficiently many shared right-hand sides, it computes
+$S=(\I_r+K)^{-1}$ by solving against the identity once per head and applies
+$U=SZ$ across samples; smaller batches retain shared LU factors. The same
+stored map supplies the transposed action in backward. \textsc{Zero} uses a
+literal zero correction and stores no core factors or equilibrium state.
+All modes share the coefficient $\Delta-\eta Z$ in the token readout, with
+$\Delta=2U-Z$ for learned cores. No factors are cached across forward calls.
+
+The public CUDA dispatcher uses an equivalent schedule that avoids
+materializing $P$. With $R^\T R=\I_r+A^\T A$ and $P=AR^{-1}$, it computes
+\begin{equation}
+    Z=R^{-\T}A^\T C,\qquad
+    V=R^{-1}(\Delta-\eta Z),\qquad
+    Y=\eta C+AV.
+\end{equation}
+The three core modes share token statistics, readout and input derivatives;
+only the compact correction differs. The explicit-frame native implementation
+is retained as a comparison baseline, not an automatic fallback.
+For $N\leq r$, the base term is evaluated as
+$\eta(\I_N+AA^\T)^{-1}C$ to avoid subtracting nearly equal values. This system
+is at most $r\times r$, and neither schedule stores an attention matrix.
 
 \subsection{Backward and numerical boundaries}
 
 The analytic backward reuses saved factors for transposed solves and
 propagates gradients through the compact state, generator and soft frame.
-Shared \textsc{Static} parameters accumulate contributions from all samples.
+For \textsc{Static}, matrix adjoints are accumulated across samples before
+applying the shared parameterization Jacobian.
 The token-level frame and relation derivatives are fused to avoid storing a
 separate token-sized frame adjoint. The implementation supports first-order
 gradients; it does not differentiate through unrolled optimization steps.
@@ -1466,7 +1484,11 @@ gradients; it does not differentiate through unrolled optimization steps.
 Ordinary projection and eligible compact products use BF16 operands with
 FP32 accumulation. Packed native activations and their gradients are BF16.
 Frame storage, factorization, the accretive factor Gram, solve state and
-parameter gradients remain FP32. The reference retains FP64 evaluation for
+parameter gradients remain FP32. In the no-frame schedule, transformed compact
+coefficients are stored in FP32 and decomposed into a leading BF16 word and a
+BF16 residual word for token products, avoiding a single BF16 rounding of the
+combined coefficient. Its compact VJP uses first-order autograd and an implicit
+solve derivative. The reference retains FP64 evaluation for
 output and gradient oracles. All three core modes are checked against this
 reference, including nonzero core parameters, gapped padding and fully
 masked samples. Kernel and integration tests define the numerical acceptance

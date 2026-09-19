@@ -1,6 +1,6 @@
 # Dense Downstream Protocols
 
-> Current source uses model contract 13 and native ABI 9. External position
+> Current source uses model contract 13 and native ABI 10. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -29,10 +29,10 @@ valid outputs.
 
 ## Protocol provenance
 
-ImageNet-1K is the official
-[DeiT III recipe](https://github.com/facebookresearch/deit/blob/7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md).
-The ImageNet launcher and its exact S/B/L recipes are documented in
-`docs/IMAGENET_DEIT3.md`.
+The historical ImageNet results used DeiT III training. The current classifier
+uses plain ViT³-derived T/S/B training, documented in `docs/IMAGENET_VIT3.md`.
+The dense S/B/L configurations below retain their original geometry and are
+not newly validated downstream results under that training protocol.
 
 COCO is a **downstream standard protocol**, not an official DeiT III detection
 recipe. It is the public [XCiT Mask R-CNN + FPN 3x
@@ -60,8 +60,7 @@ Then install a **compiled** `mmcv==2.1.*` build matched to the active PyTorch
 and CUDA stack using the [OpenMMLab installation
 guide](https://mmcv.readthedocs.io/en/latest/get_started/installation.html).
 `mmcv-lite` does not provide the CUDA/C++ operators required by Mask R-CNN.
-Install Apex with FusedLAMB as described in `docs/IMAGENET_DEIT3.md` for
-canonical DeiT III pretraining.
+The current ImageNet training entrypoint uses PyTorch AdamW and needs no Apex.
 
 ## Dataset layout
 

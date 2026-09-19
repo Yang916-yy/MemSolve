@@ -682,7 +682,9 @@ class _NoFrameMix(torch.autograd.Function):
                 retain_graph=True,
             )
         projected_gradient = torch.empty_like(projected)
-        _no_frame_kernels()[2][(batch * heads, (length + 127) // 128)](
+        # Bound live token adjoints independently of the statistics tile.
+        # Larger fused tiles can spill registers at rank 48/64 and head_dim 64.
+        _no_frame_kernels()[2][(batch * heads, (length + 31) // 32)](
             projected,
             gradient,
             coefficient,
@@ -698,9 +700,9 @@ class _NoFrameMix(torch.autograd.Function):
             counts is not None,
             _no_frame_block_size(rank),
             min(128, _no_frame_block_size(head_dim)),
-            128,
+            32,
             num_warps=4,
-        num_stages=1,
+            num_stages=1,
         )
         return projected_gradient, base_gradient, drive_gradient, raw_gradient, None
 

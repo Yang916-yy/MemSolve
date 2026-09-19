@@ -7,7 +7,7 @@
 namespace lsso_equilibrium {
 namespace {
 
-constexpr int64_t kNativeContractVersion = 9;
+constexpr int64_t kNativeContractVersion = 10;
 
 bool requires_grad(const c10::optional<at::Tensor>& value) {
     return value.has_value() && value->requires_grad();

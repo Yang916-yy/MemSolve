@@ -315,7 +315,7 @@ void validate_training_tape(
     TORCH_CHECK(pivots.is_contiguous(), "pivots must be contiguous");
     TORCH_CHECK(pivots.scalar_type() == at::kInt, "pivots must use int32");
     TORCH_CHECK(
-        pivots.sizes() == at::IntArrayRef({shape.batch * shape.heads, shape.rank}),
+        pivots.sizes() == at::IntArrayRef({shape.batch * shape.heads, shape.core_mode == 2 ? 0 : shape.rank}),
         "pivots has an incompatible shape ", pivots.sizes());
 }
 
@@ -431,7 +431,8 @@ __global__ __launch_bounds__(kThreads) void generic_reduce_partials_kernel(
     float* __restrict__ output,
     int64_t system_count,
     int64_t tile_count,
-    int64_t head_dim) {
+    int64_t head_dim,
+    const float* eta_raw, float* zero_state_adjoint, int64_t heads) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     if (system_index >= system_count) {
         return;
@@ -447,6 +448,8 @@ __global__ __launch_bounds__(kThreads) void generic_reduce_partials_kernel(
                 (system_index * tile_count + tile) * rank * head_dim + linear];
         }
         output[system_index * rank * head_dim + linear] = value;
+        if (zero_state_adjoint != nullptr)
+            zero_state_adjoint[system_index * rank * head_dim + linear] = -bounded_complement(eta_raw[system_index % heads]) * value;
     }
 }
 
@@ -497,7 +500,6 @@ __global__ __launch_bounds__(kRhsTile) void generic_equilibrium_vjp_kernel(
     }
     const int64_t head = system_index - (system_index / heads) * heads;
     const int64_t rhs_start = rhs_tile * kRhsTile;
-    const float* system_tape = tape + system_index * tape_layout.stride;
     const int64_t core_index = core_mode == 1 ? head : system_index;
     const float* lu = tape + core_index * tape_layout.stride + tape_layout.lu_offset;
     const int* system_pivots = pivots + core_index * rank;
@@ -505,19 +507,6 @@ __global__ __launch_bounds__(kRhsTile) void generic_equilibrium_vjp_kernel(
     float* system_equilibrium_adjoint = equilibrium_adjoint + system_index * rank * head_dim;
     float* system_state_adjoint = state_adjoint + system_index * rank * head_dim;
     const float eta = bounded_complement(eta_raw[head]);
-
-    if (core_mode == 2) {
-        for (int linear = threadIdx.x; linear < rank * kRhsTile; linear += blockDim.x) {
-            const int row = linear / kRhsTile;
-            const int column = linear % kRhsTile;
-            if (rhs_start + column < head_dim) {
-                const int offset = row * head_dim + rhs_start + column;
-                system_equilibrium_adjoint[offset] = system_d_t[offset];
-                system_state_adjoint[offset] = -eta * system_d_t[offset];
-            }
-        }
-        return;
-    }
 
     using Getrs = typename GenericEquilibriumGetrsMathDx<rank>::Transposed;
 
@@ -552,6 +541,27 @@ __global__ __launch_bounds__(kRhsTile) void generic_equilibrium_vjp_kernel(
             system_equilibrium_adjoint[offset] = rhs[linear];
             system_state_adjoint[offset] =
                 -(1.0f + eta) * system_d_t[offset] + rhs[linear];
+        }
+    }
+}
+
+
+template <int rank>
+__global__ __launch_bounds__(kThreads) void static_core_adjoint_kernel(
+    const float* d_t, const float* tape, const float* eta_raw,
+    float* adjoint, float* state_adjoint, TrainingTapeLayout layout,
+    int64_t heads, int64_t head_dim) {
+    const int64_t system = blockIdx.x, start = int64_t(blockIdx.y) * kRhsTile;
+    const int64_t head = system % heads;
+    const float* map = tape + head * layout.stride + layout.lu_offset;
+    const float* dt = d_t + system * rank * head_dim;
+    const float eta = bounded_complement(eta_raw[head]);
+    for (int i = threadIdx.x; i < rank * kRhsTile; i += blockDim.x) {
+        const int row = i / kRhsTile, col = start + i % kRhsTile;
+        if (col < head_dim) {
+            const float value = 2.0f * apply_core_map_element<rank, true>(map, dt, row, col, head_dim);
+            adjoint[(system * rank + row) * head_dim + col] = value;
+            state_adjoint[(system * rank + row) * head_dim + col] = value - (1.0f + eta) * dt[row * head_dim + col];
         }
     }
 }
@@ -623,6 +633,21 @@ __global__ __launch_bounds__(kThreads) void generic_d_k_kernel(
     }
 }
 
+
+// Static's parameterization Jacobian is shared across the batch. Reduce its
+// matrix adjoints first, then apply that Jacobian only once per head.
+template <int rank>
+__global__ __launch_bounds__(128) void static_core_gradient_reduce_kernel(
+    const float* d_k, float* reduced, int64_t batch, int64_t heads) {
+    const int64_t head = blockIdx.x;
+    for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < rank * rank;
+         i += gridDim.y * blockDim.x) {
+        float value = 0.0f;
+        for (int64_t b = 0; b < batch; ++b) value += d_k[(b * heads + head) * rank * rank + i];
+        reduced[head * rank * rank + i] = value;
+    }
+}
+
 template <int rank>
 __global__ __launch_bounds__(kThreads) void generic_core_relation_vjp_kernel(
     const float* __restrict__ tape,
@@ -671,9 +696,10 @@ __global__ __launch_bounds__(kThreads) void generic_core_relation_vjp_kernel(
     }
     __syncthreads();
     for (int linear = threadIdx.x; linear < rank * rank; linear += blockDim.x) {
-        atomicAdd(
-            grad_core_base_raw + head * rank * rank + linear,
-            raw_adjoint[linear]);
+        if (core_mode == 1)
+            grad_core_base_raw[head * rank * rank + linear] = raw_adjoint[linear];
+        else
+            atomicAdd(grad_core_base_raw + head * rank * rank + linear, raw_adjoint[linear]);
     }
     for (int linear = threadIdx.x; linear < rank * rank; linear += blockDim.x) {
         system_d_k[linear] = raw_adjoint[linear];
@@ -869,8 +895,9 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
             const int64_t global_feature = feature_start + feature;
             compact_a(row, feature) = __float2bfloat16_rn(
                 global_feature < head_dim
-                    ? 2.0f * equilibrium[row * head_dim + global_feature] -
-                        (1.0f + eta) * compact_state[row * head_dim + global_feature]
+                    ? compact_readout_coefficient(compact_state[row * head_dim + global_feature],
+                        equilibrium[row * head_dim + global_feature], eta,
+                        tape_layout.u_offset == tape_layout.z_offset)
                     : 0.0f);
         }
         for (int linear = threadIdx.x; linear < kRhsTile * rank;
@@ -923,8 +950,9 @@ __global__ __launch_bounds__(kThreads) void generic_frame_compact_adjoint_kernel
             const int64_t global_feature = feature_start + feature;
             if (global_feature < head_dim) {
                 system_compact_state_reconstruction[row * head_dim + global_feature] =
-                    2.0f * equilibrium[row * head_dim + global_feature] -
-                    (1.0f + eta) * compact_state[row * head_dim + global_feature];
+                    compact_readout_coefficient(compact_state[row * head_dim + global_feature],
+                    equilibrium[row * head_dim + global_feature], eta,
+                    tape_layout.u_offset == tape_layout.z_offset);
             }
         }
         __syncthreads();
@@ -1411,7 +1439,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
     auto frame_c = at::empty({system_count, rank, rank}, options);
 
     const auto stream = at::cuda::getCurrentCUDAStream(projected.get_device()).stream();
-    if (grad_core_base_raw.numel() > 0) C10_CUDA_CHECK(cudaMemsetAsync(
+    if (shape.core_mode == 0) C10_CUDA_CHECK(cudaMemsetAsync(
         grad_core_base_raw.data_ptr<float>(),
         0,
         grad_core_base_raw.numel() * sizeof(float),
@@ -1456,7 +1484,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         d_t.data_ptr<float>(),
         system_count,
         token_tiles,
-        shape.head_dim);
+        shape.head_dim, eta_raw.data_ptr<float>(),
+        shape.core_mode == 2 ? compact_state_adjoint.data_ptr<float>() : nullptr, shape.heads);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     generic_statistic_partials_kernel<scalar_t, rank, false><<<token_grid, kThreads, 0, stream>>>(
         nullptr,
@@ -1472,8 +1501,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         shape.head_dim,
         token_tiles);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (shape.core_mode != 2) {
     using Getrs = typename GenericEquilibriumGetrsMathDx<rank>::Transposed;
     constexpr size_t equilibrium_vjp_shared_bytes = Getrs::shared_memory_size;
+    if (use_shared_core_map(shape)) {
+        static_core_adjoint_kernel<rank><<<rhs_grid, kThreads, 0, stream>>>(
+            d_t.data_ptr<float>(), tape.data_ptr<float>(), eta_raw.data_ptr<float>(),
+            equilibrium_adjoint.data_ptr<float>(), compact_state_adjoint.data_ptr<float>(),
+            tape_layout, shape.heads, shape.head_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
     generic_equilibrium_vjp_kernel<rank><<<
         rhs_grid, kRhsTile, equilibrium_vjp_shared_bytes, stream>>>(
         d_t.data_ptr<float>(),
@@ -1487,6 +1524,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         shape.heads,
         shape.head_dim, shape.core_mode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    }
     if (shape.core_mode != 2) {
     generic_d_k_kernel<rank><<<system_count, kThreads, 0, stream>>>(
         equilibrium_adjoint.data_ptr<float>(),
@@ -1506,16 +1545,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         equilibrium_adjoint.data_ptr<float>(),
         system_count,
         token_tiles,
-        shape.head_dim);
+        shape.head_dim, nullptr, nullptr, shape.heads);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (shape.core_mode != 2) {
-    generic_core_relation_vjp_kernel<rank><<<system_count, kThreads, 0, stream>>>(
-        tape.data_ptr<float>(),
-        d_k.data_ptr<float>(),
-        grad_core_base_raw.data_ptr<float>(),
-        tape_layout,
-        system_count,
-        shape.heads, shape.core_mode);
+    float* core_gradient = d_k.data_ptr<float>();
+    if (shape.core_mode == 1 && shape.batch > 1) {
+        // frame_c is dead until the later frame VJP; keep reduction input
+        // disjoint from the parameter-gradient output (both are restrict pointers).
+        core_gradient = frame_c.data_ptr<float>();
+        static_core_gradient_reduce_kernel<rank><<<dim3(shape.heads, (rank * rank + 127) / 128), 128, 0, stream>>>(
+            d_k.data_ptr<float>(), core_gradient, shape.batch, shape.heads);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    const int64_t core_gradient_systems = shape.core_mode == 1 ? shape.heads : system_count;
+    generic_core_relation_vjp_kernel<rank><<<core_gradient_systems, kThreads, 0, stream>>>(
+        tape.data_ptr<float>(), core_gradient, grad_core_base_raw.data_ptr<float>(),
+        tape_layout, core_gradient_systems, shape.heads, shape.core_mode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     if (shape.core_mode == 0) {

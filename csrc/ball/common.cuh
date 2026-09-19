@@ -67,6 +67,21 @@ struct FastPathShape {
     int core_mode; // 0 Dynamic, 1 Static, 2 Zero
 };
 
+// Amortize an identity-RHS solve only when many sample RHS blocks share K.
+inline bool use_shared_core_map(FastPathShape shape) {
+    return shape.core_mode == 1 && shape.batch >= 4 && shape.batch * shape.head_dim >= 4 * shape.rank;
+}
+
+template <int rank, bool transpose>
+__device__ __forceinline__ float apply_core_map_element(
+    const float* map, const float* state, int row, int column, int64_t head_dim) {
+    float value = 0.0f;
+    for (int k = 0; k < rank; ++k)
+        value = fmaf(map[transpose ? k * rank + row : row * rank + k],
+                     state[k * head_dim + column], value);
+    return value;
+}
+
 // One contiguous FP32 activation tape per [batch, head] system.  The tensor is
 // intentionally private to the native autograd boundary; its layout makes the
 // long token sections contiguous for the tiled VJPs.
@@ -92,9 +107,9 @@ inline TrainingTapeLayout training_tape_layout(FastPathShape shape) {
     const int64_t l_offset = p_offset + relation_elements;
     const int64_t z_offset = l_offset + matrix_elements;
     const int64_t coordinates_offset = z_offset + compact_elements;
-    const int64_t lu_offset = coordinates_offset + matrix_elements;
-    const int64_t u_offset = lu_offset + matrix_elements;
-    const int64_t scale_offset = u_offset + compact_elements;
+    const int64_t lu_offset = coordinates_offset + (shape.core_mode == 2 ? 0 : matrix_elements);
+    const int64_t u_offset = shape.core_mode == 2 ? z_offset : lu_offset + matrix_elements;
+    const int64_t scale_offset = shape.core_mode == 2 ? z_offset + compact_elements : u_offset + compact_elements;
     return {
         b_offset,
         p_offset,
@@ -106,6 +121,14 @@ inline TrainingTapeLayout training_tape_layout(FastPathShape shape) {
         scale_offset,
         scale_offset + 1,
     };
+}
+
+// The correction is 2U-Z for learned cores and zero for Zero. Combining it
+// with the base coefficient keeps every mode on the same token readout/VJP.
+__device__ __forceinline__ float compact_readout_coefficient(
+    float z, float u, float eta, bool zero_core) {
+    const float correction = zero_core ? 0.0f : 2.0f * u - z;
+    return correction - eta * z;
 }
 
 // Share normalized relation loads between forward and backward reconstruction.
@@ -164,8 +187,8 @@ inline ForwardWorkspaceLayout inference_workspace_layout(FastPathShape shape) {
     // Tensor-Core accumulator and therefore needs no global coordinate slot.
     const int64_t coordinates_offset = 0;
     const int64_t lu_offset = z_offset + compact_elements;
-    const int64_t u_offset = lu_offset + matrix_elements;
-    const int64_t scale_offset = u_offset + compact_elements;
+    const int64_t u_offset = shape.core_mode == 2 ? z_offset : lu_offset + matrix_elements;
+    const int64_t scale_offset = shape.core_mode == 2 ? z_offset + compact_elements : u_offset + compact_elements;
     return {
         b_offset,
         l_offset,

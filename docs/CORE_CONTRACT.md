@@ -74,8 +74,10 @@ correction gradient `G`, the CUDA reference uses the equivalent VJP
 occurrences of K. The backward solve reuses the forward LU factors.
 Static broadcasts its shared correction matrix over the batch; its matrix
 gradient accumulates contributions from all samples. This algebraic rewrite preserves the operator; removal of rotation changes
-the checkpoint contract. Native CUDA retains its equivalent
-fused equilibrium/tape form and is checked against this reference.
+the checkpoint contract. Native CUDA forms the learned correction as `2U-Z` and shares the final
+`correction-eta Z` coefficient with Zero, whose correction is exactly zero.
+Its Static schedule can apply a once-per-head solved map instead of repeated
+RHS solves; all schedules are checked against this reference.
 
 At R = 0, L = I, Omega = 0, U = Z / 2, and M = 0. DYNAMIC and STATIC both
 start at this compact point; DYNAMIC additionally starts with W_drive = 0.
@@ -107,7 +109,7 @@ are zeroed before every compact statistic.
 ## Serialized and numerical boundaries
 
 The current model `_extra_state` contract is version **13**. This is separate
-from native CUDA ABI **9** and the ImageNet runner envelope format **5**.
+from native CUDA ABI **10** and the ImageNet runner envelope format **7**.
 Loading requires every saved operator-contract field to match, including model
 geometry and ablations. Missing or mismatched contracts fail even under
 `strict=False`; older weights need explicit validation before migration.
@@ -129,3 +131,16 @@ retaining the accretive factor. `scalar_complement=False` fixes eta to zero
 with no learned complement update. Both flags are recorded in the model
 checkpoint contract and require `implementation="reference"`. The native
 default continues to require both flags enabled.
+
+
+The default CUDA path uniformly uses a no-frame implementation of these same
+identities: `R^T R=I+A^T A`, `Z=R^-T A^T C`, and
+`Y=eta C + A R^-1(correction-eta Z)`. It shares compact and token code across
+core modes. For `N<=r`, the base is computed as `eta (I+A A^T)^-1 C` to avoid
+subtractive cancellation. This changes scheduling and rounding, not the model.
+See `CUDA_CONTRACT.md` for the primal/dual dimension choice and the fixed mixed-precision policy.
+
+The frame is soft: `PP^T = A(I+A^T A)^-1 A^T`, so the common base is
+`eta (I+A A^T)^-1 C`, not an orthogonal projection onto a null space.
+Dynamic, Static and Zero all share this base. With `K=I`, the correction
+vanishes in any mode; the trainable core derivatives need not vanish.

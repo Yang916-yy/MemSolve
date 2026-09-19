@@ -314,6 +314,89 @@ __global__ __launch_bounds__(kThreads) void generic_frame_kernel(
     }
 }
 
+
+// Split only long, low-system-count scans. All paths preserve the same detached
+// maximum scale and FP32 normalization; no sequence-wide CTA is needed here.
+constexpr int kScaleTokenTile = 256;
+
+template <typename scalar_t, int rank>
+__global__ __launch_bounds__(kThreads) void relation_scale_partials_kernel(
+    const scalar_t* projected, const float* valid_counts, float* partials,
+    int64_t length, int64_t heads, int64_t dim, int64_t tiles) {
+    const int64_t system = blockIdx.x;
+    const int64_t batch = system / heads;
+    const int64_t head = system % heads;
+    const float normalizer = rsqrtf(valid_counts ? valid_counts[batch] : float(length));
+    float value = 1.0f;
+    const int64_t start = int64_t(blockIdx.y) * kScaleTokenTile;
+    for (int i = threadIdx.x; i < kScaleTokenTile * rank; i += blockDim.x) {
+        const int64_t token = start + i / rank;
+        if (token < length) {
+            value = fmaxf(value, fabsf(load_scalar(projected,
+                (batch * length + token) * (heads * rank + dim) + head * rank + i % rank) * normalizer));
+        }
+    }
+    __shared__ float values[kThreads];
+    values[threadIdx.x] = value;
+    __syncthreads();
+    for (int offset = kThreads / 2; offset; offset /= 2) {
+        if (threadIdx.x < offset) values[threadIdx.x] = fmaxf(values[threadIdx.x], values[threadIdx.x + offset]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[system * tiles + blockIdx.y] = values[0];
+}
+
+__global__ __launch_bounds__(kThreads) void relation_scale_reduce_kernel(
+    const float* partials, float* tape, ForwardWorkspaceLayout layout, int64_t tiles) {
+    float value = 1.0f;
+    for (int64_t i = threadIdx.x; i < tiles; i += blockDim.x)
+        value = fmaxf(value, partials[int64_t(blockIdx.x) * tiles + i]);
+    __shared__ float values[kThreads];
+    values[threadIdx.x] = value;
+    __syncthreads();
+    for (int offset = kThreads / 2; offset; offset /= 2) {
+        if (threadIdx.x < offset) values[threadIdx.x] = fmaxf(values[threadIdx.x], values[threadIdx.x + offset]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) tape[int64_t(blockIdx.x) * layout.stride + layout.scale_offset] = values[0];
+}
+
+template <typename scalar_t, int rank>
+__global__ __launch_bounds__(kThreads) void relation_prepare_tiled_kernel(
+    const scalar_t* projected, const float* valid_counts, float* tape,
+    ForwardWorkspaceLayout layout, int64_t length, int64_t heads, int64_t dim) {
+    const int64_t system = blockIdx.x, batch = system / heads, head = system % heads;
+    const float normalizer = rsqrtf(valid_counts ? valid_counts[batch] : float(length));
+    float* state = tape + system * layout.stride;
+    const float inverse_scale = 1.0f / state[layout.scale_offset];
+    const int64_t start = int64_t(blockIdx.y) * kScaleTokenTile;
+    for (int i = threadIdx.x; i < kScaleTokenTile * rank; i += blockDim.x) {
+        const int64_t token = start + i / rank;
+        if (token < length) {
+            const float a = load_scalar(projected,
+                (batch * length + token) * (heads * rank + dim) + head * rank + i % rank) * normalizer;
+            state[layout.b_offset + token * rank + i % rank] = a * inverse_scale;
+        }
+    }
+}
+
+// Bound each serial partial sum, exposing additional independent CTAs before
+// the small Cholesky factorization. FP32 reduction order remains deterministic.
+template <int rank>
+__global__ __launch_bounds__(kThreads) void gram_group_reduce_kernel(
+    const float* input, float* output, int64_t tiles, int64_t groups) {
+    constexpr int elements = rank * (rank + 1) / 2;
+    constexpr int group_size = 32;
+    const int64_t system = blockIdx.x, group = blockIdx.y;
+    for (int i = threadIdx.x; i < elements; i += blockDim.x) {
+        float value = 0.0f;
+        const int64_t end = min(tiles, (group + 1) * group_size);
+        for (int64_t t = group * group_size; t < end; ++t)
+            value += input[(system * tiles + t) * elements + i];
+        output[(system * groups + group) * elements + i] = value;
+    }
+}
+
 template <int rank>
 __global__ __launch_bounds__(kThreads) void generic_frame_factor_kernel(
     const float* __restrict__ tape,
@@ -904,14 +987,46 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
     }
 }
 
+
+// Solve against identity once per head. This is the same compact correction
+// map as M=2S-I, storing S to reuse the existing fused equilibrium tape/VJP.
 template <int rank>
-__global__ void zero_state_kernel(float* tape, ForwardWorkspaceLayout layout,
-                                  int64_t systems, int64_t head_dim) {
-    const int64_t system = blockIdx.x;
-    if (system >= systems) return;
+__global__ __launch_bounds__(kRhsTile) void static_core_map_kernel(
+    float* tape, const int* pivots, ForwardWorkspaceLayout layout) {
+    using Getrs = typename GenericCoreSolveMathDx<rank>::Getrs;
+    const int64_t head = blockIdx.x;
+    float* destination = tape + head * layout.stride + layout.lu_offset;
+    extern __shared__ __align__(16) unsigned char shared_raw[];
+    auto [lu, rhs, pivot] = cusolverdx::shared_memory::slice<float, float, int>(
+        shared_raw, 16u, rank * Getrs::lda, 16u, rank * Getrs::ldb, 16u, rank);
+    for (int i = threadIdx.x; i < rank * rank; i += blockDim.x) lu[i] = destination[i];
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) pivot[i] = pivots[head * rank + i];
+    __syncthreads();
+    for (int start = 0; start < rank; start += kRhsTile) {
+        for (int i = threadIdx.x; i < rank * kRhsTile; i += blockDim.x)
+            rhs[i] = i / kRhsTile == start + i % kRhsTile ? 1.0f : 0.0f;
+        __syncthreads();
+        Getrs().execute(lu, Getrs::lda, pivot, rhs, Getrs::ldb);
+        __syncthreads();
+        for (int i = threadIdx.x; i < rank * kRhsTile; i += blockDim.x)
+            if (start + i % kRhsTile < rank)
+                destination[(i / kRhsTile) * rank + start + i % kRhsTile] = rhs[i];
+        __syncthreads();
+    }
+}
+
+template <int rank>
+__global__ __launch_bounds__(kThreads) void static_core_apply_kernel(
+    float* tape, ForwardWorkspaceLayout layout, int64_t heads, int64_t head_dim) {
+    const int64_t system = blockIdx.x, start = int64_t(blockIdx.y) * kRhsTile;
+    const float* map = tape + (system % heads) * layout.stride + layout.lu_offset;
     float* entry = tape + system * layout.stride;
-    for (int64_t i = threadIdx.x; i < rank * head_dim; i += blockDim.x)
-        entry[layout.u_offset + i] = 0.5f * entry[layout.z_offset + i];
+    for (int i = threadIdx.x; i < rank * kRhsTile; i += blockDim.x) {
+        const int row = i / kRhsTile, col = start + i % kRhsTile;
+        if (col < head_dim)
+            entry[layout.u_offset + row * head_dim + col] =
+                apply_core_map_element<rank, false>(map, entry + layout.z_offset, row, col, head_dim);
+    }
 }
 
 template <int rank>
@@ -1036,8 +1151,9 @@ __global__ __launch_bounds__(kThreads) void generic_output_kernel(
             const int column = linear - row * kRhsTile;
             const int64_t feature = rhs_start + column;
             const float compact_mix = feature < head_dim
-                ? 2.0f * equilibrium[row * head_dim + feature] -
-                    (1.0f + eta) * compact_state[row * head_dim + feature]
+                ? compact_readout_coefficient(compact_state[row * head_dim + feature],
+                    equilibrium[row * head_dim + feature], eta,
+                    workspace_layout.u_offset == workspace_layout.z_offset)
                 : 0.0f;
             readout_b(row, column) = __float2bfloat16_rn(compact_mix);
         }
@@ -1138,7 +1254,7 @@ ForwardResult launch_generic_forward(
         : inference_workspace_layout(shape);
     const auto workspace_options = projected.options().dtype(at::kFloat);
     auto workspace = at::empty({system_count, workspace_layout.stride}, workspace_options);
-    auto pivot_workspace = at::empty({system_count, rank}, projected.options().dtype(at::kInt));
+    auto pivot_workspace = at::empty({system_count, shape.core_mode == 2 ? 0 : rank}, projected.options().dtype(at::kInt));
     at::Tensor tape;
     at::Tensor pivots;
     int64_t frame_offset = workspace_layout.b_offset;
@@ -1152,6 +1268,22 @@ ForwardResult launch_generic_forward(
     configure_forward_kernel_attributes<scalar_t, rank, record_tape>(
         projected.get_device());
     const auto stream = at::cuda::getCurrentCUDAStream(projected.get_device()).stream();
+    if (shape.length >= 4096 && system_count < 128) {
+        const int64_t tiles = (shape.length + kScaleTokenTile - 1) / kScaleTokenTile;
+        auto partials = at::empty({system_count, tiles}, workspace_options);
+        const dim3 grid(system_count, tiles);
+        relation_scale_partials_kernel<scalar_t, rank><<<grid, kThreads, 0, stream>>>(
+            projected.data_ptr<scalar_t>(), valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
+            partials.data_ptr<float>(), shape.length, shape.heads, shape.dim, tiles);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        relation_scale_reduce_kernel<<<system_count, kThreads, 0, stream>>>(
+            partials.data_ptr<float>(), workspace.data_ptr<float>(), workspace_layout, tiles);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        relation_prepare_tiled_kernel<scalar_t, rank><<<grid, kThreads, 0, stream>>>(
+            projected.data_ptr<scalar_t>(), valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
+            workspace.data_ptr<float>(), workspace_layout, shape.length, shape.heads, shape.dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
     generic_frame_kernel<scalar_t, rank><<<system_count, kThreads, 0, stream>>>(
         projected.data_ptr<scalar_t>(),
         valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
@@ -1162,6 +1294,8 @@ ForwardResult launch_generic_forward(
         shape.heads,
         shape.dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    }
 
     const int64_t token_tiles =
         (shape.length + kGenericTokenTile - 1) / kGenericTokenTile;
@@ -1192,6 +1326,17 @@ ForwardResult launch_generic_forward(
             token_tiles);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+        at::Tensor grouped_partials;
+        int64_t factor_tiles = token_tiles;
+        if (token_tiles >= 128 && system_count < 128) {
+            factor_tiles = (token_tiles + 31) / 32;
+            grouped_partials = at::empty({system_count, factor_tiles, kPackedLowerElements}, workspace_options);
+            gram_group_reduce_kernel<rank><<<dim3(system_count, factor_tiles), kThreads, 0, stream>>>(
+                gram_partial_data, grouped_partials.data_ptr<float>(), token_tiles, factor_tiles);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            gram_partial_data = grouped_partials.data_ptr<float>();
+            gram_partial_system_stride = factor_tiles * kPackedLowerElements;
+        }
         constexpr size_t factor_partials_shared_bytes =
             generic_frame_factor_partials_shared_bytes<rank>();
         generic_frame_factor_partials_kernel<rank><<<
@@ -1201,7 +1346,7 @@ ForwardResult launch_generic_forward(
             gram_partial_data,
             gram_partial_system_stride,
             system_count,
-            token_tiles);
+            factor_tiles);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     } else {
         constexpr size_t frame_shared_bytes = generic_frame_shared_bytes<rank>();
@@ -1310,6 +1455,14 @@ ForwardResult launch_generic_forward(
 
     using Getrs = typename GenericCoreSolveMathDx<rank>::Getrs;
     constexpr size_t solve_shared_bytes = Getrs::shared_memory_size;
+    if (use_shared_core_map(shape)) {
+        static_core_map_kernel<rank><<<shape.heads, kRhsTile, solve_shared_bytes, stream>>>(
+            workspace.data_ptr<float>(), pivot_workspace.data_ptr<int>(), workspace_layout);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        static_core_apply_kernel<rank><<<rhs_grid, kThreads, 0, stream>>>(
+            workspace.data_ptr<float>(), workspace_layout, shape.heads, shape.head_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
     generic_solve_kernel<rank><<<rhs_grid, kRhsTile, solve_shared_bytes, stream>>>(
         workspace.data_ptr<float>(),
         pivot_workspace.data_ptr<int>(),
@@ -1318,11 +1471,8 @@ ForwardResult launch_generic_forward(
         shape.heads,
         shape.head_dim, shape.core_mode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
-    } else {
-        zero_state_kernel<rank><<<system_count, kThreads, 0, stream>>>(
-            workspace.data_ptr<float>(), workspace_layout, system_count, shape.head_dim);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
     const dim3 output_grid(

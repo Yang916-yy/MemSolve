@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import importlib
 import os
 from pathlib import Path
@@ -7,10 +8,9 @@ from threading import Lock
 
 import torch
 
-
 _LOAD_LOCK = Lock()
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
-_NATIVE_CONTRACT_VERSION = 9
+_NATIVE_CONTRACT_VERSION = 10
 _RUNTIME_PACKAGE = "lsso_cuda_runtime"
 _LOADED_ARCHITECTURE: int | None = None
 
@@ -92,8 +92,7 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
         resolved_device = torch.device(device)
     if resolved_device.type != "cuda":
         raise ValueError(
-            "the LSSO CUDA fast path requires a CUDA device, "
-            f"got {resolved_device}"
+            "the LSSO CUDA fast path requires a CUDA device, " f"got {resolved_device}"
         )
     if resolved_device.index is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
@@ -217,7 +216,653 @@ def load(
         _LOADED_ARCHITECTURE = requested_architecture
 
 
-class _FastMix(torch.autograd.Function):
+@lru_cache(maxsize=1)
+def _no_frame_kernels():
+    # Lazily import the Triton supplied by CUDA PyTorch, as for projections.
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def _mixed_dot(a, b):
+        # The token operand is already BF16. Preserve the compact FP32
+        # coefficient with two BF16 words (Henry et al., arXiv:1904.06376).
+        # One BF16 rounding fails the scale-64 forward/gradient envelope.
+        hi = b.to(tl.bfloat16)
+        lo = (b - hi.to(tl.float32)).to(tl.bfloat16)
+        return tl.dot(a, hi) + tl.dot(a, lo)
+
+    @jit
+    def _statistics(
+        X,
+        E,
+        COUNT,
+        G,
+        Q,
+        DE,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        R: tl.constexpr,
+        D: tl.constexpr,
+        T: tl.constexpr,
+        GRAD: tl.constexpr,
+        HAS_COUNT: tl.constexpr,
+        BR: tl.constexpr,
+        BD: tl.constexpr,
+        BT: tl.constexpr,
+    ):
+        s = tl.program_id(0)
+        tile = tl.program_id(1)
+        b = s // H
+        h = s % H
+        count = tl.load(COUNT + b) if HAS_COUNT else float(N)
+        n = tile * BT + tl.arange(0, BT)
+        r = tl.arange(0, BR)
+        d = tl.arange(0, BD)
+        a = tl.load(
+            X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
+            (n[:, None] < N) & (r[None, :] < R),
+            0,
+        )
+        if not GRAD:
+            g = tl.dot(tl.trans(a), a).to(tl.float32) / count
+            tl.store(
+                G + ((s * T + tile) * R + r[:, None]) * R + r[None, :],
+                g, (r[:, None] < R) & (r[None, :] < R),
+            )
+        de = tl.full((), 0.0, tl.float32)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            c = tl.load(
+                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D), 0,
+            )
+            if GRAD:
+                e = tl.load(
+                    E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
+                    (n[:, None] < N) & (d[None, :] < D), 0,
+                )
+                q = tl.dot(tl.trans(a), e).to(tl.float32) / tl.sqrt(count)
+                de += tl.sum(tl.sum(e.to(tl.float32) * c.to(tl.float32), 0), 0)
+            else:
+                q = tl.dot(tl.trans(a), c).to(tl.float32) / tl.sqrt(count)
+            tl.store(
+                Q + ((s * T + tile) * R + r[:, None]) * D + d[None, :],
+                q, (r[:, None] < R) & (d[None, :] < D),
+            )
+        if GRAD:
+            tl.store(DE + s * T + tile, de)
+
+    @jit
+    def _readout(
+        X,
+        V,
+        ETA,
+        COUNT,
+        Y,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        R: tl.constexpr,
+        D: tl.constexpr,
+        HAS_COUNT: tl.constexpr,
+        BR: tl.constexpr,
+        BD: tl.constexpr,
+        BT: tl.constexpr,
+    ):
+        s = tl.program_id(0)
+        tile = tl.program_id(1)
+        b = s // H
+        h = s % H
+        count = tl.load(COUNT + b) if HAS_COUNT else float(N)
+        n = tile * BT + tl.arange(0, BT)
+        r = tl.arange(0, BR)
+        d = tl.arange(0, BD)
+        a = tl.load(
+            X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
+            (n[:, None] < N) & (r[None, :] < R),
+            0,
+        )
+        eta = tl.load(ETA + h)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            c = tl.load(
+                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D),
+                0,
+            ).to(tl.float32)
+            v = tl.load(
+                V + (s * R + r[:, None]) * D + d[None, :],
+                (r[:, None] < R) & (d[None, :] < D),
+                0,
+            ).to(tl.float32)
+            y = eta * c + _mixed_dot(a, v) / tl.sqrt(count)
+            tl.store(
+                Y + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
+                y,
+                (n[:, None] < N) & (d[None, :] < D),
+            )
+
+    @jit
+    def _token_backward(
+        X,
+        E,
+        V,
+        DG,
+        DQ,
+        ETA,
+        COUNT,
+        DX,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        R: tl.constexpr,
+        D: tl.constexpr,
+        HAS_COUNT: tl.constexpr,
+        BR: tl.constexpr,
+        BD: tl.constexpr,
+        BT: tl.constexpr,
+    ):
+        s = tl.program_id(0)
+        tile = tl.program_id(1)
+        b = s // H
+        h = s % H
+        count = tl.load(COUNT + b) if HAS_COUNT else float(N)
+        n = tile * BT + tl.arange(0, BT)
+        r = tl.arange(0, BR)
+        d = tl.arange(0, BD)
+        a = tl.load(
+            X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
+            (n[:, None] < N) & (r[None, :] < R),
+            0,
+        )
+        g = tl.load(
+            DG + (s * R + r[:, None]) * R + r[None, :],
+            (r[:, None] < R) & (r[None, :] < R),
+            0,
+        )
+        g = (g + tl.trans(g)).to(tl.float32)
+        inv = 1.0 / tl.sqrt(count)
+        eta = tl.load(ETA + h)
+        da = _mixed_dot(a, g) * (inv * inv)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            c = tl.load(
+                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D),
+                0,
+            )
+            e = tl.load(
+                E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D),
+                0,
+            )
+            v = tl.load(
+                V + (s * R + r[:, None]) * D + d[None, :],
+                (r[:, None] < R) & (d[None, :] < D),
+                0,
+            ).to(tl.float32)
+            dq = tl.load(
+                DQ + (s * R + r[:, None]) * D + d[None, :],
+                (r[:, None] < R) & (d[None, :] < D),
+                0,
+            ).to(tl.float32)
+            da += (_mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
+            dc = eta * e.to(tl.float32) + _mixed_dot(a, dq) * inv
+            tl.store(
+                DX + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                dc, (n[:, None] < N) & (d[None, :] < D),
+            )
+        tl.store(
+            DX + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
+            da, (n[:, None] < N) & (r[None, :] < R),
+        )
+
+    @jit
+    def _solve_kernel(
+        A, B, X, R: tl.constexpr, D: tl.constexpr, BR: tl.constexpr, BD: tl.constexpr
+    ):
+        s = tl.program_id(0)
+        r = tl.arange(0, BR)
+        c = tl.arange(0, BR)
+        d = tl.program_id(1) * BD + tl.arange(0, BD)
+        a = tl.load(
+            A + (s * R + r[:, None]) * R + c[None, :],
+            (r[:, None] < R) & (c[None, :] < R),
+            0,
+        )
+        b = tl.load(
+            B + (s * R + r[:, None]) * D + d[None, :],
+            (r[:, None] < R) & (d[None, :] < D),
+            0,
+        )
+        for k in range(R):
+            col = tl.sum(tl.where(c[None, :] == k, a, 0.0), 1)
+            scores = tl.where((r >= k) & (r < R), tl.abs(col), -1.0)
+            pivot = tl.argmax(scores, 0)
+            ak = tl.sum(tl.where(r[:, None] == k, a, 0.0), 0)
+            ap = tl.sum(tl.where(r[:, None] == pivot, a, 0.0), 0)
+            bk = tl.sum(tl.where(r[:, None] == k, b, 0.0), 0)
+            bp = tl.sum(tl.where(r[:, None] == pivot, b, 0.0), 0)
+            a = tl.where(
+                r[:, None] == k,
+                ap[None, :],
+                tl.where(r[:, None] == pivot, ak[None, :], a),
+            )
+            b = tl.where(
+                r[:, None] == k,
+                bp[None, :],
+                tl.where(r[:, None] == pivot, bk[None, :], b),
+            )
+            diag = tl.sum(tl.where(c == k, ap, 0.0), 0)
+            ar = ap / diag
+            br = bp / diag
+            col = tl.sum(tl.where(c[None, :] == k, a, 0.0), 1)
+            a = tl.where(r[:, None] == k, ar[None, :], a - col[:, None] * ar[None, :])
+            b = tl.where(r[:, None] == k, br[None, :], b - col[:, None] * br[None, :])
+        tl.store(
+            X + (s * R + r[:, None]) * D + d[None, :],
+            b,
+            (r[:, None] < R) & (d[None, :] < D),
+        )
+
+    return _statistics, _readout, _token_backward, _solve_kernel
+
+
+def _no_frame_block_size(size: int) -> int:
+    return max(16, 1 << (size - 1).bit_length())
+
+
+def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None):
+    batch, length, width = projected.shape
+    head_dim = (width - heads * rank) // heads
+    tiles = (length + 127) // 128
+    options = dict(device=projected.device, dtype=torch.float32)
+    cross = torch.empty((batch * heads, tiles, rank, head_dim), **options)
+    if gradient is None:
+        gram = torch.empty((batch * heads, tiles, rank, rank), **options)
+        eta_gradient = cross
+    else:
+        gram = cross
+        eta_gradient = torch.empty((batch * heads, tiles), **options)
+    _no_frame_kernels()[0][(batch * heads, tiles)](
+        projected,
+        gradient,
+        counts,
+        gram,
+        cross,
+        eta_gradient,
+        length,
+        heads,
+        rank,
+        head_dim,
+        tiles,
+        gradient is not None,
+        counts is not None,
+        _no_frame_block_size(rank),
+        min(128, _no_frame_block_size(head_dim)),
+        128,
+        num_warps=4,
+        num_stages=1,
+    )
+    cross = cross.sum(1).view(batch, heads, rank, head_dim)
+    if gradient is None:
+        return gram.sum(1).view(batch, heads, rank, rank), cross
+    return cross, eta_gradient.sum(1).view(batch, heads).sum(0)
+
+
+def _no_frame_solve(system, rhs):
+    rank, columns = rhs.shape[-2:]
+    system, rhs = system.contiguous(), rhs.contiguous()
+    result = torch.empty_like(rhs)
+    _no_frame_kernels()[3][(system.numel() // (rank * rank), (columns + 127) // 128)](
+        system,
+        rhs,
+        result,
+        rank,
+        columns,
+        _no_frame_block_size(rank),
+        min(128, _no_frame_block_size(columns)),
+        num_warps=4,
+        num_stages=1,
+    )
+    return result
+
+
+class _NoFrameSolve(torch.autograd.Function):
+    """General partial-pivot solve with an implicit, first-order FP32 VJP."""
+
+    @staticmethod
+    def forward(ctx, system, rhs):
+        result = _no_frame_solve(system, rhs)
+        ctx.save_for_backward(system, result)
+        return result
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        system, result = ctx.saved_tensors
+        adjoint = _no_frame_solve(system.mT, gradient)
+        return -(adjoint @ result.mT), adjoint
+
+
+def _no_frame_compact(gram, cross, base, drive, raw, counts, mode):
+    # QR-equivalent coordinates: R^T R=I+A^T A, Z=R^-T A^T C,
+    # V=R^-1(Delta-eta*Z), Y=eta*C+A*V. No token-sized P is stored.
+    # reference.py remains the owner of the generator and complement mapping.
+    from .reference import accretive_generator, bounded_complement
+
+    rank = gram.shape[-1]
+    identity = torch.eye(rank, device=gram.device, dtype=gram.dtype)
+    factor, _info = torch.linalg.cholesky_ex(gram + identity, check_errors=False)
+    state = torch.linalg.solve_triangular(factor, cross, upper=False)
+    eta = bounded_complement(raw)
+    if mode == 2:
+        correction = torch.zeros_like(state)
+    else:
+        coordinates = (
+            base
+            if mode == 1
+            else base + state @ drive / counts.sqrt().view(-1, 1, 1, 1)
+        )
+        generator = accretive_generator(coordinates)
+        if mode == 1:
+            mapping = _NoFrameSolve.apply(identity + generator, identity - generator)
+            correction = mapping @ state
+        else:
+            correction = _NoFrameSolve.apply(
+                identity + generator, (identity - generator) @ state
+            )
+    coefficient = torch.linalg.solve_triangular(
+        factor.mT,
+        correction - eta[None, :, None, None] * state,
+        upper=True,
+    )
+    return coefficient, eta
+
+
+def _no_frame_forward(projected, base, drive, raw, counts, *, record):
+    from .reference import _ieee_fp32_matmul
+
+    heads, rank = base.shape[:2]
+    batch, length, width = projected.shape
+    head_dim = (width - heads * rank) // heads
+    mode = 2 if base.numel() == 0 else (1 if drive.numel() == 0 else 0)
+    gram, cross = _no_frame_statistics(projected, heads, rank, counts=counts)
+    normalization = (
+        counts
+        if counts is not None
+        else torch.full(
+            (batch,),
+            float(length),
+            device=projected.device,
+            dtype=torch.float32,
+        )
+    )
+    # All compact operations remain FP32 regardless of the caller's AMP/TF32
+    # policy. No process-wide precision setting is left changed.
+    with (
+        torch.set_grad_enabled(record),
+        torch.autocast(device_type="cuda", enabled=False),
+        _ieee_fp32_matmul(projected.device),
+    ):
+        leaves = [
+            value.detach().requires_grad_(record)
+            for value in (gram, cross, base, drive, raw)
+        ]
+        coefficient, eta = _no_frame_compact(*leaves, normalization, mode)
+        coefficient = coefficient.contiguous()
+    output = torch.empty(
+        (batch, length, heads * head_dim),
+        device=projected.device,
+        dtype=projected.dtype,
+    )
+    _no_frame_kernels()[1][(batch * heads, (length + 127) // 128)](
+        projected,
+        coefficient,
+        eta,
+        counts,
+        output,
+        length,
+        heads,
+        rank,
+        head_dim,
+        counts is not None,
+        _no_frame_block_size(rank),
+        min(128, _no_frame_block_size(head_dim)),
+        128,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output, (coefficient, eta, *leaves)
+
+
+class _NoFrameMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, projected, base, drive, raw, counts):
+        output, saved = _no_frame_forward(
+            projected, base, drive, raw, counts, record=True
+        )
+        ctx.save_for_backward(projected, counts, *saved)
+        ctx.heads, ctx.rank = base.shape[:2]
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        from .reference import _ieee_fp32_matmul
+
+        projected, counts, coefficient, eta, *leaves = ctx.saved_tensors
+        heads, rank = ctx.heads, ctx.rank
+        batch, length, width = projected.shape
+        head_dim = (width - heads * rank) // heads
+        gradient = gradient.contiguous()
+        coefficient_gradient, eta_gradient = _no_frame_statistics(
+            projected,
+            heads,
+            rank,
+            gradient,
+            counts,
+        )
+        with (
+            torch.enable_grad(),
+            torch.autocast(device_type="cuda", enabled=False),
+            _ieee_fp32_matmul(projected.device),
+        ):
+            # Retain the private compact graph for repeated first-order VJPs
+            # when the public caller explicitly retains the outer graph.
+            (
+                gram_gradient,
+                cross_gradient,
+                base_gradient,
+                drive_gradient,
+                raw_gradient,
+            ) = torch.autograd.grad(
+                (coefficient, eta),
+                leaves,
+                grad_outputs=(coefficient_gradient, eta_gradient),
+                allow_unused=True,
+                retain_graph=True,
+            )
+        projected_gradient = torch.empty_like(projected)
+        _no_frame_kernels()[2][(batch * heads, (length + 127) // 128)](
+            projected,
+            gradient,
+            coefficient,
+            gram_gradient.contiguous(),
+            cross_gradient.contiguous(),
+            eta,
+            counts,
+            projected_gradient,
+            length,
+            heads,
+            rank,
+            head_dim,
+            counts is not None,
+            _no_frame_block_size(rank),
+            min(128, _no_frame_block_size(head_dim)),
+            128,
+            num_warps=4,
+        num_stages=1,
+        )
+        return projected_gradient, base_gradient, drive_gradient, raw_gradient, None
+
+
+def _short_no_frame_forward(projected, base, drive, raw, counts):
+    """Use the smaller token system for the cancellation-sensitive base term.
+
+    When N <= r, C-A(I+A^T A)^-1 A^T C = (I+A A^T)^-1 C.
+    The latter avoids subtracting nearly equal values for a strong relation.
+    Only at most r-by-r systems are formed; no explicit soft frame is needed.
+    """
+    from .reference import accretive_generator, bounded_complement, _ieee_fp32_matmul
+
+    batch, length, width = projected.shape
+    heads, rank = base.shape[:2]
+    head_dim = (width - heads * rank) // heads
+    with (
+        torch.autocast(device_type="cuda", enabled=False),
+        _ieee_fp32_matmul(projected.device),
+    ):
+        normalization = (
+            counts
+            if counts is not None
+            else torch.full(
+                (batch,),
+                float(length),
+                device=projected.device,
+                dtype=torch.float32,
+            )
+        )
+        relation, content = projected.float().split(
+            (heads * rank, heads * head_dim), dim=-1
+        )
+        relation = relation.reshape(batch, length, heads, rank).transpose(1, 2)
+        relation = relation / normalization.sqrt().view(batch, 1, 1, 1)
+        content = content.reshape(batch, length, heads, head_dim).transpose(1, 2)
+        identity_token = torch.eye(length, device=projected.device, dtype=torch.float32)
+        factor_token, _info = torch.linalg.cholesky_ex(
+            identity_token + relation @ relation.mT, check_errors=False
+        )
+        residual = torch.linalg.solve_triangular(factor_token, content, upper=False)
+        residual = torch.linalg.solve_triangular(factor_token.mT, residual, upper=True)
+        eta = bounded_complement(raw)
+        result = eta[None, :, None, None] * residual
+        if base.numel():
+            identity = torch.eye(rank, device=projected.device, dtype=torch.float32)
+            factor, _info = torch.linalg.cholesky_ex(
+                identity + relation.mT @ relation, check_errors=False
+            )
+            state = torch.linalg.solve_triangular(
+                factor, relation.mT @ content, upper=False
+            )
+            coordinates = (
+                base
+                if not drive.numel()
+                else base + state @ drive / normalization.sqrt().view(batch, 1, 1, 1)
+            )
+            generator = accretive_generator(coordinates)
+            if drive.numel():
+                correction = _NoFrameSolve.apply(
+                    identity + generator, (identity - generator) @ state
+                )
+            else:
+                correction = (
+                    _NoFrameSolve.apply(identity + generator, identity - generator)
+                    @ state
+                )
+            coefficient = torch.linalg.solve_triangular(
+                factor.mT, correction, upper=True
+            )
+            result = result + relation @ coefficient
+        return (
+            result.transpose(1, 2)
+            .reshape(batch, length, heads * head_dim)
+            .to(torch.bfloat16)
+        )
+
+
+class _ShortNoFrameMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, projected, base, drive, raw, counts):
+        with torch.enable_grad():
+            leaves = [
+                value.detach().requires_grad_(True)
+                for value in (projected, base, drive, raw)
+            ]
+            result = _short_no_frame_forward(*leaves, counts)
+        ctx.save_for_backward(result, *leaves)
+        return result.detach()
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        from .reference import _ieee_fp32_matmul
+
+        result, *leaves = ctx.saved_tensors
+        with (
+            torch.enable_grad(),
+            torch.autocast(device_type="cuda", enabled=False),
+            _ieee_fp32_matmul(result.device),
+        ):
+            gradients = torch.autograd.grad(
+                result, leaves, gradient, allow_unused=True, retain_graph=True
+            )
+        return (*gradients, None)
+
+
+def _validate_no_frame_inputs(projected, base, drive, raw, counts):
+    def require(condition, message):
+        if not condition:
+            raise RuntimeError(message)
+
+    require(projected.is_cuda, "projected must be a CUDA tensor")
+    require(
+        projected.ndim == 3 and projected.is_contiguous(),
+        "projected must be contiguous [B, N, H*R + D]",
+    )
+    require(
+        projected.dtype == torch.bfloat16,
+        "projected must use bfloat16 under the mixed precision CUDA contract",
+    )
+    for name, value in (
+        ("core_base_raw", base),
+        ("core_drive_weight", drive),
+        ("eta_raw", raw),
+    ):
+        require(
+            value.device == projected.device and value.is_contiguous(),
+            f"{name} must be contiguous on the same CUDA device",
+        )
+        require(value.dtype == torch.float32, f"{name} must use float32")
+    require(base.ndim == 3, "core_base_raw must have shape [H,R,R] or [H,R,0]")
+    batch, length, width = projected.shape
+    heads, rank, columns = base.shape
+    require(batch > 0 and length > 0 and heads > 0, "B, N, and H must be positive")
+    require(
+        rank in (16, 32, 48, 64), "the CUDA fast path supports rank in {16,32,48,64}"
+    )
+    require(columns in (0, rank), "core_base_raw must have shape [H,R,R] or [H,R,0]")
+    content_dim = width - heads * rank
+    require(
+        content_dim > 0 and content_dim % heads == 0,
+        "projected content width must be positive and divisible by H",
+    )
+    require(base.numel() != 0 or drive.numel() == 0, "Zero cannot have a dynamic drive")
+    require(
+        tuple(drive.shape)
+        == (heads, content_dim // heads, rank if drive.numel() else 0),
+        "core_drive_weight has an incompatible shape",
+    )
+    require(tuple(raw.shape) == (heads,), "eta_raw must have shape [H]")
+    if counts is not None:
+        require(
+            counts.device == projected.device
+            and counts.dtype == torch.float32
+            and counts.is_contiguous(),
+            "valid_counts must be contiguous float32 on the same CUDA device",
+        )
+        require(tuple(counts.shape) == (batch,), "valid_counts must have shape [B]")
+
+
+class _NativeFrameMix(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
@@ -279,32 +924,25 @@ def fast_mix(
     eta_raw: torch.Tensor,
     valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the strict native mixer with first-order autograd support."""
+    """Apply the common no-frame operator; never dispatch to a materialized P.
 
+    The only dimension choice is the primal/dual identity for the base term:
+    solve an N-by-N token system when N <= r, otherwise an r-by-r system.
+    Rank, core mode and batch size do not select a different CUDA algorithm.
+    """
     if valid_counts is not None and valid_counts.requires_grad:
-        raise ValueError(
-            "the LSSO CUDA fast path does not support gradients for valid_counts"
-        )
-
+        raise ValueError("the LSSO CUDA fast path does not support gradients for valid_counts")
     require_available()
-    if not torch.is_grad_enabled() or not any(
+    _validate_no_frame_inputs(
+        projected, core_base_raw, core_drive_weight, eta_raw, valid_counts
+    )
+    record = torch.is_grad_enabled() and any(
         value.requires_grad
         for value in (projected, core_base_raw, core_drive_weight, eta_raw)
-    ):
-        return torch.ops.lsso_equilibrium.forward_inference(
-            projected,
-            core_base_raw,
-            core_drive_weight,
-            eta_raw,
-            valid_counts,
-        )
-    return _FastMix.apply(
-        projected,
-        core_base_raw,
-        core_drive_weight,
-        eta_raw,
-        valid_counts,
     )
-
-
-__all__ = ["fast_mix", "is_available", "load", "require_available"]
+    arguments = (projected, core_base_raw, core_drive_weight, eta_raw, valid_counts)
+    if projected.shape[1] <= core_base_raw.shape[1]:
+        return _ShortNoFrameMix.apply(*arguments) if record else _short_no_frame_forward(*arguments)
+    if record:
+        return _NoFrameMix.apply(*arguments)
+    return _no_frame_forward(*arguments, record=False)[0]

@@ -45,7 +45,7 @@ def _reference_fast_mix(
     eta_raw = eta_raw.to(dtype=calc_dtype)
     batch, length, width = projected.shape
     heads = core_base_raw.shape[0]
-    rank = core_base_raw.shape[-1]
+    rank = core_base_raw.shape[1]
     dim = width - heads * rank
     head_dim = dim // heads
     if valid_counts is None:
@@ -63,12 +63,18 @@ def _reference_fast_mix(
     relation = relation / counts.sqrt().view(batch, 1, 1, 1)
     frame = qr_soft_frame(relation)
     compact_state = frame.mT @ content
-    coordinates = core_base_raw.unsqueeze(0) + (
-        compact_state @ core_drive_weight / counts.sqrt().view(batch, 1, 1, 1)
-    )
+    if core_base_raw.numel() == 0:
+        generator = None
+    elif core_drive_weight.numel() == 0:
+        generator = accretive_generator(core_base_raw)
+    else:
+        coordinates = core_base_raw.unsqueeze(0) + (
+            compact_state @ core_drive_weight / counts.sqrt().view(batch, 1, 1, 1)
+        )
+        generator = accretive_generator(coordinates)
     return accretive_equilibrium_mix(
         frame,
-        accretive_generator(coordinates),
+        generator,
         compact_state,
         content,
         bounded_complement(eta_raw),
@@ -100,7 +106,7 @@ def test_cuda_boundary_is_explicit() -> None:
             cuda.require_available()
 
 
-def test_fast_mix_selects_the_strict_train_and_inference_abis(
+def test_native_baseline_has_strict_train_and_inference_abis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -156,13 +162,13 @@ def test_fast_mix_selects_the_strict_train_and_inference_abis(
     drive = torch.randn(1, 16, 16, requires_grad=True)
     eta = torch.randn(1, requires_grad=True)
     counts = torch.tensor([2.0])
-    output = cuda.fast_mix(projected, base, drive, eta, counts)
+    output = cuda._NativeFrameMix.apply(projected, base, drive, eta, counts)
     output.sum().backward()
     assert calls == ["forward_train", "backward"]
 
     calls.clear()
     with torch.inference_mode():
-        inference_output = cuda.fast_mix(projected, base, drive, eta, counts)
+        inference_output = inference(projected, base, drive, eta, counts)
     assert not inference_output.requires_grad
     assert calls == ["forward_inference"]
 
@@ -1477,8 +1483,9 @@ def test_static_correction_reuses_one_head_factorization_in_backward(monkeypatch
 
 @pytest.mark.parametrize("mode", list(CoreMode))
 @pytest.mark.parametrize("rank", [16, 32, 48, 64])
-def test_all_core_modes_match_reference_without_rotation(mode: CoreMode, rank: int) -> None:
-    """Shared Static factors and solve-free Zero preserve outputs and VJPs."""
+@pytest.mark.parametrize("batch", [3, 5])
+def test_all_core_modes_match_reference_without_rotation(mode: CoreMode, rank: int, batch: int, monkeypatch) -> None:
+    """The common no-frame path preserves modes, masks, AMP and VJPs."""
     _require_native_cuda()
     torch.manual_seed(913)
     layer = LSSO(LSSOConfig(64, 2, rank=rank, core_mode=mode)).cuda()
@@ -1488,9 +1495,9 @@ def test_all_core_modes_match_reference_without_rotation(mode: CoreMode, rank: i
         if layer.core_drive_weight is not None:
             layer.core_drive_weight.normal_(0, 0.1)
     oracle = copy.deepcopy(layer).double()
-    x = torch.randn(3, 73, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(batch, 73, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     xr = x.detach().double().requires_grad_()
-    mask = torch.rand(3, 73, device="cuda") > 0.2
+    mask = torch.rand(batch, 73, device="cuda") > 0.2
     mask[2] = False
     with torch.autocast("cuda", dtype=torch.bfloat16):
         actual = layer(x, valid_mask=mask, implementation="cuda")
@@ -1498,6 +1505,151 @@ def test_all_core_modes_match_reference_without_rotation(mode: CoreMode, rank: i
     upstream = torch.randn_like(actual)
     actual_grads = torch.autograd.grad((actual * upstream).sum(), (x, *layer.parameters()))
     oracle_grads = torch.autograd.grad((expected * upstream.double()).sum(), (xr, *oracle.parameters()))
+    with torch.no_grad():
+        inference = layer(x, valid_mask=mask, implementation="cuda")
+    torch.testing.assert_close(inference, actual, rtol=0, atol=0)
     _assert_mixed_close(actual, expected, limit=0.015)
     for got, want in zip(actual_grads, oracle_grads):
         _assert_mixed_close(got, want, limit=0.035)
+
+
+def test_zero_native_tape_omits_core_and_equilibrium_storage() -> None:
+    _require_native_cuda()
+    batch, length, heads, rank, head_dim = 2, 65, 2, 16, 16
+    projected = torch.randn(batch, length, heads * (rank + head_dim), device="cuda", dtype=torch.bfloat16)
+    base = torch.empty(heads, rank, 0, device="cuda")
+    drive = torch.empty(heads, head_dim, 0, device="cuda")
+    eta = torch.zeros(heads, device="cuda")
+    _, tape, pivots = torch.ops.lsso_equilibrium.forward_train(projected, base, drive, eta)
+    assert pivots.numel() == 0
+    assert tape.numel() == batch * heads * (length * rank + rank * rank + rank * head_dim + 1)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rank,length,head_dim,relation_scale,core_scale,eta_value", [
+    (16, 1, 1, 64.0, 0.1, 0.1),
+    (64, 1, 1, 64.0, 0.1, 0.1),
+    (64, 33, 17, 64.0, 0.1, 0.1),
+    (16, 33, 17, 64.0, 0.1, 0.1),
+    (32, 7, 8, 1.0, 0.0, 9.5),
+    (32, 129, 32, 0.001, 1.0, 0.1),
+    (32, 129, 32, 4.0, 4.0, 0.1),
+])
+def test_no_frame_numerical_boundaries(mode, rank, length, head_dim, relation_scale, core_scale, eta_value, monkeypatch):
+    _require_native_cuda()
+    torch.manual_seed(191 + rank + length)
+    batch, heads = 2, 2
+    projected = torch.randn(batch, length, heads * (rank + head_dim), device="cuda")
+    projected[:, :, :heads * rank] *= relation_scale
+    projected = projected.bfloat16().requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.ZERO else rank, device="cuda") * core_scale).requires_grad_()
+    drive = (torch.randn(heads, head_dim, rank if mode is CoreMode.DYNAMIC else 0, device="cuda") * core_scale).requires_grad_()
+    eta = torch.tensor([-eta_value, eta_value], device="cuda", requires_grad=True)
+    arguments = (projected, base, drive, eta)
+    oracle_arguments = tuple(value.detach().double().requires_grad_() for value in arguments)
+    # The CUDA implementation must not inherit ambient AMP or TF32 rounding.
+    previous = torch.backends.cuda.matmul.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    try:
+        with torch.autocast("cuda", dtype=torch.float16):
+            actual = cuda.fast_mix(*arguments)
+        assert torch.backends.cuda.matmul.fp32_precision == "tf32"
+        expected = _reference_fast_mix(*oracle_arguments)
+        upstream = torch.randn_like(actual)
+        actual_gradients = torch.autograd.grad(actual, arguments, upstream, allow_unused=True)
+        expected_gradients = torch.autograd.grad(expected, oracle_arguments, upstream.double(), allow_unused=True)
+        assert torch.backends.cuda.matmul.fp32_precision == "tf32"
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = previous
+    _assert_mixed_close(actual, expected, limit=5e-3)
+    for index, (got, want) in enumerate(zip(actual_gradients, expected_gradients)):
+        if want is None:
+            assert got is None
+        else:
+            _assert_mixed_close(got, want, limit=1e-2 if index == 3 else 3e-2)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("length", [1, 129])
+def test_no_frame_graph_replay_updates_inputs_and_parameters(mode, length, monkeypatch):
+    _require_native_cuda()
+    torch.manual_seed(941)
+    batch, heads, rank, head_dim = 2, 2, 16, 17
+    projected = torch.randn(batch, length, heads * (rank + head_dim), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.ZERO else rank, device="cuda") * .1).requires_grad_()
+    drive = (torch.randn(heads, head_dim, rank if mode is CoreMode.DYNAMIC else 0, device="cuda") * .1).requires_grad_()
+    eta = torch.randn(heads, device="cuda").requires_grad_()
+    arguments = (projected, base, drive, eta)
+    upstream = torch.randn(batch, length, heads * head_dim, device="cuda", dtype=torch.bfloat16)
+
+    def step():
+        output = cuda.fast_mix(*arguments)
+        gradients = torch.autograd.grad(output, arguments, upstream, allow_unused=True)
+        return output, gradients
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured_output, captured_gradients = step()
+        for _ in range(2):
+            with torch.no_grad():
+                for value in arguments:
+                    value.add_(0.01)
+            expected_output, expected_gradients = step()
+            graph.replay()
+            torch.testing.assert_close(captured_output, expected_output, rtol=0, atol=0)
+            for got, want in zip(captured_gradients, expected_gradients):
+                if want is None:
+                    assert got is None
+                else:
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+        # Private compact autograd state must also survive a retained outer graph.
+        output = cuda.fast_mix(*arguments)
+        first = torch.autograd.grad(output, arguments, upstream, allow_unused=True, retain_graph=True)
+        second = torch.autograd.grad(output, arguments, upstream, allow_unused=True)
+        for got, want in zip(first, second):
+            if want is not None:
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize('mode', list(CoreMode))
+def test_identity_core_uses_the_same_zero_base_without_native_frame(mode, monkeypatch):
+    _require_native_cuda()
+    def reject(*args, **kwargs):
+        pytest.fail('the public CUDA path must never dispatch to materialized P')
+    monkeypatch.setattr(torch.ops.lsso_equilibrium, 'forward_train', reject)
+    monkeypatch.setattr(torch.ops.lsso_equilibrium, 'forward_inference', reject)
+    torch.manual_seed(1033)
+    batch, length, heads, rank, head_dim = 2, 17, 2, 16, 32
+    projected = torch.randn(batch, length, heads * (rank + head_dim), device='cuda', dtype=torch.bfloat16)
+    projected[..., :heads * rank] *= 8
+    mask = torch.ones(batch, length, device='cuda', dtype=torch.bool)
+    mask[0, 1::3] = False
+    projected = projected.masked_fill(~mask[..., None], 0).requires_grad_()
+    base = torch.zeros(heads, rank, 0 if mode is CoreMode.ZERO else rank, device='cuda', requires_grad=True)
+    drive = torch.zeros(heads, head_dim, rank if mode is CoreMode.DYNAMIC else 0, device='cuda', requires_grad=True)
+    raw = torch.tensor([.1, -.2], device='cuda', requires_grad=True)
+    counts = mask.sum(1).float()
+    arguments = (projected, base, drive, raw)
+    oracle = tuple(v.detach().double().requires_grad_() for v in arguments)
+    actual = cuda.fast_mix(*arguments, counts)
+    expected = _reference_fast_mix(*oracle, counts)
+    _assert_mixed_close(actual, expected, limit=5e-3)
+    gradient = torch.randn_like(actual)
+    got = torch.autograd.grad(actual, arguments, gradient, allow_unused=True)
+    want = torch.autograd.grad(expected, oracle, gradient.double(), allow_unused=True)
+    for index, (left, right) in enumerate(zip(got, want)):
+        if right is None:
+            assert left is None
+        else:
+            _assert_mixed_close(left, right, limit=1e-2 if index == 3 else 3e-2)
+    with torch.no_grad():
+        inference = cuda.fast_mix(*arguments, counts)
+    torch.testing.assert_close(inference, actual, rtol=0, atol=0)

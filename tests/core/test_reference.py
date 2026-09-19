@@ -662,3 +662,48 @@ def test_static_core_solve_is_shared_and_not_cached_across_updates(monkeypatch):
     second = accretive_equilibrium_mix(frame, accretive_generator(raw), state, content, eta)
     assert calls == [(torch.Size([2, 4, 4]), torch.Size([2, 4, 4]))] * 2
     assert not torch.allclose(first, second)
+
+
+@pytest.mark.parametrize('length', [3, 9])
+@pytest.mark.parametrize('mode', ['dynamic', 'static', 'zero'])
+def test_no_frame_identity_matches_original_resolvent_and_its_differential(length, mode):
+    """Check algebra against the original readout, independent of CUDA precision."""
+    torch.manual_seed(123)
+    rank = 4
+    a = (torch.randn(2, 2, length, rank, dtype=torch.float64) / length**0.5).requires_grad_()
+    c = torch.randn(2, 2, length, 3, dtype=torch.float64, requires_grad=True)
+    base = (torch.randn(2, rank, rank, dtype=torch.float64) * .1).requires_grad_()
+    drive = (torch.randn(2, 3, rank, dtype=torch.float64) * .1).requires_grad_()
+    eta = torch.tensor([.1, -.2], dtype=torch.float64, requires_grad=True)
+    eye = torch.eye(rank, dtype=torch.float64)
+
+    def generator(z):
+        if mode == 'zero':
+            return eye
+        return accretive_generator(base if mode == 'static' else base + z @ drive / length**0.5)
+
+    p = qr_soft_frame(a)
+    z = p.mT @ c
+    k = generator(z)
+    e = eta[None, :, None, None]
+    original = 2 * p @ torch.linalg.solve(eye + k, z) - (1 + e) * (p @ z) + e * c
+    lower = torch.linalg.cholesky(eye + a.mT @ a)
+    z2 = torch.linalg.solve_triangular(lower, a.mT @ c, upper=False)
+    k2 = generator(z2)
+    delta = torch.linalg.solve(eye + k2, (eye - k2) @ z2)
+    v = torch.linalg.solve_triangular(lower.mT, delta - e * z2, upper=True)
+    no_frame = e * c + a @ v
+    torch.testing.assert_close(original, no_frame, atol=1e-12, rtol=1e-10)
+    # The common base is a regularized inverse, not an orthogonal complement.
+    token_eye = torch.eye(length, dtype=torch.float64)
+    base_inverse = torch.linalg.solve(token_eye + a @ a.mT, c)
+    torch.testing.assert_close(c - p @ z, base_inverse, atol=1e-12, rtol=1e-10)
+    upstream = torch.randn_like(original)
+    arguments = (a, c, base, drive, eta)
+    first = torch.autograd.grad(original, arguments, upstream, allow_unused=True, retain_graph=True)
+    second = torch.autograd.grad(no_frame, arguments, upstream, allow_unused=True)
+    for left, right in zip(first, second):
+        if left is None:
+            assert right is None
+        else:
+            torch.testing.assert_close(left, right, atol=1e-11, rtol=1e-9)

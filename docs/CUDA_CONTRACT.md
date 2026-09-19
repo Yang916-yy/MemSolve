@@ -1,6 +1,7 @@
 # CUDA Contract
 
-Native contract version 9 implements the unrotated operator in three core modes:
+The CUDA runtime implements the unrotated operator in three core modes.
+The native RHS-tiled component uses contract version 10:
 
 - `core_mode=DYNAMIC`, `STATIC`, or `ZERO`;
 - `skew_coupling=True` and `scalar_complement=True`;
@@ -21,7 +22,7 @@ itself has different requirements. See NVIDIA
 [installed-package requirements](https://docs.nvidia.com/cuda/cublasdx/requirements_func.html).
 The projection runtime is Triton 3.8.0 supplied by this PyTorch environment.
 Use `LSSO_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh` for an A800.
-The current unrotated implementation uses native ABI 9 and checkpoint contract 13.
+The current unrotated implementation uses native ABI 10 and checkpoint contract 13.
 Historical rotated checkpoints and results retain their original contracts.
 
 ## Public And Native Boundaries
@@ -76,10 +77,10 @@ higher-order gradients are unsupported.
 same reference path run with FP64 tensors is the oracle for CUDA validation.
 CUDA uses a fixed mixed BF16/FP16/FP32 contract:
 
-- ordinary projection, content and compact GEMMs use BF16 multiplicands and
-  FP32 accumulators; PyTorch reduced-precision BF16 reductions are disabled
-  inside these operations, independently of ambient AMP;
-- frame storage, Gram/factorization, one-ULP interiorized eta, LU and triangular
+- token projections and token-statistics GEMMs use BF16 multiplicands and
+  FP32 accumulators; compact factors/products/solves remain FP32. PyTorch
+  reduced-precision BF16 reductions are disabled inside projection operations;
+- Gram/factorization, one-ULP interiorized eta, LU and triangular
   solves, sensitive backward statistics, and parameter gradients remain FP32;
 - packed activations, native output and packed-input gradients are BF16.
 
@@ -107,6 +108,26 @@ for BF16 rounding: the expanded native shape sweep measured up to 1.418%,
 and the reference ZERO-mode fixture measured 2.357%. The forward limit remains
 0.5%; narrow-head and complement-tail eta checks retain their 1% limits.
 These are deterministic fixture budgets, not universal error bounds.
+
+### TODO: cancellation with very few valid tokens
+
+The rank-space no-P readout still evaluates the shared base as
+`eta C - eta A (I + A^T A)^-1 A^T C`. With padded length greater than rank,
+very few valid tokens, and large relation features, its two terms can nearly
+cancel. This affects the base in all three modes; removing materialized P
+does not eliminate finite-precision subtraction error.
+
+A 2026-09-19 BF16 Zero-mode probe at physical length 197, rank 32, one valid
+token and random relation features multiplied by 64 measured 9.93% relative
+output L2 error, but maximum absolute error was 5.97e-7 and error L2 divided
+by content L2 was 1.25e-7. At scale 8, relative error was 0.187%.
+These are synthetic forward measurements, not training or gradient guarantees.
+The current fixed-resolution ImageNet recipe uses all 197 tokens; image
+augmentation does not reduce valid token counts. Defer this sparse-mask case
+for that experiment, and revisit before workloads with very small valid
+supports. TODO: evaluate an algebraically equivalent stable shared-base
+calculation and its gradients without adding empirical dispatch thresholds,
+raising production precision, or relaxing validation tolerances.
 
 The FP32-reduction policy follows the
 [PyTorch 2.11 numerical accuracy guidance](https://docs.pytorch.org/docs/2.11/notes/numerical_accuracy.html#reduced-precision-reduction-for-fp16-and-bf16-gemms):
@@ -136,19 +157,102 @@ It uses the Triton runtime supplied by Linux CUDA PyTorch (tested with Triton
 The first call compiles a kernel; warm up on the capture stream before CUDA
 Graph capture. Token counts are runtime arguments, avoiding one compilation
 for every image resolution. This adds a JIT projection boundary; the native
-MathDx mixer remains a precompiled artifact with ABI 9. No new parameters,
+MathDx mixer remains a precompiled artifact with ABI 10. No new parameters,
 checkpoint version, precision guards, or fallback implementation are added.
 
 
-## Schedule
+## Default CUDA scheduling without an explicit frame
+
+`cuda.fast_mix()` always uses the common no-frame Triton/PyTorch implementation
+for training and inference. Dynamic, Static and Zero share this path for every
+supported rank and batch size, including ImageNet shapes. The model contract
+13 and native ABI 10 remain unchanged. Native materialized-frame entry points
+remain available for explicit low-level comparisons; the public path never
+selects them as an optimization or fallback.
+
+The no-frame schedule uses, in real arithmetic,
+
+```
+R^T R = I + A^T A
+Z = solve(R^T, A^T C)
+Delta = solve(I+K, (I-K) Z)        # Dynamic
+Delta = solve(I+K, I-K) Z         # Static, one map per head
+Delta = 0                        # Zero
+V = solve(R, Delta - eta Z)
+Y = eta C + A V
+```
+
+Here A includes length/valid-count normalization. This is the same frame
+`P=A R^-1` as the reference, without constructing or saving token-sized P.
+Statistics and token VJPs read the existing BF16 packed projection in tiles;
+only compact factors/state, partial statistics and the compact autograd graph
+are retained. The three modes share the statistics, readout and input VJP.
+Static's differentiable map is rebuilt per forward, never cached across updates.
+
+There are no rank-48, mode, batch-size or sequence-length performance heuristics.
+For the shared base, `N <= r` selects the equivalent smaller token system;
+otherwise the rank system is used. Both forms eliminate P. Feature dimensions
+are processed in tiles of at most 128 channels, including wider heads, rather
+than redirecting those shapes to a materialized-frame implementation.
+
+The no-frame statistical dots use exact BF16 inputs with FP32 accumulation.
+Compact factors, general partial-pivot solves, products and their VJPs are FP32
+with ambient AMP and TF32 disabled locally. The transformed readout coefficient
+and compact input adjoints must not be rounded to one BF16 word: that fails the
+large-relation fixture. Instead, token products split each FP32 compact operand
+into a BF16 leading word and a BF16 residual word and sum their two FP32 dot
+results. The token operand is already BF16. This follows the multiword arithmetic
+idea in [Henry et al.](https://arxiv.org/abs/1904.06376); it is not full FP32
+multiplication, and the existing forward/gradient error budgets still apply.
+There is no persistent FP64 training path or global precision-setting change.
+
+For `N <= r`, the base term is evaluated as
+`eta * solve(I + A A^T, C)` instead of subtracting `eta * A R^-1 Z` from
+`eta * C`. The smaller system is at most 64-by-64. This avoids cancellation
+when a strong relation nearly spans a short sequence, including Zero and eta
+VJPs. The learned correction remains `A solve(R, Delta)`. These are exact
+algebraic identities, selected by shape; they never construct P or an unbounded
+N-by-N attention matrix. Statistics for ordinary longer sequences do not use
+the native detached-scale workspace; the validated envelope covers relation
+scales from 0.001 to 64, raw core scales through 4, eta tails +/-9.5, all supported
+ranks, and gapped/all-masked inputs. Finite fixture errors are not universal
+bounds for arbitrarily ill-conditioned inputs or vanishing residuals.
+
+The compact VJP uses a private first-order autograd graph; repeated VJPs with
+`retain_graph=True` are supported, higher-order differentiation is not. Warm up
+each shape and its backward on a side stream before CUDA Graph capture. Graph
+replay includes fresh input and parameter reads, all GPU kernels, and graph-pool
+storage. It avoids repeated Python/autograd scheduling but does not remove
+unnecessary GPU work or make memory overhead zero; see the
+[PyTorch CUDA Graph documentation](https://docs.pytorch.org/docs/main/notes/cuda.html#cuda-graphs).
+
+## Native RHS-tiled schedule
 
 All supported ranks use one tiled generic workspace schedule. It builds the
 FP32 relation/soft-frame state, computes compact tiles, fuses dynamic-coordinate
 generation with accretive factor construction and LU factorization, then solves
 the equilibrium and performs the BF16/FP32 readout. There are no phase tables
-or position coordinates. STATIC factors one matrix per head and shares its LU
-across the batch; each sample still solves its own compact right-hand side.
-ZERO skips core construction and LU solves, using U = Z / 2 in the shared tape.
+or position coordinates. All modes share a base-plus-correction coefficient:
+`correction = 2U - Z` for learned cores, zero for ZERO, followed by
+`correction - eta Z` in the token readout and frame VJP.
+
+STATIC factors one matrix per head. When `B >= 4` and `B * head_dim >= 4 * rank`,
+it solves against the identity once per head, stores `S = solve(I+K, I)`, and
+applies `U = S Z` across samples. The transpose action uses the same stored S;
+it does not repeat per-sample core solves. This is equivalent to the reference
+correction map `M = 2S - I`. Smaller batches retain shared LU with per-sample RHS
+solves to avoid materializing a map that cannot amortize its construction.
+For STATIC backward, matrix adjoints are reduced across the batch before the
+shared parameterization VJP. The reduction uses scratch storage that is dead
+until the later frame VJP; it does not alias the parameter-gradient output.
+No detached or cross-forward factor cache is used.
+
+ZERO skips core construction and LU solves. Its compact correction is zero,
+so it stores neither U, core coordinates, LU factors nor pivots. The first
+backward statistic reduction also produces its state adjoint `-eta * d_t`,
+avoiding a separate equilibrium-adjoint launch. The frame, compact statistics,
+content VJP and token readout remain shared with the learned-core paths.
+
 Training stores one token-sized FP32 frame: materialization overwrites `B`
 with `P` in place. Backward reconstructs `B` from BF16 packed relations,
 FP32 length normalization, and saved detached scale.
@@ -222,8 +326,15 @@ all calls use a temporary lower-triangle workspace of
 cross-state producer workspace. Shorter sequences retain the single-CTA Gram
 reduction.
 
-There is no public scheduling switch and no rank-16/rank-32 single-CTA
-specialization contract.
+For long inputs (`N >= 4096`) with fewer than 128 batch/head systems, scale
+preparation uses 256-token producers, a maximum reduction, and parallel
+normalization. It preserves detached scaling and identity augmentation. Long
+Gram reductions group 32 partials before the final factorization when there
+are at least 128 token tiles and fewer than 128 systems. Short or highly batched
+inputs retain the original lower-launch-count schedule. The hierarchical sums
+remain FP32 and deterministic, but their grouping can change rounding.
+
+There is no public scheduling switch: these are equivalent internal schedules.
 
 
 The core GEMM keeps its FP32 accumulator separate while reusing dead BF16 A/B
@@ -261,7 +372,7 @@ verifies both its compiled SM and native contract version before launching
 kernels.
 
 The runtime packaging tool requires all seven files. A wheel built for this
-source must carry native contract 8; older released v0.6.3 wheels must not be
+source must carry native contract 10; older released v0.6.3 wheels must not be
 mixed with current source. Its generated
 metadata is checked before loading: LSSO version, native contract, exact Torch
 version, CUDA version, and PyTorch's C++ ABI must all match. Release packaging
@@ -318,6 +429,17 @@ this validation did not produce a seven-architecture release wheel.
 Dynamic uses base `[H,R,R]` and drive `[H,Dh,R]`. Static uses the same base
 and an empty drive `[H,Dh,0]`. Zero uses empty base `[H,R,0]` and drive
 `[H,Dh,0]`. These placeholders are private ABI metadata, not model parameters.
-All modes share the fused readout `eta C + P (2U - (1+eta)Z)`, algebraically
-equal to the reference base-plus-correction form. Static backward sums core
-gradients across samples; no factors are cached between forward calls.
+All modes share `eta C + P (correction - eta Z)`. For learned cores,
+`correction = 2U-Z`; for Zero it is exactly zero. ABI 10 changes private tape
+layout and Static factor representation, while model checkpoint contract 13
+and parameter ownership are unchanged.
+
+## Scheduling sources
+
+The separation between parallel token producers and compact consumers follows
+FLA's [shape-dependent local fusion](https://github.com/fla-org/flash-linear-attention/blob/864a87f6ce5be8828bef81eb22baafd41937cdf2/fla/ops/gated_delta_rule/chunk_fwd.py).
+Its unit-triangular solver is not used for the general LSSO core. Small direct
+solves continue to use MathDx; the shared-memory lifetime pattern follows the
+[cuBLASDx examples](https://docs.nvidia.com/cuda/cublasdx/0.7.0/examples.html).
+No FLA source has been copied into the operator. Performance probes and
+unselected implementations are retained outside the source tree.

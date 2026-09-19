@@ -194,3 +194,69 @@ def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
     ):
         assert torch.isfinite(fast_gradient).all()
         assert _relative_l2(fast_gradient, reference_gradient) <= 1e-2
+
+
+@pytest.mark.parametrize("schedule,expected", [("linear", [0.0, 0.2, 0.4]), ("constant", [0.4] * 3)])
+def test_shared_scaffold_applies_the_selected_drop_path_schedule(schedule, expected):
+    pytest.importorskip("timm")
+    from integrations.timm import create_lsso_deit3
+
+    model = create_lsso_deit3(
+        image_size=32, patch_size=16, num_classes=10, embed_dim=32,
+        depth=3, num_heads=2, rank=16, mlp_ratio=2, core_mode="dynamic",
+        bias=True, drop_path_rate=0.4, drop_path_schedule=schedule,
+    )
+    actual = [getattr(block.drop_path1, "drop_prob", 0.0) for block in model.blocks]
+    assert actual == pytest.approx(expected)
+
+
+def test_cpe_replaces_absolute_positions_and_matches_patch_grid_convolution():
+    pytest.importorskip("timm")
+    from integrations.timm import create_lsso_deit3, VisionTokenLayout
+    torch.manual_seed(137)
+    model = create_lsso_deit3(
+        image_size=32, patch_size=16, num_classes=10, embed_dim=32,
+        depth=1, num_heads=2, rank=16, mlp_ratio=2, core_mode="dynamic",
+        bias=True, position_encoding="cpe",
+    )
+    assert model.encoder.pos_embed is None
+    block = model.blocks[0]
+    assert block.cpe.groups == 32 and block.cpe.kernel_size == (3, 3)
+    # Observe exactly the tensor entering the first normalization.
+    seen = []
+    handle = block.norm1.register_forward_pre_hook(lambda _module, inputs: seen.append(inputs[0]))
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    block(x)
+    grid = x[:, 1:].reshape(2, 2, 2, 32).permute(0, 3, 1, 2).contiguous()
+    expected = x[:, 1:] + torch.nn.functional.conv2d(
+        grid, block.cpe.weight, block.cpe.bias, padding=1, groups=32,
+    ).flatten(2).transpose(1, 2)
+    torch.testing.assert_close(seen[-1][:, 0], x[:, 0])
+    torch.testing.assert_close(seen[-1][:, 1:], expected)
+    seen.clear()
+    valid = torch.ones(2, 5, dtype=torch.bool);valid[:, 2] = False
+    first = block(x, attn_mask=VisionTokenLayout(valid))
+    altered = x.detach().clone();altered[:, 2] = 1000
+    second = block(altered, attn_mask=VisionTokenLayout(valid))
+    torch.testing.assert_close(first[valid], second[valid])
+    first[valid].square().sum().backward()
+    assert block.cpe.weight.grad is not None
+    assert torch.isfinite(block.cpe.weight.grad).all()
+    assert torch.count_nonzero(x.grad[:, 2]) == 0
+    handle.remove()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_adamw_matches_unfused_fp32_updates():
+    torch.manual_seed(77)
+    first = torch.nn.Linear(17, 7, device='cuda')
+    second = copy.deepcopy(first)
+    fused = torch.optim.AdamW(first.parameters(), lr=.001, weight_decay=.05, fused=True)
+    unfused = torch.optim.AdamW(second.parameters(), lr=.001, weight_decay=.05, fused=False, foreach=False)
+    for _ in range(3):
+        for a, b in zip(first.parameters(), second.parameters()):
+            a.grad = torch.randn_like(a); b.grad = a.grad.clone()
+        fused.step(); unfused.step()
+    for a, b in zip(first.parameters(), second.parameters()):
+        torch.testing.assert_close(a, b, atol=1e-7, rtol=1e-6)

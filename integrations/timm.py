@@ -240,14 +240,22 @@ def _create_deit3_encoder(
     norm_eps: float,
     dynamic_img_size: bool,
     dynamic_img_pad: bool,
+    position_encoding: str = "learned",
+    drop_path_schedule: str = "constant",
 ) -> nn.Module:
     """Build the one DeiT III-compatible LSSO encoder.
 
     The engineering form uses timm blocks, but it preserves DeiT III's
     no-CLS-position layout, LayerScale initialization, and constant stochastic
-    depth. The latter differs from timm's default linearly increasing schedule.
+    depth by default. ImageNet ViT³ training selects timm's linear schedule.
     """
 
+    if position_encoding not in {"learned", "cpe"}:
+        raise ValueError("position_encoding must be learned or cpe")
+    if position_encoding == "cpe" and (dynamic_img_size or dynamic_img_pad):
+        raise ValueError("CPE currently requires the configured fixed image grid")
+    if drop_path_schedule not in {"constant", "linear"}:
+        raise ValueError("drop_path_schedule must be constant or linear")
     if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
         raise ValueError("depth must be a positive integer")
     if not 0.0 <= drop_path_rate < 1.0:
@@ -286,6 +294,34 @@ def _create_deit3_encoder(
             kwargs["drop_path"] = drop_path_rate
             super().__init__(*args, **kwargs)
 
+    block_type = ConstantDropPathBlock if drop_path_schedule == "constant" else Block
+
+    class CPEBlock(block_type):
+        # ViT³ / CPVT residual CPE, using PyTorch's cuDNN depthwise convolution.
+        # Keep this spatial operation outside the LSSO mixer.
+        def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
+            super().__init__(dim, *args, **kwargs)
+            self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+
+        def forward(self, x, attn_mask=None, is_causal=False):
+            side = image_size // patch_size
+            if x.shape[1] != side * side + 1:
+                raise ValueError("CPE requires CLS followed by the configured patch grid")
+            if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
+                raise ValueError("CPE accepts only the vision token validity layout")
+            valid = None if attn_mask is None else attn_mask.valid_mask
+            patches = x[:, 1:]
+            if valid is not None:
+                patches = torch.where(valid[:, 1:, None], patches, 0)
+            spatial = patches.reshape(x.shape[0], side, side, x.shape[2]).permute(0, 3, 1, 2)
+            # NHWC tokens give a channels-last convolution view; cuDNN owns dispatch.
+            local = self.cpe(spatial).flatten(2).transpose(1, 2)
+            patches = patches + local
+            if valid is not None:
+                patches = torch.where(valid[:, 1:, None], patches, 0)
+            x = torch.cat((x[:, :1], patches), dim=1)
+            return super().forward(x, attn_mask=attn_mask, is_causal=is_causal)
+
     encoder = VisionTransformer(
         img_size=image_size,
         patch_size=patch_size,
@@ -298,12 +334,13 @@ def _create_deit3_encoder(
         qkv_bias=bias,
         proj_bias=bias,
         no_embed_class=True,
+        pos_embed="none" if position_encoding == "cpe" else "learn",
         dynamic_img_size=dynamic_img_size,
         dynamic_img_pad=dynamic_img_pad,
         init_values=layer_scale_init_value,
         drop_path_rate=drop_path_rate,
         norm_layer=partial(nn.LayerNorm, eps=norm_eps),
-        block_fn=ConstantDropPathBlock,
+        block_fn=CPEBlock if position_encoding == "cpe" else block_type,
         attn_layer=ConfiguredMixer,
     )
     if encoder.cls_token is None:
@@ -336,6 +373,8 @@ class LSSODeiT3(nn.Module):
         no_embed_class: bool = True,
         dynamic_img_size: bool = False,
         dynamic_img_pad: bool = False,
+        position_encoding: str = "learned",
+        drop_path_schedule: str = "constant",
     ) -> None:
         super().__init__()
         if not no_embed_class:
@@ -357,6 +396,8 @@ class LSSODeiT3(nn.Module):
             norm_eps=norm_eps,
             dynamic_img_size=dynamic_img_size,
             dynamic_img_pad=dynamic_img_pad,
+            position_encoding=position_encoding,
+            drop_path_schedule=drop_path_schedule,
         )
 
     @property
@@ -425,6 +466,8 @@ def create_lsso_deit3(
     patch_size: int = 16,
     dynamic_img_size: bool = False,
     dynamic_img_pad: bool = False,
+    position_encoding: str = "learned",
+    drop_path_schedule: str = "constant",
 ) -> LSSODeiT3:
     """Build a DeiT III LSSO classifier or feature encoder."""
 
@@ -446,6 +489,8 @@ def create_lsso_deit3(
         no_embed_class=no_embed_class,
         dynamic_img_size=dynamic_img_size,
         dynamic_img_pad=dynamic_img_pad,
+        position_encoding=position_encoding,
+        drop_path_schedule=drop_path_schedule,
     )
 
 

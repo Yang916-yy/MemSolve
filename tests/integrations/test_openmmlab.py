@@ -59,7 +59,6 @@ def _tiny_imagenet_checkpoint(
         },
         "operator": {
             "core_mode": "dynamic",
-            "rank_rotary": True,
             "bias": True,
             "implementation": "reference",
         },
@@ -122,7 +121,7 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.LSSODeiT3Backbon
         rank=4,
         out_indices=(0, 1, 2, 3),
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="reference",
     ).eval()
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())
@@ -232,7 +231,7 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
         num_heads=4,
         rank=4,
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         bias=True,
         implementation="reference",
         drop_path_rate=0.0,
@@ -262,7 +261,7 @@ def test_backbone_interpolates_a_smaller_pretrain_position_table(
         rank=4,
         out_indices=(0, 1, 2, 3),
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="reference",
     ).eval()
     source = LSSODeiT3(
@@ -274,7 +273,7 @@ def test_backbone_interpolates_a_smaller_pretrain_position_table(
         num_heads=4,
         rank=4,
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         bias=True,
         implementation="reference",
         drop_path_rate=0.0,
@@ -304,7 +303,7 @@ def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
         num_heads=4,
         rank=4,
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         bias=True,
         implementation="reference",
         drop_path_rate=0.0,
@@ -364,7 +363,6 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
             "out_indices": out_indices,
             "implementation": "cuda",
             "core_mode": "dynamic",
-            "rank_rotary": True,
         }
         assert config["model"]["neck"] == {
             "in_channels": [channels] * 4,
@@ -402,7 +400,6 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         assert backbone["out_indices"] == out_indices
         assert backbone["implementation"] == "cuda"
         assert backbone["core_mode"] == "dynamic"
-        assert backbone["rank_rotary"]
         assert config["model"]["decode_head"] == {
             "in_channels": [channels] * 4,
             "channels": decoder_channels,

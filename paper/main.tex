@@ -36,218 +36,207 @@
 \maketitle
 
 \begin{abstract}
-Bidirectional sequence models can use the entire context to construct a compact
-state for global interaction.  Recent extensions of recurrent memory and
-test-time training make this an increasingly useful alternative to dense
-attention, but leave open how to jointly design the state, its induced mixing,
-and its computational realization.  We introduce LSSO, a contextual operator
-built around one compact direct solve per sample and head.  A full-context
-cross-moment generates a strictly accretive system; its solved state is lifted
-to tokens through a QR soft frame and a learned scalar complement.  The compact
-core covers every real strict contraction, including nonsymmetric and nonnormal
-maps, while the resulting token mixer has an exact gain computable in compact
-space.  These guarantees concern the realized mixing operator, rather than the
-end-to-end input-dependent network.  At fixed rank, arithmetic and activation
-storage scale linearly with sequence length.  An algebraically equivalent CUDA
-implementation evaluates the solve and its analytic backward without a dense
-token map.  In a matched three-seed comparison on eight GenomicBenchmarks tasks,
-LSSO obtains the highest mean accuracy on seven tasks and improves macro accuracy
-from the strongest alternative's $75.57$ to $78.53$.  Additional long-sequence
-results, trained-state diagnostics, and complete-mixer timings characterize the
-scope and cost of this full-context design.
+Test-time training constructs an input-specific memory by adapting an internal
+model to contextual associations.  For full-context tasks, all positions can
+participate in this adaptation, but computing the state through repeated
+updates introduces a tradeoff between update budget and execution cost.
+We propose LSSO, a bidirectional sequence layer that obtains a shared memory
+by solving a compact linear system.  The system is generated from the complete
+input and has an exact interpretation as regularized associative-memory error
+correction with skew-symmetric coupling.  Its structure guarantees a unique
+solution and bounds the forward and adjoint solves.  A shared frame maps the
+state back to tokens, yielding a mixer whose spectral norm is strictly below
+one and can be computed in compact space for each input.  Forward and backward
+costs grow linearly with sequence length at fixed rank.  On eight
+GenomicBenchmarks tasks with matched encoders and three seeds, LSSO achieves
+the highest mean accuracy on seven tasks and a macro accuracy of $78.53\%$,
+compared with $75.57\%$ for the strongest baseline.  On ImageNet-1K, Small and Base models reach $79.43\%$ and
+$82.24\%$ validation Top-1 accuracy.  Four Long Range Arena tasks,
+diagnostics of trained operators, and CUDA timings further evaluate
+sequence accuracy, operator stability, and computational cost.
 \end{abstract}
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\linewidth]{operator_overview.pdf}
-\caption{\textbf{Graphical abstract: full context, compact solve, global mixing.}
-All valid tokens jointly define a compact system.  One direct solve per sample
-and head produces a shared state whose action reaches every output token.
-At fixed rank, the construction scales linearly with sequence length and admits
-an exact realized-gain formula.  This formula describes the mixer after freezing
-its sample-conditioned quantities, not the end-to-end network Jacobian.
-The dashed path generates the system from the context statistic; the solid
-path evaluates it.  Global readout uses the shared frame, context statistic,
-and scalar complement.  Tensor shapes are schematic; no experimental results
-are depicted.}
+\caption{\textbf{Full-context associative memory in LSSO.}
+(a) Each association produces a residual under the same memory $U$.
+The weighted residuals, regularization, and skew coupling define the
+memory-correction field, with $\Gamma_X=\I_r+LL^\T-P^\T P$.
+(b) LSSO evaluates its equilibrium directly: $P$ and $C$ form the statistic
+$Z$, which generates $K(Z)$ and supplies the right-hand side of the solve.
+The readout combines $U^\star$ with the shared frame, content, and statistic.
+Panel (a) is an equivalent dynamics interpretation, not an unrolled computation.
+Blue denotes association coordinates, orange denotes content and output,
+and green denotes memory quantities.}
 \label{fig:overview}
 \end{figure}
 
 \section{Introduction}
 \label{sec:introduction}
 
-Image encoders and full-sequence classifiers receive all their tokens before
-producing a prediction.  Each position can therefore draw on the entire sample,
-which makes global interaction a natural building block.  Dense attention
-provides this interaction through token pairs, but its quadratic arithmetic
-becomes costly as the sequence grows.  Compact-state alternatives offer another
-route: gather contextual information into a smaller representation and use it
-to transform every token \cite{lee2019settransformer,ma2021luna,jaegle2021perceiver}.
-The design of that representation determines both the global interaction and
-its computational cost.
+Visual recognition and offline sequence understanding require representations
+that combine evidence from across an input.  Pairwise attention provides this
+global interaction, but its quadratic arithmetic becomes costly as sequences
+grow.  Compact memories offer a different computational route: encode the
+context in a bounded state and use that state to inform every output position.
+The challenge is to form a memory that captures the associations needed to
+interpret the current sample.
 
-Recurrent linear attention, selective state-space models, and test-time
-training (TTT) have developed powerful ways to construct such states from
-context \cite{schlag2021fastweights,gu2024mamba,sun2025ttt}.
-Their extension to bidirectional tasks is now an active architectural direction.
-LION relates full, recurrent, and chunkwise forms of bidirectional linear
-attention \cite{afzal2025lion}; ViT$^3$ studies full-batch inner updates for visual
-TTT \cite{han2026vit3}; and ZipMap compresses an image collection into a shared
-scene state for bidirectional reconstruction \cite{jin2026zipmap}.
-These approaches establish several ways to exploit complete context.  In
-particular, bidirectional information access and parallel execution are distinct
-choices: a causal computation can be parallelized, and a bidirectional model
-can retain directional scans.
+Test-time training (TTT) makes this adaptation explicit by treating contextual
+associations as training data for an internal model \cite{sun2025ttt}.
+The outer network learns how to construct and read that model, while an inner
+computation adapts it to the current input.  ViT$^3$ brings this perspective to
+visual sequence modeling and studies how the inner learning procedure should
+be designed \cite{han2026vit3}.  In its visual experiments, a full-batch inner
+update outperforms sequential mini-batch updates; the authors relate this
+finding to the causal dependencies and overwriting introduced by sequential
+updates.  For tasks with complete input access, this finding supports adapting a shared
+memory using all positions together.
 
-When the entire context is available, a layer can construct its state jointly
-from all tokens.  This raises a design question: \emph{what global transformation
-should the state induce, and how should its expressivity, evaluation, and gain
-be controlled?}  The optimization perspective of test-time regression provides
-one framework for choosing a state \cite{wang2025testtimeregression}, and MesaNet
-solves causal context regressions using conjugate gradients
-\cite{vonoswald2026mesanet}.  However, a smaller inner loss need not imply better
-task performance: recent analysis of KV-binding TTT motivates inspecting the
-induced operator itself \cite{liu2026kvbinding}.  We consequently treat the
-full-context operator as the design object, with its solve and geometry chosen
-together.
+Computing this shared state introduces a second problem.  In an error-correcting memory, each association's residual depends
+on the current state, and these residuals in turn change that state.  A
+full-context update evaluates this feedback across all positions, but a finite
+update budget still makes the result depend on the chosen step sizes and
+number of steps.  ViT$^3$ illustrates the practical tradeoff: additional
+full-batch inner updates can improve accuracy, while reducing throughput and,
+in some tested configurations, destabilizing training \cite{han2026vit3}.
+We therefore ask whether full-context memory correction can be formulated as
+a compact equilibrium problem with a direct solution and a controlled readout.
 
-LSSO constructs this operator from a compact strictly accretive system.  Each
-head gathers the full sample into a cross-moment $Z=P^\T C$, generates a matrix
-$K$ from $Z$, and obtains the contextual state by solving
-$(\I+K)U^\star=Z$.  The state is read back through the same soft frame $P$ to
-produce a global token transformation (Figure~\ref{fig:overview}).  Equivalently,
-the compact action and its token-space lift are
-\begin{align}
-    M &= 2(\I+K)^{-1}-\I,
-\label{eq:reflected-resolvent}\\
-    T &= \eta\I+P(M-\eta\I)P^\T.
-\label{eq:token-mixer-intro}
-\end{align}
-All valid tokens participate in generating this shared operator.  LSSO is a
-native full-context construction, rather than an equivalence transformation of
-an existing causal update rule.
+DeltaNet and MesaNet suggest how to formulate such a problem.  DeltaNet updates memory using the residual
+between an association's prediction and target, and efficient chunkwise
+algorithms enable parallel training
+\cite{schlag2021fastweights,yang2025deltanet}.  MesaNet instead uses conjugate
+gradients to solve a contextual regression problem at causal positions
+\cite{vonoswald2026mesanet}.  We draw on DeltaNet's residual correction and MesaNet's use of a solve to
+construct a shared full-context memory.
+The difficulty is to preserve this error-correcting mechanism while making
+full-context computation efficient.  LION's Appendix~B.7 gives bidirectional
+recurrent and chunkwise DeltaNet formulations, but identifies a bottleneck in
+the full-attention expression it considers: a matrix inverse whose cost grows
+cubically with sequence length \cite{afzal2025lion}.  Thus, even though this
+expression exposes parallel computation, its $O(N^3)$ inversion can dominate
+the cost of processing long sequences and negate the intended training
+advantage.  LION consequently avoids that full-attention route for DeltaNet
+training.  The challenge is therefore to retain global association-error
+feedback without solving a system whose dimension grows with the sequence.
 
-The construction assigns a role to each structural choice.  Accretivity makes
-the compact state uniquely solvable and controls the transposed solve used in
-backpropagation.  Its reflected resolvent spans every strict contraction in
-\emph{compact rank space}, so gain control still permits nonsymmetric mixing.
-The soft frame lifts this action to tokens, while $\eta$ controls the complement
-outside the frame.  Together they give an exact, sample-specific gain formula
-using matrices no larger than $r\times r$.  Token--rank products and one small
-direct solve realize the operator with linear sequence scaling at fixed rank;
-the dense token matrix is never formed.
+We introduce LSSO, which constructs a shared memory equilibrium from the
+complete input and evaluates it by one direct solve per sample and head.
+A soft association frame $P$ gathers content $C$ into a cross-moment
+$Z=P^\T C$, which generates a compact system $K(Z)$.  The memory satisfies
+\begin{equation}
+    (\I_r+K(Z))U^\star=Z.
+\label{eq:intro-state}
+\end{equation}
+All valid tokens jointly determine this system, but its dimension is the
+compact rank $r$, independent of sequence length $N$.  The factorization and
+solve cost $O(r^3+r^2d)$ per head, and gathering and reading the context cost
+$O(Nr^2+Nrd)$.  This places the expensive solve in memory space while allowing
+all positions to participate, giving linear total cost in $N$ at fixed rank.
+Strict accretivity makes the equilibrium
+unique and bounds the inverse used in the state and adjoint solves.  For fixed
+sample-conditioned quantities, the system admits an exact decomposition into
+regularized association-error correction and skew-symmetric coupling.  The forward pass computes this equilibrium without
+unrolling updates.
+A readout through the same association frame then gives each token access to
+the shared state.  We choose the readout so that its spectral norm is strictly
+below one for each input and is exactly computable from compact matrices.
+This bound applies with the generated coefficients fixed; the full network
+Jacobian also includes derivatives of those coefficients.  The implementation
+uses token--rank products and the small solve, giving linear sequence scaling
+at fixed rank without forming a dense token matrix.
 
-Our contributions are threefold:
+The paper makes three contributions:
 \begin{enumerate}
-    \item \textbf{A solved full-context operator.}  LSSO jointly constructs a
-    compact state from all valid tokens and evaluates it by direct solution,
-    without an inner learning rate, update schedule, or iterative stopping rule.
-    \item \textbf{Expressive compact geometry with a computable global gain.}
-    The compact chart covers the real strict matrix ball, and its structured
-    token-space lift admits an exact realized-gain certificate.  A complementary
-    monotonicity margin bounds the state and implicit adjoint.
-    \item \textbf{Task evidence and efficient realization.}  Matched genomic
-    experiments evaluate the complete mixer; LRA results and trained-state
-    diagnostics examine further sequence settings.  An equivalent native CUDA
-    implementation demonstrates the execution cost of the compact construction.
+    \item We construct a full-context memory layer with a directly solved
+    equilibrium and derive its connection to regularized association-error
+    correction.
+    \item We prove bounds on the state and adjoint solves, characterize the
+    compact contraction family, and derive the exact spectral norm of the
+    induced token mixer.
+    \item We evaluate the layer on ImageNet classification, genomic tasks, and Long
+    Range Arena, measure operator margins in trained models, and implement an
+    equivalent CUDA forward and backward for timing comparisons.
 \end{enumerate}
-
-
 
 \section{Related Work}
 \label{sec:related-work}
 
-\paragraph{Global compact-state mixing.}
-Efficient Transformers replace the dense token map with projections,
-landmarks, kernels, cosine reweighting, or inducing states
-\cite{wang2020linformer,katharopoulos2020linear,
-choromanski2021performer,qin2022cosformer,xiong2021nystrom}.  Set Transformer uses inducing
-points for global set interaction \cite{lee2019settransformer}; Luna packs and
-unpacks information through a fixed-length auxiliary sequence
-\cite{ma2021luna}; and ABC interprets several such mechanisms as learned
-bounded memory \cite{peng2022abc}.  Perceiver similarly mediates global
-exchange through latent slots \cite{jaegle2021perceiver}.  LSSO advances this
-compact-state line by building on XCiT's central insight that an
-input-dependent cross-statistic can generate one compact global operator for
-all tokens \cite{ali2021xcit}.  XCiT turns token-aggregated cross-covariance
-into a shared channel mixer; LSSO carries the compact operator into token
-space, where the cross-moment generates an accretive system.  Its equilibrium
-is solved directly, and the resulting contraction is lifted through a learned
-token frame without constructing a dense token matrix.
+\paragraph{Test-time training and full-context visual adaptation.}
+TTT layers treat hidden states as internal models adapted on the current
+context \cite{sun2025ttt}.  ViT$^3$ studies the inner objectives, update settings,
+and model architectures needed for visual TTT \cite{han2026vit3}.  Its full-batch updates provide a noncausal form of adaptation.  ZipMap likewise
+forms a shared scene state from an image collection \cite{jin2026zipmap}.
+LSSO defines a different internal system whose equilibrium admits a compact
+direct solve.  Work on KV-binding TTT also shows why the quality of an inner
+solution must be distinguished from its usefulness for the outer task \cite{liu2026kvbinding}.
 
-\paragraph{From causal memory to full-context operators.}
-Fast-weight models and TTT construct a compact representation from a sequence
-\cite{schlag2021fastweights,sun2025ttt}.  LION extends linear attention to
-bidirectional tasks through equivalent full, recurrent, and chunkwise forms
-\cite{afzal2025lion}.  ViT$^3$ studies full-batch visual inner updates
-\cite{han2026vit3}, while ZipMap uses TTT to form a shared state from an image
-collection \cite{jin2026zipmap}.  These are distinct ways to make complete
-context available to the output.  LSSO contributes a different state
-construction: a full-context statistic generates a compact system whose direct
-solution defines the global mixing map.  The available experiments do not yet
-compare LSSO against LION or visual TTT under a matched training protocol.
+\paragraph{Error-correcting memory and solved adaptation.}
+Fast-weight interpretations connect linear attention to associative memory;
+DeltaNet replaces purely additive storage with prediction-error correction
+\cite{schlag2021fastweights,yang2025deltanet}.  Test-time regression provides a
+common language for contextual memory objectives
+\cite{wang2025testtimeregression}, and Longhorn derives state-space updates
+from online learning \cite{liu2024longhorn}.  MesaNet studies contextual
+regression solved through conjugate gradients with a chunkwise implementation
+\cite{vonoswald2026mesanet}.  LSSO uses these ideas to construct an accretive system from the complete
+context.  Section~\ref{sec:memory-correction} derives the corresponding
+association-error dynamics, including the role of the skew term.
 
-\begin{table}[t]
-\centering
-\small
-\caption{Representative full-context constructions.  This comparison concerns
-how the state is formed, not a matched performance ranking.}
-\label{tab:full-context-designs}
-\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth}>{\raggedright\arraybackslash}p{0.31\linewidth}>{\raggedright\arraybackslash}p{0.40\linewidth}}
-\toprule
-Construction & Context representation & Evaluation route \\
-\midrule
-LION \cite{afzal2025lion} & Bidirectional linear-attention aggregates & Equivalent full, recurrent, or chunkwise forms \\
-Visual full-batch TTT \cite{han2026vit3} & Updated inner-model parameters & Full-context inner update and query evaluation \\
-LSSO & Generated compact system and solved state & Direct compact solve and soft-frame readout \\
-\bottomrule
-\end{tabular}
-\end{table}
+\paragraph{Bidirectional sequence computation.}
+LION gives equivalent full, recurrent, and chunkwise views of bidirectional
+linear attention \cite{afzal2025lion}.  Its Appendix~B.7 separates bidirectional
+DeltaNet formulations from the matrix-inverse cost of the full-attention
+expression it analyzes.  LSSO constructs a different global system with a
+solve dimension set by compact rank.  A related architectural route extends
+selective SSMs such as Mamba \cite{gu2024mamba,dao2024mamba2}: Hydra uses
+quasiseparable matrix mixers to construct a principled bidirectional extension
+\cite{hwang2024hydra}.  LSSO's construction starts from a sample-generated
+memory equilibrium and its readout.  Matched comparisons with these recent architectures remain future work.
 
-\paragraph{Context as a solved problem.}
-Longhorn and test-time regression relate sequence processing to regression
-objectives \cite{liu2024longhorn,wang2025testtimeregression}.  MesaNet optimizes
-causal per-context regressions with a chunkwise conjugate-gradient formulation
-\cite{vonoswald2026mesanet}.  Our bidirectional construction instead generates
-one compact accretive problem per sample and head.  Its mathematical solution
-is evaluated with a direct factorization, subject to floating-point error.
-Analysis of KV-binding TTT further shows that inner optimization and task
-performance need not track one another in the studied settings
-\cite{liu2026kvbinding}.  This motivates our focus on the resulting operator;
-we do not infer a task advantage merely from solving a system accurately.
+\paragraph{Compact states and global interaction.}
+Efficient attention uses projections, kernels, landmarks, or inducing states
+to avoid a dense token map
+\cite{wang2020linformer,katharopoulos2020linear,choromanski2021performer,
+qin2022cosformer,xiong2021nystrom}.  Set Transformer, Luna, ABC, and Perceiver
+mediate global interactions through a bounded auxiliary representation
+\cite{lee2019settransformer,ma2021luna,peng2022abc,jaegle2021perceiver}.
+XCiT uses token-aggregated cross-covariance to generate a shared channel mixer
+\cite{ali2021xcit}.  In LSSO, a compact cross-moment generates the system to be solved, and the
+same association frame gathers the context and reads out the solution.
 
-\paragraph{Context-conditioned contractive geometry.}
-S4 and selective state-space models obtain linear sequence scaling through
-structured recurrence and input-dependent state evolution
-\cite{gu2022s4,gu2024mamba,dao2024mamba2}.  Deep equilibrium models use
-implicit differentiation at a root \cite{bai2019deep}; monotone operator
-equilibrium networks additionally obtain well-posed states from monotone
-structure \cite{winston2020mondeq}.  Direct Cayley parameterization gives a
-complete trainable chart for static Lipschitz-bounded network weights
-\cite{wang2023direct}.  LSSO makes this geometry contextual: every sample
-generates a compact accretive operator, its exact solve produces the global
-token mixer, and compact statistics recover the gain actually realized on
-that sample.  Skew coordinates retain nonsymmetric and nonnormal
-contractions.  This joins global noncausal conditioning with
-accretive/resolvent geometry \cite{bauschke2017convex} and provides a directly
-measurable operator guarantee in a setting where ordinary self-attention need
-not be globally Lipschitz \cite{kim2021lipschitz}.
+\paragraph{Monotone equilibria and contractive parameterization.}
+Deep equilibrium models differentiate through implicit states
+\cite{bai2019deep}, and monotone operator equilibrium networks impose
+structure that makes those states well posed \cite{winston2020mondeq}.
+Cayley relations between accretive operators and contractions are classical
+\cite{bauschke2017convex}; direct parameterizations also provide complete
+charts for static Lipschitz-bounded network weights \cite{wang2023direct}.
+LSSO uses these tools for a sample-generated memory equilibrium and its
+structured token-space readout.  Its norm analysis fixes the generated coefficients, whereas global Lipschitz
+analyses of self-attention must also account for their input dependence \cite{kim2021lipschitz}.
 
-\paragraph{Hardware-efficient linear layers.}
-FlashAttention demonstrated that avoiding materialized intermediates and
-controlling memory traffic can matter as much as operation count
-\cite{dao2022flashattention}; Mamba likewise couples its recurrence to a
-hardware-aware parallel algorithm \cite{gu2024mamba}.  LSSO follows this
-algorithm--implementation co-design principle.  Its native path lowers the
-compact algebra to fused CUDA schedules for both the forward and analytic
-backward.  Unlike exact softmax attention, whose pairwise arithmetic remains
-quadratic even when FlashAttention avoids storing the score matrix, LSSO's
-compact algebra is linear in sequence length at fixed rank.
-Section~\ref{sec:cuda-implementation} reports its measured behavior, and
-Appendix~\ref{app:cuda} gives the lowering and workspace accounting.
+\paragraph{Hardware-efficient execution.}
+FlashAttention and hardware-aware SSM algorithms demonstrate the importance of
+memory traffic and execution structure alongside arithmetic complexity
+\cite{dao2022flashattention,gu2024mamba}.  DeltaNet's chunkwise algorithm also
+makes error-correcting memory practical through hardware-efficient training
+\cite{yang2025deltanet}.  LSSO lowers its compact equilibrium algebra and
+analytic backward to tiled CUDA kernels.  At fixed rank its sequence-dependent
+arithmetic is linear, while exact softmax attention retains quadratic
+pairwise arithmetic even without materializing its score matrix.
+Section~\ref{sec:cuda-implementation} reports complete-mixer measurements;
+Appendix~\ref{app:cuda} distinguishes the current implementation from the
+historical timing protocol.
 
-\section{LSSO}
+\section{LSSO: Full-Context Memory Adaptation}
 \label{sec:method}
+
+LSSO first gathers the input into association coordinates, then constructs and
+solves a compact memory system, and finally reads the state back to tokens.
+The memory-correction interpretation follows from this construction.
 
 We describe one head and omit the batch index.  Let $X\in\R^{N\times D}$ be
 the incoming token matrix, $d$ the head width, and $r$ the compact rank.  A
@@ -259,9 +248,11 @@ single input projection produces relation and content coordinates
 \end{equation}
 Heads are concatenated and passed through an ordinary output projection after
 mixing.  The construction below is repeated independently for each head, with
-one compact state shared by all valid tokens in that head.
+one compact memory state shared by all valid tokens in that head.
+The state is recomputed from the current sample; learned outer parameters
+remain fixed during each forward evaluation.
 
-\subsection{Full-context computation at a glance}
+\subsection{Overview}
 For normalized, position-transformed relation coordinates, LSSO builds a soft
 frame $P$ and evaluates
 \begin{equation}
@@ -269,14 +260,28 @@ frame $P$ and evaluates
  Y=\eta C+P[2U^\star-(1+\eta)Z].
 \label{eq:computation-overview}
 \end{equation}
-The first operation gathers the entire valid context; the second constructs a
-shared solved state; the third returns its action to all tokens.  The following
-subsections specify each operation.  Masking, $1/\sqrt n$ relation normalization,
-and Rank-Rotary precede frame construction, as detailed in
-Section~\ref{sec:mask-and-phase}; throughout, $n$ is the valid-token count.
+Here $P$ is the association frame, $K$ is generated from $Z$, and $\eta$ is
+a learned scalar.  We define each below, starting with the token coordinates
+used to construct $P$.
 
+\subsection{Relation features and masking}
+\label{sec:masking}
 
-\subsection{Gathering the full context into a compact statistic}
+For a boolean validity mask $m\in\{0,1\}^N$, invalid rows of both $A$ and $C$
+are set to zero before any compact statistic is formed.  Let
+\begin{equation}
+    n = \sum_{i=1}^N m_i.
+\end{equation}
+For a nonempty sequence, relation coordinates are normalized as
+$A\leftarrow A/\sqrt{n}$.  An entirely masked sequence is assigned the zero
+output by definition.  Masking before normalization makes the result invariant
+to appended padding.
+
+The operator consumes relation and content features without an internal
+position-dependent transform. Absolute or two-dimensional learned position
+embeddings belong to the surrounding encoder.
+
+\subsection{Association frame}
 \label{sec:soft-frame}
 
 The QR soft frame maps unconstrained relation coordinates to a strict column
@@ -296,15 +301,53 @@ range.
 The identity augmentation means that the factorization is defined even when
 $N<r$ or $A$ is rank deficient.
 
-The frame compresses the content into one shared cross-moment,
+Each row of $P$ supplies an association coordinate, and $C$ supplies its
+content target.  A memory $U\in\R^{r\times d}$ predicts those targets as
+$PU$.  The frame compresses the content into one shared cross-moment,
 \begin{equation}
     Z=P^\T C\in\R^{r\times d}.
 \label{eq:cross-moment}
 \end{equation}
 $Z$ aggregates all valid positions symmetrically in one noncausal pass without
-forming the token-level matrix in \eqref{eq:token-mixer-intro}.
+forming the token-level matrix in \eqref{eq:token-mixer}.
 
-\subsection{Generating and solving the contextual core}
+\begin{theorem}[Soft-frame spectrum and coverage]
+\label{thm:soft-frame}
+Let $P$ be the upper block of the $Q$ factor in
+\eqref{eq:soft-frame}.  If $\sigma_i(A)$ are the singular values of the
+normalized relation matrix, then
+\begin{equation}
+    \sigma_i(P)=\frac{\sigma_i(A)}
+    {\sqrt{1+\sigma_i(A)^2}}.
+\label{eq:soft-frame-spectrum}
+\end{equation}
+Consequently,
+\begin{equation}
+    P^\T P \prec \I_r,
+    \qquad
+    \I_N-PP^\T \succ 0,
+    \qquad
+    1-\norm{P}_2^2=\frac{1}{1+\norm{A}_2^2}.
+\label{eq:soft-frame-contract}
+\end{equation}
+Moreover, at the level of represented frames, the construction covers every
+$P\in\R^{N\times r}$ satisfying $P^\T P\prec\I_r$.
+\end{theorem}
+
+The lower QR block satisfies $E=R_{\mathrm{qr}}^{-1}$, so
+$P^\T P+E^\T E=\I_r$ gives the strict frame margin.
+Appendix~\ref{app:proofs} derives the spectrum and proves coverage of the
+represented frame family.
+
+The identity augmentation supplies the strict complement $\I_N-PP^\T$, which
+allows the compact contraction to extend to every token direction.  If $A_0$ denotes
+the masked relation matrix before division by $\sqrt n$, the final term in
+\eqref{eq:soft-frame-contract} becomes
+$1/(1+\norm{A_0}_2^2/n)$.  Thus bounded per-token relation energy prevents the
+frame margin from deteriorating merely because the sequence is longer.
+
+
+\subsection{Memory system}
 \label{sec:accretive-core}
 
 In the default \textsc{Dynamic} mode, $Z$ generates compact raw coordinates
@@ -316,6 +359,14 @@ where $\Theta_0\in\R^{r\times r}$ and
 $W_{\mathrm{drive}}\in\R^{d\times r}$ are learned per-head parameters.  The
 \textsc{Static} ablation uses $\Theta=\Theta_0$, while \textsc{Zero} fixes the
 compact contraction to zero.
+
+\begin{definition}[Strict accretivity]
+\label{def:accretive}
+A real square matrix $K$ is strictly accretive when
+\begin{equation}
+    \sym(K) \coloneqq \frac{K+K^\T}{2}\succ0.
+\end{equation}
+\end{definition}
 
 For \textsc{Dynamic} and \textsc{Static}, define
 \begin{align}
@@ -345,7 +396,68 @@ At $\Theta=0$, $L=\I_r$, $\Omega=0$, $K=\I_r$, and the compact contraction is
 $M=0$.  Both nonzero-core modes start at that point; \textsc{Dynamic} also
 starts with $W_{\mathrm{drive}}=0$.
 
-\subsection{Lifting the compact action to all tokens}
+\subsection{Association-error correction}
+\label{sec:memory-correction}
+
+For \textsc{Dynamic} and \textsc{Static}, the constructed system has a precise
+error-correction interpretation.  Fix the current sample's $P$, $C$, $L$, and
+$\Omega$, and define the derived regularizer
+\begin{equation}
+    \Gamma_X=\I_r+LL^\T-P^\T P\succ0.
+\label{eq:memory-regularizer}
+\end{equation}
+Positive definiteness follows from Theorem~\ref{thm:soft-frame} and
+$LL^\T\succ0$.  The coefficients are fixed during the solve.  In particular, $\Gamma_X$ is
+derived from the frame and system parameters rather than learned separately.
+
+\begin{proposition}[Associative-memory correction identity]
+\label{prop:memory-correction}
+For the fixed contextual quantities above, let
+\begin{equation}
+    \mathcal J_X(U)=\frac12\norm{PU-C}_F^2
+        +\frac12\operatorname{tr}(U^\T\Gamma_XU).
+\label{eq:association-objective}
+\end{equation}
+Then the memory-correction field satisfies
+\begin{align}
+    \dot U
+    &=\underbrace{P^\T(C-PU)}_{\text{association-error feedback}}
+       -\Gamma_XU-\Omega U \\
+    &=-\nabla_U\mathcal J_X(U)-\Omega U
+      =Z-(\I_r+K)U.
+\label{eq:memory-correction-flow}
+\end{align}
+Its unique equilibrium is the state $U^\star$ used by LSSO.
+\end{proposition}
+
+\begin{proof}
+Since $\Gamma_X$ is symmetric,
+$\nabla_U\mathcal J_X(U)=(P^\T P+\Gamma_X)U-P^\T C
+=(\I_r+LL^\T)U-Z$.  Adding the skew term gives
+$Z-(\I_r+LL^\T+\Omega)U=Z-(\I_r+K)U$.
+The symmetric part of $\I_r+K$ is positive definite, so its zero is unique.
+\end{proof}
+
+Writing row $i$ of $P$ as $\mathbf p_i^\T$ and row $i$ of $C$ as $\mathbf c_i^\T$ makes the
+feedback explicit:
+\begin{equation}
+    P^\T(C-PU)=\sum_{i:m_i=1}\mathbf p_i(\mathbf c_i^\T-\mathbf p_i^\T U).
+\label{eq:association-feedback}
+\end{equation}
+Every valid association contributes its prediction error to the same memory.
+When $\Omega=0$, this is gradient flow on the strictly convex regularized
+association objective.  With nonzero $\Omega$, it is a monotone correction
+system with skew coupling; $U^\star$ need not minimize
+$\mathcal J_X$ itself.  Appendix~\ref{sec:solved-inner-process} proves global
+convergence to $U^\star$ for the continuous process, while
+Section~\ref{sec:theory} bounds the solve and its implicit adjoint.
+
+The forward pass obtains this equilibrium by solving the $r\times r$ system.
+Backpropagation differentiates through the solve and through the generation of
+its coefficients.  The identity explains the memory corrected by LSSO; it
+does not require executing the continuous dynamics.
+
+\subsection{Token readout}
 
 Define the reflected resolvent
 \begin{equation}
@@ -360,39 +472,6 @@ token-mixing form
     T=\eta\I_N+P(M-\eta\I_r)P^\T.
 \label{eq:token-mixer}
 \end{equation}
-
-\paragraph{Solved contextual inner state.}
-LSSO obtains $U^\star$ by a direct $r\times r$ solve.
-Appendix~\ref{sec:solved-inner-process} relates this solution to a globally
-convergent contextual dynamics.
-
-\subsection{Position, masking, and execution order}
-\label{sec:mask-and-phase}
-
-For a boolean validity mask $m\in\{0,1\}^N$, invalid rows of both $A$ and $C$
-are set to zero before any compact statistic is formed.  Let
-\begin{equation}
-    n = \sum_{i=1}^N m_i.
-\end{equation}
-For a nonempty sequence, relation coordinates are normalized as
-$A\leftarrow A/\sqrt{n}$.  An entirely masked sequence is assigned the zero
-output by definition.  Masking before normalization makes the result invariant
-to appended padding.
-
-Rank-Rotary applies a block-diagonal planar rotation to
-the $r$ relation coordinates before the soft frame.  For centered position
-$p_i$ and frequencies $\{\omega_j\}_{j=1}^{r/2}$, each coordinate pair uses
-the angle $p_i\omega_j$.  The transformation preserves each relation row's
-Euclidean norm and obeys the relative-phase identity
-\begin{equation}
-    \mathcal R(p_i)^\T\mathcal R(p_j)=\mathcal R(p_j-p_i).
-\label{eq:rank-rotary-relative}
-\end{equation}
-Rank-Rotary therefore supplies relative phase within relation rank space while
-preserving each row norm.  Absolute or two-dimensional position embeddings
-remain external to the mixer.  Full-context access does not remove positional
-structure: these feature rotations are applied before aggregation and do not
-impose a causal visibility mask.
 
 \subsection{Linear sequence complexity}
 \label{sec:linear-complexity}
@@ -417,14 +496,16 @@ Unlike exact MHA, whose $O(N^2d)$ mixing cost persists under FlashAttention
 \cite{dao2022flashattention}, LSSO has $O(Nr(r+d))$ token-dependent work and no
 $N\times N$ intermediate.  Both retain $O(ND^2)$ feature projections.
 
-\section{Geometry of the Full-Context Operator}
+\section{Properties of the Memory and Readout}
 \label{sec:theory}
 
-We analyze one realized head in exact arithmetic.  Complete proofs are given in
-Appendix~\ref{app:proofs}, and mixed-precision execution is described in
-Section~\ref{sec:cuda-implementation}.
+We analyze the adaptation state and its induced readout for one realized
+head in exact arithmetic.  We first bound the solve and its derivatives, then characterize the compact
+operator family and the spectral norm of the token readout.  Complete proofs
+are given in Appendix~\ref{app:proofs}, and mixed-precision execution is
+described in Section~\ref{sec:cuda-implementation}.
 
-\subsection{Is the contextual state well posed?}
+\subsection{Well-posed adaptation and implicit differentiation}
 
 \begin{theorem}[Stable solved state and implicit adjoint]
 \label{thm:stable-solve}
@@ -465,54 +546,7 @@ used by implicit differentiation, and sensitivity to the generated compact
 problem.  The realized-gain certificate below separately measures the
 contraction margin, which also depends on the skew coordinates.
 
-\subsection{What does gain control allow the operator to express?}
-
-\paragraph{A frame that preserves the compact guarantee.}
-
-\begin{theorem}[Soft-frame contract]
-\label{thm:soft-frame}
-Let $P$ be the upper block of the $Q$ factor in
-\eqref{eq:soft-frame}.  If $\sigma_i(A)$ are the singular values of the
-normalized relation matrix, then
-\begin{equation}
-    \sigma_i(P)=\frac{\sigma_i(A)}
-    {\sqrt{1+\sigma_i(A)^2}}.
-\label{eq:soft-frame-spectrum}
-\end{equation}
-Consequently,
-\begin{equation}
-    P^\T P \prec \I_r,
-    \qquad
-    \I_N-PP^\T \succ 0,
-    \qquad
-    1-\norm{P}_2^2=\frac{1}{1+\norm{A}_2^2}.
-\label{eq:soft-frame-contract}
-\end{equation}
-Moreover, at the level of represented frames, the construction covers every
-$P\in\R^{N\times r}$ satisfying $P^\T P\prec\I_r$.
-\end{theorem}
-
-\begin{proof}[Proof sketch]
-The lower block of \eqref{eq:soft-frame} obeys
-$ER_{\mathrm{qr}}=\I_r$.  Since the augmented matrix has full
-column rank, $R_{\mathrm{qr}}$ and hence $E$ are nonsingular.  Orthogonality
-of the full thin-$Q$ factor gives
-\begin{equation}
-    P^\T P+E^\T E=\I_r.
-\end{equation}
-Because $E^\T E\succ0$, the first claim follows.  Also
-$R_{\mathrm{qr}}^\T R_{\mathrm{qr}}=\I_r+A^\T A$ and
-$P=AR_{\mathrm{qr}}^{-1}$, which yields
-\eqref{eq:soft-frame-spectrum} and the exact norm margin.  In particular,
-$\norm{P}_2<1$, which implies $PP^\T\prec\I_N$ and proves the second claim.
-\end{proof}
-
-The identity augmentation supplies the strict complement $\I_N-PP^\T$, which
-allows the compact contraction to extend to every token direction.  If $A_0$ denotes
-the masked relation matrix before division by $\sqrt n$, the final term in
-\eqref{eq:soft-frame-contract} becomes
-$1/(1+\norm{A_0}_2^2/n)$.  Thus bounded per-token relation energy prevents the
-frame margin from deteriorating merely because the sequence is longer.
+\subsection{Context dependence and expressivity}
 
 \begin{proposition}[Length-normalized contextual drive]
 \label{prop:length-normalized-drive}
@@ -532,21 +566,12 @@ length.
 
 \paragraph{A complete compact contraction chart.}
 
-\begin{definition}[Strict accretivity]
-\label{def:accretive}
-A real square matrix $K$ is strictly accretive when
-\begin{equation}
-    \sym(K) \coloneqq \frac{K+K^\T}{2}\succ0.
-\end{equation}
-\end{definition}
+
 
 The Cayley connection between accretive coordinates and contractions is
 classical in monotone operator theory \cite{bauschke2017convex}, and direct
 Cayley charts have parameterized static Lipschitz-bounded network weights
-\cite{wang2023direct}.  The result below gives the complete strict form needed
-by LSSO.  Its role here is contextual: $K$ is generated from the current
-sample's cross-moment, and the resulting contraction is lifted through that
-sample's token frame.
+\cite{wang2023direct}.  We use this relation to characterize the compact maps represented by LSSO.
 
 \begin{theorem}[Accretive Cayley parameterization]
 \label{thm:accretive-cayley}
@@ -591,7 +616,7 @@ nonnormal.  The chart retains every strict contraction in rank space, and at
 token level,
 $T-T^\T=P(M-M^\T)P^\T$, so this nonsymmetric structure survives the lift.
 
-\subsection{Can the realized global gain be computed exactly?}
+\subsection{Exact gain of the global readout}
 
 The soft frame identifies the token subspace where contextual mixing acts.
 Figure~\ref{fig:geometry} separates this compact action from the scalar
@@ -682,21 +707,99 @@ certificate.  Thus $T$ is a rank-$r$ correction to an isotropic complement.
 Appendix~\ref{app:proofs} proves padding isolation and noncausal permutation
 equivariance.
 
-\section{Task Evidence and Realized Operators}
+\section{Experiments}
 \label{sec:sequence-experiments}
 
-We evaluate LSSO as a drop-in replacement for attention in otherwise ordinary
-bidirectional encoders.  All reported LSSO runs use the default
-\textsc{Dynamic} core, Rank-Rotary, rank $32$, FP16
-automatic mixed precision, and the CUDA implementation.  Checkpoints are
+We evaluate LSSO in image classifiers and bidirectional sequence encoders.
+ImageNet training follows the DeiT III protocol.
+The accuracy and timing tables retain their original source revisions. Those
+runs included a position-dependent relation-feature transform that is absent
+from the current operator. They therefore describe the archived models, not
+new measurements of the current implementation.
+The archived genomic and LRA experiments use the \textsc{Dynamic} core,
+rank $32$, FP16 automatic mixed precision, and the CUDA implementation.  For these sequence experiments, checkpoints are
 selected only by validation accuracy, with validation loss breaking an exact
 tie; the held-out test split is evaluated once after selection.  Reported
 uncertainties are sample standard deviations over seeds $0$, $1$, and $2$.
-Across the evaluated task configurations, LSSO requires only
+Across the genomic and LRA configurations, LSSO requires
 $1.3\%$--$32.0\%$ of exact MHA's sequence-dependent mixer-core MACs
 (Appendix~\ref{app:mixer-macs}).
 
-\subsection{Matched genomic mixer comparison}
+\subsection{ImageNet classification}
+\label{sec:vision}
+
+\paragraph{Experimental settings.}
+We evaluate image classification on ImageNet-1K, which contains 1.28M training
+images and 50K validation images from 1,000 classes
+\cite{russakovsky2015imagenet}.  We replace the attention layers in DeiT III
+with LSSO and follow the DeiT III training protocol \cite{touvron2022deit3}.
+Both Small and Base use 12 blocks, $16\times16$ patches, and a class-token
+readout.  Their widths, head counts, and compact ranks are $(384,6,32)$ and
+$(768,12,48)$, respectively.  All LSSO layers use the \textsc{Dynamic} core.
+
+We train for 800 epochs with fused LAMB and a total batch size of 2048, using
+3-Augment, Mixup, CutMix, and binary cross-entropy.  Small is trained at
+$224\times224$; Base is trained at $192\times192$ and then fine-tuned for
+20 epochs at $224\times224$ with AdamW and a batch size of 512.
+We report validation Top-1 accuracy at $224\times224$.  Checkpoint selection
+and full training settings are provided in Appendix~\ref{app:imagenet-protocol}.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{ImageNet-1K classification at $224\times224$.  All models use
+ImageNet-1K training data only.  Baseline results are quoted from the cited
+papers or official releases under their respective training protocols;
+LSSO follows DeiT III.  Training schedules, augmentation, and other settings
+are not unified across methods.}
+\label{tab:imagenet-comparison}
+\begin{tabular}{llrr}
+\toprule
+Model & Mixing mechanism & Params (M) & Top-1 (\%) \\
+\midrule
+\multicolumn{4}{l}{\emph{Established classification baselines}} \\
+DeiT-S \cite{touvron2021deit} & Self-attention & 22 & 79.8 \\
+DeiT-B \cite{touvron2021deit} & Self-attention & 86 & 81.8 \\
+DeiT III-S \cite{touvron2022deit3} & Self-attention & 22.0 & 81.4 \\
+DeiT III-B \cite{touvron2022deit3} & Self-attention & 86.6 & 83.8 \\
+ConvNeXt-T \cite{liu2022convnext} & Convolution & 28 & 82.1 \\
+ConvNeXt-B \cite{liu2022convnext} & Convolution & 89 & 83.8 \\
+\midrule
+\multicolumn{4}{l}{\emph{Bidirectional sequence mixers and visual TTT}} \\
+Vim-S \cite{zhu2024vim} & Bidirectional SSM & 26 & 80.3 \\
+Vim-B \cite{zhu2024vim} & Bidirectional SSM & 98 & 81.9 \\
+Vim-S$^\dagger$ \cite{zhu2024vim} & Bidirectional SSM & 26 & 81.4 \\
+Vim-B$^\dagger$ \cite{zhu2024vim} & Bidirectional SSM & 98 & 83.2 \\
+Hydra-ViT-B \cite{hwang2024hydra} & Bidirectional SSM & 91 & 81.6 \\
+LION-D$^\natural$ (Small) \cite{afzal2025lion} & Bidirectional linear attention & 22 & 79.9 \\
+LION-D$^\natural$ (Base) \cite{afzal2025lion} & Bidirectional linear attention & 86 & 80.2 \\
+ViT$^3$-S \cite{han2026vit3} & Test-time training & 24 & 81.6 \\
+ViT$^3$-B \cite{han2026vit3} & Test-time training & 90 & 82.6 \\
+\midrule
+\multicolumn{4}{l}{\emph{Our models}} \\
+LSSO-S & Associative memory & 19.62 & 79.43 \\
+LSSO-B & Associative memory & 78.50 & 82.24 \\
+\bottomrule
+\end{tabular}
+\par\smallskip
+\begin{minipage}{0.96\linewidth}
+\footnotesize
+$\dagger$: Vim fine-tuned for 30 additional epochs at $224\times224$ with
+patch size 16 and extraction stride 8.  $\natural$: LION with multiple scans.
+\end{minipage}
+\end{table}
+
+\paragraph{Results.}
+Table~\ref{tab:imagenet-comparison} compares LSSO with established classifiers
+and related bidirectional sequence models.  LSSO-S achieves $79.43\%$ Top-1
+with $19.62$M parameters, and LSSO-B achieves $82.24\%$ with $78.50$M.
+LSSO-B is $0.44$ points above the quoted DeiT-B result and $0.36$ points below
+ViT$^3$-B, while DeiT III-B reaches $83.8\%$.  These comparisons place LSSO
+among existing visual backbones, but differences in training protocols
+prevent attributing the accuracy differences to the mixer alone.
+
+\subsection{Genomic classification}
 
 GenomicBenchmarks collects binary DNA sequence-classification tasks with
 official train and test partitions \cite{gresova2023genomicbenchmarks}.  We
@@ -740,64 +843,13 @@ Unweighted task macro    & $75.37$ & $74.35$ & $74.34$ & $75.57$ & $\mathbf{78.5
 \end{table}
 
 Table~\ref{tab:genomic-results} shows that LSSO has the highest mean on
-seven of eight tasks; this is not a claim of statistical significance on each task.  Its $78.53$ macro average exceeds cosFormer, the strongest alternative
-at $75.57$, by $2.96$ points and MHA's $75.37$ by $3.16$ points.  The three
-linear-attention controls indicate that neither removing softmax nor obtaining
-linear sequence scaling alone reproduces LSSO's gain.  The macro result first
-averages seeds within each task and then gives all tasks equal weight.  The
-largest gain occurs on Human or Worm; Mouse Enhancers Ensembl is the sole
-exception, where Linear Transformer is highest.
+seven of eight tasks.  Its $78.53$ macro average exceeds cosFormer, the strongest alternative
+at $75.57$, by $2.96$ points and MHA's $75.37$ by $3.16$ points.  The largest improvement is on Human or Worm, while Linear Transformer leads
+on Mouse Enhancers Ensembl.  The small mean differences on tasks such as
+Human Enhancers Cohn should be read alongside the three-seed variability.
+The macro average weights tasks equally after averaging seeds within each task.
 
-\subsection{Scope of mechanism attribution}
-The matched comparison tests the complete LSSO layer.  It does not isolate the
-benefits of the dynamic drive, skew coordinates, rank, or Rank-Rotary.
-In particular, \textsc{Static} removes the dynamic drive to $K$ while leaving
-$P$ input-dependent; it is not a fully input-independent mixer.  Matched
-\textsc{Dynamic}/\textsc{Static}/\textsc{Zero} training and core-activity
-measurements are needed to attribute a task advantage to the generated core.
-No such ablation results are included here.
-
-\subsection{Certificates in trained models}
-\label{sec:certificate-evidence}
-
-We next measure how much certified margin trained models retain.  Across three
-six-layer LRA Text checkpoints and matched held-out token-stream probes from
-$1$K to $8$K, all $9{,}216$ head-level observations are finite and satisfy
-their certified conditions (Table~\ref{tab:certificate-audit}).  The worst
-realized gain is $0.9087$, leaving at least $0.0913$ contraction slack, and the
-minimum monotonicity margin is $1.1667$.  Solved states use at most $93.3\%$ of
-their certified bound, while deterministic adjoint probes use at most $88.1\%$.
-Appendix~\ref{app:certificate-protocol} reports the per-layer distributions
-and stress-test protocol.
-
-\begin{table}[H]
-\centering
-\small
-\setlength{\tabcolsep}{7pt}
-\caption{Worst observation in the trained-model certificate audit.  Bound
-usage is the measured ratio normalized by its certified upper bound $1/\mu$.}
-\label{tab:certificate-audit}
-\begin{tabular}{lcc}
-\toprule
-Quantity & Certified condition & Worst observed \\
-\midrule
-Realized gain & $q(X)<1$ & $\max q=0.9087$ \\
-Contraction slack & $1-q(X)>0$ & $\min(1-q)=0.0913$ \\
-Monotonicity margin & $\mu>1$ & $\min\mu=1.1667$ \\
-Solved-state bound usage & $\mu\norm{U^\star}_F/\norm{Z}_F\leq1$ & $0.9329$ \\
-Adjoint-probe bound usage & $\mu\norm{A_K^{-\T}G}_F/\norm{G}_F\leq1$ & $0.8814$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-
-The gain in these probes is dominated by the scalar complement $|\eta|$
-(Appendix~\ref{app:certificate-protocol}).  The audit therefore establishes
-realized operator margins, not the task contribution of the dynamic core.
-The $8$K probes are operator stress tests on assembled token streams, not an
-$8$K classification or length-generalization result.
-
-\subsection{Long Range Arena context}
+\subsection{Long Range Arena}
 
 Long Range Arena (LRA) tests structured reasoning and long-context
 classification \cite{tay2021lra}.  Following established reporting practice
@@ -805,9 +857,8 @@ classification \cite{tay2021lra}.  Following established reporting practice
 benchmark and subsequent work and groups models by their primary mixing
 mechanism.  General-purpose global mixers and efficient-attention
 approximations form the first block; structured recurrence and state-space
-models form the second.  This distinction matters because explicit locality
-and positional structure materially affect LRA performance
-\cite{mirallesgonzalez2025locality}.
+models form the second.  These published results use different training protocols; locality and
+positional design also affect performance \cite{mirallesgonzalez2025locality}.
 
 We evaluate LSSO on four LRA tasks using six-layer encoders, with $D=128$ for
 ListOps and Retrieval and $D=256$ for Text and Pathfinder-32.  ListOps, Text,
@@ -857,13 +908,55 @@ Mega \cite{ma2023mega} & $\mathbf{63.14}$ & $\mathbf{90.43}$
 
 Within the global-mixer block, LSSO gives the highest Retrieval, Pathfinder,
 and four-task average; it is within $0.38$ points of the highest ListOps result
-and $0.71$ points of the highest Text result.  The same mixer spans symbolic,
-byte-level, paired-retrieval, and two-dimensional path tasks.
+and $0.71$ points of the highest Text result.  S4 and Mega obtain higher scores across all four tasks.  The table places
+LSSO among published results; the matched genomic experiment provides the
+controlled comparison of mixers.
 
-\section{Execution Cost of the Solved Operator}
+\subsection{Operator margins in trained models}
+\label{sec:certificate-evidence}
+
+We next test whether trained operators remain comfortably within the bounds
+of Section~\ref{sec:theory}.  Across three
+six-layer LRA Text checkpoints and matched held-out token-stream probes from
+$1$K to $8$K, all $9{,}216$ head-level observations are finite and satisfy
+their certified conditions (Table~\ref{tab:certificate-audit}).  The worst
+realized gain is $0.9087$, leaving at least $0.0913$ contraction slack, and the
+minimum monotonicity margin is $1.1667$.  Solved states use at most $93.3\%$ of
+their certified bound, while deterministic adjoint probes use at most $88.1\%$.
+Appendix~\ref{app:certificate-protocol} reports the per-layer distributions
+and stress-test protocol.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{7pt}
+\caption{Worst observation in the trained-model certificate audit.  Bound
+usage is the measured ratio normalized by its certified upper bound $1/\mu$.}
+\label{tab:certificate-audit}
+\begin{tabular}{lcc}
+\toprule
+Quantity & Certified condition & Worst observed \\
+\midrule
+Realized gain & $q(X)<1$ & $\max q=0.9087$ \\
+Contraction slack & $1-q(X)>0$ & $\min(1-q)=0.0913$ \\
+Monotonicity margin & $\mu>1$ & $\min\mu=1.1667$ \\
+Solved-state bound usage & $\mu\norm{U^\star}_F/\norm{Z}_F\leq1$ & $0.9329$ \\
+Adjoint-probe bound usage & $\mu\norm{A_K^{-\T}G}_F/\norm{G}_F\leq1$ & $0.8814$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+The gain in these probes is dominated by the scalar complement $|\eta|$
+(Appendix~\ref{app:certificate-protocol}).  The nearly constant worst-case gain therefore reflects the learned complement;
+it does not measure how strongly the dynamic core contributes to predictions.
+The $8$K probes are operator stress tests on assembled token streams, not an
+$8$K classification or length-generalization result.
+
+\subsection{Runtime}
 \label{sec:cuda-implementation}
 
-The default \textsc{Dynamic} core with Rank-Rotary has a native,
+The \textsc{Dynamic}, \textsc{Static}, and \textsc{Zero} cores have a native,
 algebraically equivalent CUDA path for inference and first-order training.  It
 avoids both the $N\times N$ token matrix and the compact Cayley matrix; compact
 factorization and tiled solves evaluate the equilibrium directly, while the
@@ -871,14 +964,15 @@ analytic backward reuses saved factors.  Mixed-precision outputs and gradients
 are validated against the FP64 reference.  Appendix~\ref{app:cuda} gives the
 execution schedule, workspace, VJP, numerical envelope, and build coverage.
 
-The following measurements use the historical contract-6 implementation;
-they have not been rerun under the current contract-8 mixed-precision backend.
+These timings use the implementation and software versions recorded in
+Appendix~\ref{app:cuda}, rather than the subsequently revised backend.
 Table~\ref{tab:cuda-wall-clock} measures the complete mixer boundary, including
 input and output projections.  At $N=4096$, native LSSO reaches $1.79\times$
 the Flash-SDPA MHA forward throughput and $2.30\times$ its training throughput.
 Across $N=1024$--$4096$, forward--backward latency grows by $3.88\times$ for
-LSSO and $7.92\times$ for MHA.  These finite-shape timings illustrate
-the scaling trend; they are not an asymptotic fit or an end-to-end model benchmark.
+LSSO and $7.92\times$ for MHA.  At $N=1024$, LSSO is slower in inference ($2.539$ versus $2.131$ ms),
+so the throughput advantage depends on sequence length.  The timings cover
+the mixer, including projections, rather than the complete encoder.
 
 \begin{table}[H]
 \centering
@@ -907,48 +1001,44 @@ $N$ & PyTorch ref. & Native & MHA & Ref./native & MHA/native \\
 \end{tabular}
 \end{table}
 
-\section{Visual Representation and Dense Prediction}
-\label{sec:vision}
-% Intentionally empty: no visual results are claimed in this draft.
-\subsection{ImageNet classification}
-\subsection{COCO detection and instance segmentation}
-\subsection{ADE20K semantic segmentation}
-
 \section{Limitations}
 \label{sec:limitations}
 
-LSSO is designed for bidirectional tasks: its compact statistic uses the full
-valid sequence.  It has no causal masking or autoregressive decoding contract.
-The token-space family is a rank-$r$ correction to a scalar complement, even
-though the compact chart covers every real strict contraction.  Its realized
-gain certificate does not bound the end-to-end Jacobian, which also includes
-derivatives of the input-conditioned operator, feature projections, and the
-surrounding network.
+LSSO compresses the associations in a sequence into a memory of fixed rank.
+For each sample, the frame selects at most $r$ token directions for nontrivial
+mixing; the orthogonal complement receives the same scalar action $\eta$.
+Although the frame adapts to the input, a fixed rank may limit the number of
+independent relations that one head can represent in a complex context.
+Increasing $r$ expands this capacity, but raises the frame cost as $O(Nr^2)$
+and the factorization cost as $O(r^3)$.  Linear scaling with sequence length
+therefore comes with a capacity--computation tradeoff.
 
-The task evidence evaluates the complete layer on genomic classification and
-four LRA tasks.  Mechanism attribution, matched comparisons with recent
-bidirectional linear attention and TTT, and visual transfer remain open.
-The native packages support $r\in\{16,32,48,64\}$, but the reported task runs
-use $r=32$.  Timings are hardware- and shape-specific and use the historical
-implementation contract; broader hardware, rank, and current-backend
-measurements are needed to extend those empirical conclusions.
+The direct solve also introduces overhead that is not amortized on every
+workload.  In our measurements, LSSO has lower inference throughput than
+Flash-SDPA attention at $N=1024$, with an advantage emerging at longer lengths.
+The crossover depends on model dimensions, precision, and hardware, so linear
+asymptotic complexity alone does not imply lower latency.  The current
+architecture uses a single global memory per head; combining it with explicit
+local modeling is a useful direction for inputs whose fine-scale structure
+and long-range relations place different demands on the representation.
 
 \section{Conclusion}
 
-Complete context permits a sequence layer to construct its mixing state jointly
-from all tokens.  LSSO realizes this choice through a sample-generated compact
-system and one direct solve.  The accretive core, soft frame, and scalar
-complement jointly specify an expressive compact action, a structured global
-lift, and an exactly computable realized gain.  The resulting algebra supports
-linear sequence scaling at fixed rank and an equivalent native backward.
-Matched genomic results establish task value for the complete layer, while
-long-sequence diagnostics and timings characterize its realized behavior.
-This construction makes the full-context operator, its geometry, and its
-execution part of the same design.
+LSSO forms a shared full-context memory by directly solving a compact,
+input-dependent system.  Its equilibrium can be expressed as regularized
+association-error correction with skew coupling.  The system structure bounds
+the state and adjoint solves, while the frame readout yields a token mixer
+with an exactly computable spectral norm below one.  The layer has linear
+sequence complexity at fixed rank and admits an equivalent CUDA implementation.
+ImageNet experiments demonstrate visual classification with the solved
+memory, matched genomic experiments show gains for the complete layer, and
+LRA results and diagnostics examine its behavior on longer sequences.
+Determining which parts of the construction account for these gains remains
+an important next step.
 
 \appendix
 
-\section{Complete Theoretical Details}
+\section{Proofs and Additional Properties}
 \label{app:proofs}
 
 \subsection{Soft-frame spectrum and coverage}
@@ -1006,13 +1096,15 @@ $\norm{(\I_r+K)v}_2\geq\mu\norm{v}_2$, proving
 $\sigma_{\min}(\I_r+K)\geq\mu$ and
 $\norm{(\I_r+K)^{-1}}_2\leq\mu^{-1}$.
 
-\subsection{The direct solve resolves a convergent contextual process}
+\subsection{Convergence of the memory-correction dynamics}
 \label{sec:solved-inner-process}
 
-Let $A_K=\I_r+K$.  The following result relates the direct solve to a
-continuous contextual process.
+Let $A_K=\I_r+K$.  By Proposition~\ref{prop:memory-correction}, the
+continuous process below is exactly the regularized association-error
+correction field with skew coupling.  We establish its convergence while
+holding the sample-conditioned coefficients fixed.
 
-\begin{theorem}[Solved contextual inner process]
+\begin{theorem}[Convergence to the memory equilibrium]
 \label{thm:inner-process}
 For fixed contextual quantities $K$ and $Z$, consider the continuous dynamics
 \begin{equation}
@@ -1043,10 +1135,8 @@ because $\sym(A_K)=\I_r+LL^\T\succeq\mu\I_r$.  Gronwall's inequality gives
 \eqref{eq:flow-rate}.
 \end{proof}
 
-Appendix~\ref{app:proofs} also identifies the direct solution as the
-infinite-step limit of stable gradient descent on the residual objective.  The
-production backward differentiates this solved state rather than a finite
-unroll.
+The next subsection gives a separate residual-minimization interpretation
+and derives the gradient of the solved state.
 
 \subsection{Residual optimization, implicit derivative, and sensitivity}
 
@@ -1089,17 +1179,6 @@ For two generated problems, the resolvent identity gives
 \end{align}
 which proves \eqref{eq:finite-solve-sensitivity}.  Taking its differential
 gives \eqref{eq:equilibrium-differential} and the stated local bound.
-The solve and adjoint bounds above further give
-\begin{equation}
-    \norm{U^\star}_F\leq\mu^{-1}\norm{Z}_F,
-    \qquad
-    \norm{V}_F\leq\mu^{-1}\norm{G}_F,
-    \qquad
-    \norm{dU^\star}_F
-    \leq\mu^{-1}\norm{dZ}_F
-      +\mu^{-2}\norm{dK}_2\norm{Z}_F.
-\end{equation}
-
 The margin $\mu$ certifies the solve and flow rate, while the realized-gain
 certificate separately captures the effect of skew coordinates.  For example,
 with $L=\I_2$ and
@@ -1139,18 +1218,101 @@ If an invalid row has $A_i=C_i=0$, the upper QR block has $P_i=0$, so
 Equation~\eqref{eq:equilibrium-readout} gives $Y_i=0$.  Explicit output
 masking preserves this value after the feature projection.
 
-Let $\Pi$ permute token rows together with their mask and position identifiers.
-All rowwise projections, masking, normalization, and phase rotations commute
+Let $\Pi$ permute token rows together with their validity mask.
+All rowwise projections, masking, and normalization commute
 with $\Pi$.  Uniqueness of the positive-diagonal reduced QR factorization gives
 $P'=\Pi P$, while
 $Z'=P'^{\T}C'=P^\T C=Z$.  The generated $K$, $M$, and $\eta$ are unchanged,
 and Equation~\eqref{eq:token-mixer} yields
 \begin{equation}
-    \operatorname{LSSO}(\Pi X,\Pi m,\Pi p)
-    =\Pi\operatorname{LSSO}(X,m,p).
+    \operatorname{LSSO}(\Pi X,\Pi m)
+    =\Pi\operatorname{LSSO}(X,m).
 \end{equation}
 
-\section{Certificate Diagnostic Protocol}
+\section{ImageNet Training Details}
+\label{app:imagenet-protocol}
+
+The three runs were recorded with source revision
+\texttt{bec1f18750ca4ad364b9d2a5b2ac63359b5cf6c9}, PyTorch 2.11.0+cu128,
+CUDA 12.8, and timm 1.0.28 on one NVIDIA H100 80GB HBM3.
+Training follows the DeiT III protocol and uses the
+\texttt{timm/imagenet-1k-wds} ImageNet-1K release with 1,281,167 training
+images and all 50,000 validation images.  Repeated augmentation and batching
+produce 1,280,000 training presentations per initial-training epoch; fine-tuning
+uses 1,281,024.  No external pretraining data or distillation teacher is used.
+
+All models have 12 blocks, patch size 16, MLP ratio four, LayerScale
+initialization $10^{-4}$, and normalization epsilon $10^{-6}$.  Small uses
+$(D,H,r)=(384,6,32)$ and constant stochastic depth $0.05$; Base uses
+$(768,12,48)$ and stochastic depth $0.2$.  The class token has no learned
+position embedding, while the patch tokens do.  Increasing Base resolution
+from 192 to 224 changes the recorded parameter count from 78,460,792 to
+78,500,728 through the patch-position table; Small has 19,619,632 parameters.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{Recorded ImageNet optimization settings.  Fine-tuning initializes
+from the best Base initial-training checkpoint.}
+\label{tab:imagenet-settings}
+\begin{tabular}{lccc}
+\toprule
+Setting & Small initial & Base initial & Base fine-tuning \\
+\midrule
+Resolution & 224 & 192 & 224 \\
+Epochs & 800 & 800 & 20 \\
+Optimizer & Fused LAMB & Fused LAMB & AdamW \\
+Learning rate & $0.004$ & $0.003$ & $10^{-5}$ \\
+Minimum learning rate & $10^{-5}$ & $10^{-5}$ & $10^{-5}$ \\
+Weight decay & $0.05$ & $0.05$ & $0.1$ \\
+Effective batch & 2048 & 2048 & 512 \\
+Physical batch / accumulation & $1024/2$ & $512/4$ & $512/1$ \\
+Augmentation & 3-Augment & 3-Augment & RandAugment \\
+Repeated augmentation & Yes & Yes & No \\
+Loss & BCE & BCE & Smoothed CE \\
+Label smoothing & 0 & 0 & 0.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Each run uses seed 0, FP16 AMP, five warmup epochs from learning rate
+$10^{-6}$, Mixup $\alpha=0.8$, and CutMix $\alpha=1.0$.  Initial training uses
+a cosine schedule and color jitter 0.3; fine-tuning uses
+\texttt{rand-m9-mstd0.5-inc1}.  EMA is maintained with decay 0.99996.
+The historical training loop calls validation on the ordinary model, not the
+EMA copy, and selects the best checkpoint by validation Top-1.  Evaluation
+uses a crop ratio of 1.0.  Top-5 accuracy is reported at the checkpoint selected by Top-1 accuracy.
+
+\begin{table}[H]
+\centering
+\small
+\caption{ImageNet validation results at the selected checkpoints.  Epoch indices are one-based
+within each phase.  The Base fine-tuning phase follows 800 initial epochs;
+these are stages of one training run, not independent seeds.}
+\label{tab:imagenet-recorded-results}
+\begin{tabular}{lrrrr}
+\toprule
+Run & Resolution & Best epoch & Top-1 (\%) & Top-5 (\%) \\
+\midrule
+Small initial & 224 & 759 & 79.434 & 94.290 \\
+Base initial & 192 & 760 & 81.646 & 95.122 \\
+Base fine-tuning & 224 & 15 & 82.240 & 95.944 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Reference results.}
+Table~\ref{tab:imagenet-comparison} uses the non-distilled DeiT models and
+the ImageNet-1K-only DeiT III and ConvNeXt releases.  Hydra's $81.6\%$ is
+the EMA result in its Table~5; the non-EMA result is $81.0\%$.  Other baselines
+retain their source papers' evaluation settings.  Vim's long-sequence variants
+keep $224\times224$ images and $16\times16$ patches but reduce the extraction
+stride from 16 to 8 for 30 additional fine-tuning epochs.  Thus their token
+count and computation differ from the standard variants even at the same
+image resolution.
+
+\section{Operator Diagnostic Protocol}
 \label{app:certificate-protocol}
 
 We use the validation-selected seed-$0$, seed-$1$, and seed-$2$ LRA Text
@@ -1178,8 +1340,8 @@ $\mu\norm{U^\star}_F/\norm{Z}_F\leq1$ and
 $\mu\norm{A_K^{-\T}G}_F/\norm{G}_F\leq1$ are required for every observation.
 
 We treat $8$K as an operator-level stress test.  The learned absolute position
-table is repeated modulo its $4096$-position training range, while Rank-Rotary
-receives centered positions over the full probe.  This protocol tests the
+table is repeated modulo its $4096$-position training range. The archived
+relation-feature preprocessing uses positions over the full probe.  This protocol tests the
 mixer beyond its training length without introducing a new learned-position
 extrapolation rule.
 
@@ -1253,157 +1415,67 @@ Pathfinder-32           & 1024 & $256/6/4$ & $0.1510$ & $3.2212$  & $4.7$ \\
 \section{CUDA Implementation Details}
 \label{app:cuda}
 
-\subsection{Execution contract}
+\subsection{Current implementation contract}
 
-The native backend implements \textsc{Dynamic} with Rank-Rotary for inference
-and first-order training and is algebraically equivalent to
-Section~\ref{sec:method}.  It accepts FP16 or FP32 activations with FP32 learned
-parameters.  The \textsc{Static}, \textsc{Zero}, and Rank-Rotary-off ablations
-remain reference-only.
+The current backend uses native ABI 9 and model checkpoint contract 13.
+It implements \textsc{Dynamic}, \textsc{Static}, and \textsc{Zero} with the
+same masking and compact-state definition as Section~\ref{sec:method}.
+All three modes support inference and analytic first-order training.
+The no-skew and no-complement variants require the reference backend;
+unsupported requests fail explicitly rather than selecting another backend.
 
-The joint input projection in Equation~\eqref{eq:input-projection} produces
-contiguous FP32 relation and content coordinates with TF32 enabled on
-supporting hardware.  The separate output projection uses FP16 Tensor-Core
-operands with FP32 accumulation before casting back to the activation dtype.
+The native path accepts FP16 or BF16 activations with FP32 parameters, ranks
+$r\in\{16,32,48,64\}$, and positive head widths within allocation and launch
+limits. Boolean validity masks have shape $[B,N]$. Invalid rows are zeroed
+before compact statistics and again after output projection. Each sample uses
+$\sqrt{\max(n_{\mathrm{valid}},1)}$ for normalization, including gapped masks
+and entirely masked samples. The mixer has no position-coordinate input.
+External position embeddings are applied by the encoder.
 
-The schedule supports
+\subsection{Base and correction evaluation}
+
+The reference evaluates the token output as
 \begin{equation}
-    r\in\{16,32,48,64\}
+    Y=\eta(C-PZ)+P\Delta,\qquad
+    \Delta=(\I_r+K)^{-1}(\I_r-K)Z.
 \end{equation}
-and any positive head width $d$ within allocation and launch limits, including
-$r>d$.  Runtime right-hand-side panels have width 32 with zero-filled tails.
+The identity $(\I_r+K)^{-1}(\I_r-K)=2(\I_r+K)^{-1}-\I_r$
+establishes equality with the equilibrium readout. For \textsc{Static}, the
+reference computes this correction map once per head and applies it across
+the batch. \textsc{Zero} sets $\Delta=0$ and owns no compact-core parameters.
 
-Boolean validity masks have shape $[B,N]$, and position identifiers have shape
-$[N]$ or $[B,N]$.  Invalid projected rows are zeroed before every compact
-statistic, all sample-dependent normalizations use
-$\sqrt{n_{\mathrm{valid}}}$, and invalid output rows are zeroed again.  This
-covers gapped padding and entirely masked samples in one generic schedule.
-Position identifiers and valid-token counts are metadata rather than
-differentiable inputs.
+The native implementation retains the equivalent fused readout
+$Y=\eta C+P[2U-(1+\eta)Z]$. It constructs the soft frame using a tiled
+Gram--Cholesky schedule algebraically equivalent to the positive-diagonal QR
+form, then computes $Z=P^\T C$. \textsc{Dynamic} constructs and factors an
+input-conditioned system per sample and head. \textsc{Static} factors one
+system per head and shares its LU factors across samples; each sample still
+has its own compact right-hand side. \textsc{Zero} skips core construction
+and LU solves, using $U=Z/2$ in the shared readout. No factors are cached
+across forward calls.
 
-\subsection{Lowering to tiled kernels}
+\subsection{Backward and numerical boundaries}
 
-The forward pass begins with a rank-phase schedule that constructs the
-Rank-Rotary sine and cosine table.  Consecutive default positions are cached by
-device, rank, and sequence length; explicit positions use an invocation-local
-table.  One relation-input kernel combines phase rotation,
-$1/\sqrt{n_{\mathrm{valid}}}$ normalization, detached common scaling, and
-storage of the scaled relation coordinates.
+The analytic backward reuses saved factors for transposed solves and
+propagates gradients through the compact state, generator and soft frame.
+Shared \textsc{Static} parameters accumulate contributions from all samples.
+The token-level frame and relation derivatives are fused to avoid storing a
+separate token-sized frame adjoint. The implementation supports first-order
+gradients; it does not differentiate through unrolled optimization steps.
 
-The soft frame uses the Gram--Cholesky form algebraically equivalent to the
-positive-diagonal reduced QR in Equation~\eqref{eq:soft-frame}.  Short
-sequences use a single-block FP32 Gram reduction.  At 32 or more 32-token
-tiles, independent partial Grams are reduced in ascending token order before
-the same Cholesky factorization.  Tiled triangular solves then materialize the
-frame.  The cross-moment $Z=P^\T C$ is produced in independent token and
-right-hand-side tiles using FP16 Tensor-Core multiplicands and FP32
-accumulation; no more than 64 token partials are live at once.
+Ordinary projection and eligible compact products use BF16 operands with
+FP32 accumulation. Packed native activations and their gradients are BF16.
+Frame storage, factorization, the accretive factor Gram, solve state and
+parameter gradients remain FP32. The reference retains FP64 evaluation for
+output and gradient oracles. All three core modes are checked against this
+reference, including nonzero core parameters, gapped padding and fully
+masked samples. Kernel and integration tests define the numerical acceptance
+criteria; implementation checks do not establish new task accuracy.
 
-A compact-core kernel evaluates
-\begin{equation}
-    \Theta=\Theta_0+\frac{ZW_{\mathrm{drive}}}
-                            {\sqrt{n_{\mathrm{valid}}}},
-\end{equation}
-constructs $L$ and $\Omega$, forms $LL^\T$ using IEEE FP32 FMA, assembles
-$\I+K$, and performs partial-pivot LU factorization.  Separate 32-column FP32
-solve panels compute $U^\star=(\I+K)^{-1}Z$.  The final tiled kernel directly
-evaluates
-\begin{equation}
-    Y=\eta C+P[2U^\star-(1+\eta)Z].
-\end{equation}
-Thus neither the Cayley matrix $M$ nor a token-space transition matrix is
-stored.
-
-\subsection{Analytic backward and activation storage}
-
-Training records a private contiguous FP32 tape per sample and head together
-with one-based INT32 LU pivots.  The backward reuses the saved LU factors to
-apply the transposed equilibrium solve, then evaluates analytic VJPs for the
-dynamic core, accretive parameterization, compact cross-moment, soft frame, and
-Rank-Rotary transform.  It does not differentiate through an unrolled solver.
-The token-level frame and relation derivatives are fused, so the
-single-consumer frame adjoint remains on chip rather than making a global
-$[BH,N,r]$ round trip.  The complement reduction reconstructs its
-frame--content term in FP32 within an existing compact kernel.  Buffers are
-reused after their last consumer: the compact-core matrix adjoint becomes the
-frame adjoint, and compact-state partial storage is overwritten after its
-reduction.
-
-Let $S=BH$, $T_{32}=\lceil N/32\rceil$,
-$T_{64}=\lceil N/64\rceil$, $Q=\lceil d/32\rceil$, and
-$C_T=\min(T_{32},64)$.  Excluding packed input, output, returned gradients,
-Rank-Rotary phase tables, and allocator bookkeeping, the saved training tape
-contains
-\begin{equation}
-    W_{\mathrm{train}}
-    =S(2Nr+3r^2+2rd+1)
-\label{eq:cuda-training-tape}
-\end{equation}
-FP32 values and $Sr$ INT32 pivots.  The compact inference workspace contains
-\begin{equation}
-    W_{\mathrm{infer}}
-    =S(Nr+2r^2+2rd+1)
-\label{eq:cuda-inference-workspace}
-\end{equation}
-FP32 values, plus $Sr$ transient INT32 pivots.
-Rank-Rotary phase storage is additional: a shared table contains $Nr$ FP32
-values, while per-sample positions require $BNr$.  Default consecutive-position
-tables live in a bounded persistent cache; explicit position tables are
-invocation-local.
-
-The long-sequence Gram schedule has the logical live storage
-\begin{equation}
-    W_{\mathrm{Gram}}
-    =S T_{32}\frac{r(r+1)}{2}
-\label{eq:cuda-gram-workspace}
-\end{equation}
-in FP32.  Tape-producing calls with $r\in\{16,32,48\}$ place these partials in
-the not-yet-materialized frame region; inference and $r=64$ training allocate
-them separately.  The cross-moment producer uses
-\begin{equation}
-    W_{\mathrm{cross}}=S Q C_T r\,32
-\label{eq:cuda-cross-workspace}
-\end{equation}
-FP32 values, and its lifetime does not overlap the Gram temporary.  Native
-backward scratch contains
-\begin{equation}
-    W_{\mathrm{backward}}
-    =S(T_{64}rd+T_{64}+3rd+2r^2)
-\label{eq:cuda-backward-workspace}
-\end{equation}
-FP32 values.  These formulas describe the principal tape/workspace and the
-explicitly listed scratch tensors owned by the native mixer; full-module peak
-memory additionally includes phase storage, feature projections, external
-autograd state, returned gradients, and allocator caching.
-
-\subsection{Numerical and build coverage}
-
-The contract-6 backend used for the reported experiments follows a fixed mixed TF32/FP16-Tensor-Core/FP32 contract. The current source uses contract 8 (BF16 ordinary multiplicands, FP16 phase storage, and FP32 sensitive arithmetic); the reported experiments have not been rerun under that contract.  The
-joint input projection uses TF32 where supported.  Selected compact
-contractions and the readout use FP16 multiplicands with FP32 accumulation.
-Rank-Rotary phases, the soft-frame Gram and Cholesky factorization, the
-one-ULP-interiorized complement, $LL^\T$, LU factorization, and triangular
-solves remain FP32.  This fixed precision partition applies to every supported
-configuration.
-
-FP64 evaluation of the sole reference operator is the numerical oracle.  The
-CUDA acceptance envelope requires finite outputs and gradients, forward
-relative $\ell_2$ error at most $5\times10^{-3}$, and input- and
-parameter-gradient relative $\ell_2$ error at most $10^{-2}$.  The oracle suite
-covers all four ranks,
-non-tile-aligned head widths, lengths through 4776, the
-$N=4096,D=256,H=8,r=32$ long-sequence setting, parallel Gram reduction,
-batch-specific positions, gapped masks, entirely masked samples, and agreement
-between inference and tape-producing forward entry points.  Acceptance is
-defined by these mixed-precision error envelopes.
-
-CUDA 12.8 with cuBLASDx and cuSolverDx from MathDx 25.12.1 builds separate
-artifacts for
-\begin{equation}
-    \mathrm{SM}\in\{75,80,86,87,89,90,100,120\}.
-\end{equation}
-Each binary records its compiled SM and numerical contract.  Physical latency
-and numerical measurements use the RTX 5070 Ti specified below.
+The current source targets PyTorch 2.14.0+cu132, CUDA 13.2 and MathDx 26.06.1.
+The updated build and oracle tests have been validated on SM80. The timing
+table below uses the earlier software and operator revision stated in its
+protocol; it is not a measurement of this updated backend.
 
 \subsection{Wall-clock protocol}
 
@@ -1412,7 +1484,8 @@ RTX 5070 Ti (16 GB, SM120), driver 610.88, PyTorch 2.11.0+cu128, CUDA 12.8, and
 native contract version 6.  Training measurements use training mode, while
 inference measurements use evaluation mode.  Each process pregenerates a
 contiguous input tensor and enables TF32.  LSSO uses the default \textsc{Dynamic} core
-with Rank-Rotary, consecutive positions, and no padding mask.
+with its archived relation-feature preprocessing, consecutive positions, and
+no padding mask.
 The comparison is PyTorch \texttt{nn.MultiheadAttention} with bias, zero
 dropout, batch-first layout, and \texttt{need\_weights=False}, using PyTorch's
 Flash SDPA forward and backward kernels.
@@ -1439,7 +1512,10 @@ Scientific Agent Skills \cite{kassis2026skills}; the drawing code and operator
 content were written for this manuscript.  The tensor-flow diagrams in
 ViT$^3$ \cite{han2026vit3} and the semantic color grouping in LION
 \cite{afzal2025lion} informed the visual organization; no source artwork was
-reused.  The existing certificate plot
+reused.  The revised overview also draws on the state/update/readout
+organization of TTT \cite{sun2025ttt} and the separation of parameter-generation
+and state-computation paths in Mamba \cite{gu2024mamba}.  All elements of the
+revised overview were drawn as vector primitives for LSSO.  The existing certificate plot
 reports the diagnostic protocol in Appendix~\ref{app:certificate-protocol}.
 
 \begingroup

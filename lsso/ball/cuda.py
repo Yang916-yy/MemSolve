@@ -10,7 +10,7 @@ import torch
 
 _LOAD_LOCK = Lock()
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
-_NATIVE_CONTRACT_VERSION = 8
+_NATIVE_CONTRACT_VERSION = 9
 _RUNTIME_PACKAGE = "lsso_cuda_runtime"
 _LOADED_ARCHITECTURE: int | None = None
 
@@ -55,7 +55,7 @@ def _check_native_contract() -> None:
 
 
 def is_available() -> bool:
-    """Return whether the strict DYNAMIC + Rank-Rotary operator is registered."""
+    """Return whether the native Dynamic/Static/Zero operator is registered."""
 
     return (
         _native_operator_abi_is_registered()
@@ -225,7 +225,6 @@ class _FastMix(torch.autograd.Function):
         core_base_raw: torch.Tensor,
         core_drive_weight: torch.Tensor,
         eta_raw: torch.Tensor,
-        centered_positions: torch.Tensor | None,
         valid_counts: torch.Tensor | None,
     ) -> torch.Tensor:
         output, tape, pivots = torch.ops.lsso_equilibrium.forward_train(
@@ -233,7 +232,6 @@ class _FastMix(torch.autograd.Function):
             core_base_raw,
             core_drive_weight,
             eta_raw,
-            centered_positions,
             valid_counts,
         )
         saved = [
@@ -244,12 +242,9 @@ class _FastMix(torch.autograd.Function):
             tape,
             pivots,
         ]
-        if centered_positions is not None:
-            saved.append(centered_positions)
         if valid_counts is not None:
             saved.append(valid_counts)
         ctx.save_for_backward(*saved)
-        ctx.has_positions = centered_positions is not None
         ctx.has_valid_counts = valid_counts is not None
         return output
 
@@ -262,8 +257,6 @@ class _FastMix(torch.autograd.Function):
         saved = ctx.saved_tensors
         projected, core_base_raw, core_drive_weight, eta_raw, tape, pivots = saved[:6]
         index = 6
-        centered_positions = saved[index] if ctx.has_positions else None
-        index += int(ctx.has_positions)
         valid_counts = saved[index] if ctx.has_valid_counts else None
 
         gradients = torch.ops.lsso_equilibrium.backward(
@@ -274,10 +267,9 @@ class _FastMix(torch.autograd.Function):
             eta_raw,
             tape,
             pivots,
-            centered_positions,
             valid_counts,
         )
-        return (*gradients, None, None)
+        return (*gradients, None)
 
 
 def fast_mix(
@@ -285,16 +277,10 @@ def fast_mix(
     core_base_raw: torch.Tensor,
     core_drive_weight: torch.Tensor,
     eta_raw: torch.Tensor,
-    centered_positions: torch.Tensor | None = None,
     valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the strict native mixer with first-order autograd support."""
 
-    if centered_positions is not None and centered_positions.requires_grad:
-        raise ValueError(
-            "the LSSO CUDA fast path does not support gradients for "
-            "centered_positions"
-        )
     if valid_counts is not None and valid_counts.requires_grad:
         raise ValueError(
             "the LSSO CUDA fast path does not support gradients for valid_counts"
@@ -310,7 +296,6 @@ def fast_mix(
             core_base_raw,
             core_drive_weight,
             eta_raw,
-            centered_positions,
             valid_counts,
         )
     return _FastMix.apply(
@@ -318,7 +303,6 @@ def fast_mix(
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts,
     )
 

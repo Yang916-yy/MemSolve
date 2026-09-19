@@ -1,5 +1,10 @@
 # ImageNet DeiT III
 
+> Current source uses model contract 13 and native ABI 9. External position
+> embeddings belong to the surrounding model. Historical measurements retain
+> their recorded source versions and are not new-source results.
+
+
 `experiments/train_imagenet.py` launches the shared `experiments/imagenet.py`
 workflow, which implements the ImageNet-1K recipes from the
 [official DeiT III repository at commit 7e160fe43f0252d17191b71cbb5826254114ea5b](https://github.com/facebookresearch/deit/blob/7e160fe43f0252d17191b71cbb5826254114ea5b/README_revenge.md).
@@ -155,7 +160,7 @@ The shared backbone boundary is intentionally narrow:
 ```python
 integrations.timm.create_lsso_deit3(
     image_size, patch_size, num_classes, embed_dim, depth, num_heads, rank,
-    mlp_ratio, core_mode, rank_rotary, bias, implementation, drop_path_rate,
+    mlp_ratio, core_mode, bias, implementation, drop_path_rate,
     layer_scale_init_value, norm_eps, no_embed_class=True,
 )
 ```
@@ -185,7 +190,7 @@ The current operator supports both FP16 and BF16 inputs, but this ImageNet
 runner's canonical recipe still requires `train.amp_dtype = 'float16'`.
 Operator capability is not a change to the published training recipe.
 The notebook's pinned released runtime must be used with matching released
-source; it must not be combined with current ABI-8 source. For current source,
+source; it must not be combined with current ABI-9 source. For current source,
 follow [the source build instructions](../README.md).
 
 Dense-task initialization uses `--backbone-checkpoint`, not an ImageNet

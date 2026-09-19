@@ -17,11 +17,10 @@ from lsso.ball.reference import (
 pytestmark = pytest.mark.core
 
 
-def _reference_output_without_positions(layer: LSSO, x: torch.Tensor) -> torch.Tensor:
-    """Evaluate the public unmasked, Rank-Rotary-off contract via reference.py."""
+def _reference_unmasked_output(layer: LSSO, x: torch.Tensor) -> torch.Tensor:
+    """Evaluate the public unmasked contract via reference.py."""
 
     config = layer.config
-    assert not config.rank_rotary
     batch, length, _dim = x.shape
     projected = layer.w_bc(x)
     relation, content = projected.split(
@@ -86,10 +85,8 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 @pytest.mark.parametrize("core_mode", list(CoreMode))
-@pytest.mark.parametrize("rank_rotary", [False, True])
 def test_forward_backward(
     core_mode: CoreMode,
-    rank_rotary: bool,
 ) -> None:
     torch.manual_seed(10)
     layer = LSSO(
@@ -98,7 +95,7 @@ def test_forward_backward(
             num_heads=3,
             rank=6,
             core_mode=core_mode,
-            rank_rotary=rank_rotary,
+
             bias=True,
         )
     ).double()
@@ -117,7 +114,6 @@ def test_forward_backward(
 def test_default_is_the_complete_dynamic_variant() -> None:
     config = LSSOConfig(dim=24, num_heads=3, rank=6)
     assert config.core_mode is CoreMode.DYNAMIC
-    assert config.rank_rotary
 
 
 def test_model_diagnostics_follow_masked_reference_problem() -> None:
@@ -199,7 +195,7 @@ def test_public_forward_matches_direct_equilibrium_reference(
             num_heads=2,
             rank=4,
             core_mode=core_mode,
-            rank_rotary=False,
+
             bias=True,
         )
     ).double()
@@ -217,17 +213,17 @@ def test_public_forward_matches_direct_equilibrium_reference(
             layer.core_drive_weight.normal_(std=0.15)
 
     x = torch.randn(3, 7, 16, dtype=torch.float64)
-    expected = _reference_output_without_positions(layer, x)
+    expected = _reference_unmasked_output(layer, x)
     torch.testing.assert_close(layer(x), expected, rtol=2e-11, atol=2e-11)
 
 
 def test_dynamic_public_output_uses_content_conditioning() -> None:
     torch.manual_seed(12)
     dynamic = LSSO(
-        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.DYNAMIC, rank_rotary=False)
+        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.DYNAMIC, )
     ).double()
     static = LSSO(
-        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.STATIC, rank_rotary=False)
+        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.STATIC, )
     ).double()
     with torch.no_grad():
         dynamic.w_bc.weight.normal_(std=0.2)
@@ -251,7 +247,7 @@ def test_dynamic_public_output_uses_content_conditioning() -> None:
 def test_dynamic_cross_moment_is_replication_invariant() -> None:
     torch.manual_seed(13)
     layer = LSSO(
-        LSSOConfig(16, 2, rank=4, rank_rotary=False)
+        LSSOConfig(16, 2, rank=4)
     ).double().eval()
     with torch.no_grad():
         assert layer.core_drive_weight is not None
@@ -287,7 +283,7 @@ def test_dynamic_zero_init_receives_gradient() -> None:
 def test_static_core_is_batch_independent() -> None:
     torch.manual_seed(15)
     layer = LSSO(
-        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.STATIC, rank_rotary=False)
+        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.STATIC, )
     ).double().eval()
     with torch.no_grad():
         assert layer.core_base_raw is not None
@@ -303,7 +299,7 @@ def test_static_core_is_batch_independent() -> None:
 def test_zero_core_stays_exact_without_core_parameters() -> None:
     torch.manual_seed(16)
     layer = LSSO(
-        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.ZERO, rank_rotary=False)
+        LSSOConfig(16, 2, rank=4, core_mode=CoreMode.ZERO, )
     ).double()
     optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
     x = torch.randn(2, 7, 16, dtype=torch.float64)
@@ -311,7 +307,7 @@ def test_zero_core_stays_exact_without_core_parameters() -> None:
     layer(x).square().mean().backward()
     optimizer.step()
 
-    expected = _reference_output_without_positions(layer, x)
+    expected = _reference_unmasked_output(layer, x)
     torch.testing.assert_close(layer(x), expected, rtol=2e-11, atol=2e-11)
     names = set(dict(layer.named_parameters()))
     assert "core_base_raw" not in names
@@ -341,7 +337,7 @@ def test_forward_uses_the_complement_method() -> None:
             return super().complement()
 
     layer = ComplementSpy(
-        LSSOConfig(8, 2, rank=4, rank_rotary=False)
+        LSSOConfig(8, 2, rank=4)
     )
     layer(torch.randn(1, 3, 8))
     assert layer.complement_calls == 1
@@ -357,8 +353,6 @@ def test_removed_configuration_knobs_are_not_accepted() -> None:
 
 
 def test_configuration_requires_boolean_switches() -> None:
-    with pytest.raises(TypeError, match="rank_rotary"):
-        LSSOConfig(8, 2, rank=4, rank_rotary="false")
     with pytest.raises(TypeError, match="bias"):
         LSSOConfig(8, 2, rank=4, bias=1)
 
@@ -390,13 +384,12 @@ def test_gapped_nan_padding_matches_cropped_sequence() -> None:
     reference = copy.deepcopy(layer)
     clean = torch.randn(1, 8, 16, dtype=torch.float64)
     mask = torch.tensor([[True, False, True, False, False, True, False, False]])
-    positions = (3 * torch.arange(8) + 11).view(1, 8)
     poisoned = torch.where(
         mask[:, :, None], clean, torch.full_like(clean, float("nan"))
     )
-    output = layer(poisoned, valid_mask=mask, position_ids=positions)
+    output = layer(poisoned, valid_mask=mask, )
     kept = mask[0].nonzero(as_tuple=False).flatten()
-    expected = reference(clean[:, kept], position_ids=positions[:, kept])
+    expected = reference(clean[:, kept], )
     torch.testing.assert_close(output[:, kept], expected, rtol=2e-11, atol=2e-11)
     assert torch.count_nonzero(output[:, ~mask[0]]) == 0
 
@@ -415,40 +408,9 @@ def test_mask_dtype_is_strict() -> None:
         layer(x, valid_mask=torch.tensor([[1, 0, 1]]))
 
 
-def test_centered_rank_rotary_is_shift_invariant() -> None:
-    torch.manual_seed(18)
-    layer = LSSO(LSSOConfig(dim=16, num_heads=2, rank=6)).double()
-    x = torch.randn(2, 9, 16, dtype=torch.float64)
-    positions = torch.arange(9).view(1, 9).expand(2, 9)
-    expected = layer(x, position_ids=positions)
-    shifted = layer(x, position_ids=positions + 100_000_000)
-    torch.testing.assert_close(shifted, expected, rtol=2e-11, atol=2e-11)
-
-
-def test_float64_positions_center_before_calculation_dtype_conversion() -> None:
-    torch.manual_seed(181)
-    layer = LSSO(LSSOConfig(dim=16, num_heads=2, rank=6)).eval()
-    x = torch.randn(2, 9, 16)
-    positions = torch.arange(9, dtype=torch.float64)
-    expected = layer(x, position_ids=positions)
-    shifted = layer(x, position_ids=positions + 1e12)
-    torch.testing.assert_close(shifted, expected, rtol=1e-5, atol=1e-6)
-
-
-def test_positions_are_ignored_without_rank_rotary() -> None:
-    torch.manual_seed(19)
-    layer = LSSO(
-        LSSOConfig(16, 2, rank=5, rank_rotary=False)
-    ).double()
-    x = torch.randn(2, 9, 16, dtype=torch.float64)
-    expected = layer(x, position_ids=torch.arange(9))
-    shifted = layer(x, position_ids=torch.arange(9) + 123456)
-    torch.testing.assert_close(shifted, expected)
-
-
 def test_checkpoint_contract_rejects_semantic_mismatch() -> None:
-    source = LSSO(LSSOConfig(16, 2, rank=4, rank_rotary=True))
-    target = LSSO(LSSOConfig(16, 2, rank=4, rank_rotary=False))
+    source = LSSO(LSSOConfig(16, 2, rank=4))
+    target = LSSO(LSSOConfig(16, 2, rank=4, skew_coupling=False))
     with pytest.raises(RuntimeError, match="checkpoint contract"):
         target.load_state_dict(source.state_dict(), strict=True)
 
@@ -482,8 +444,8 @@ def test_checkpoint_contract_cannot_be_bypassed_in_a_parent_load() -> None:
 
 
 def test_checkpoint_contract_mismatch_cannot_be_bypassed_non_strictly() -> None:
-    source = LSSO(LSSOConfig(16, 2, rank=4, rank_rotary=True))
-    target = LSSO(LSSOConfig(16, 2, rank=4, rank_rotary=False))
+    source = LSSO(LSSOConfig(16, 2, rank=4))
+    target = LSSO(LSSOConfig(16, 2, rank=4, skew_coupling=False))
     with pytest.raises(RuntimeError, match="checkpoint contract"):
         target.load_state_dict(source.state_dict(), strict=False)
 
@@ -493,7 +455,7 @@ def test_checkpoint_contract_rejects_previous_numerics() -> None:
     legacy_state = copy.deepcopy(source.state_dict())
     extra_state = legacy_state["_extra_state"]
     assert isinstance(extra_state, dict)
-    assert extra_state["version"] == 12
+    assert extra_state["version"] == 13
     assert extra_state["numerics"] == "tf32-wbc-ieee-fgram-tc16-v6"
     extra_state["numerics"] = "tf32-fp32-wbc-tc16-v4"
 
@@ -512,7 +474,7 @@ def test_checkpoint_contract_round_trips() -> None:
     torch.testing.assert_close(target(x), source(x))
 
 
-def test_empty_sequence_is_rejected_before_position_or_mask_reduction() -> None:
+def test_empty_sequence_is_rejected_before_mask_reduction() -> None:
     layer = LSSO(LSSOConfig(8, 2, rank=4))
     x = torch.empty(2, 0, 8)
     with pytest.raises(ValueError, match="sequence length"):
@@ -532,16 +494,6 @@ def test_empty_batch_is_rejected_before_backend_dispatch(
         layer(x, implementation=implementation)
 
 
-def test_integer_positions_subtract_before_float32_conversion() -> None:
-    torch.manual_seed(21)
-    layer = LSSO(LSSOConfig(dim=16, num_heads=2, rank=6)).eval()
-    x = torch.randn(2, 9, 16)
-    positions = torch.arange(9, dtype=torch.int64)
-    expected = layer(x, position_ids=positions)
-    shifted = layer(x, position_ids=positions + 2**40)
-    torch.testing.assert_close(shifted, expected, rtol=1e-5, atol=1e-6)
-
-
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("core_mode", list(CoreMode))
@@ -555,7 +507,7 @@ def test_mixed_precision_reference_matches_fp64_oracle_for_outputs_and_gradients
             num_heads=2,
             rank=8,
             core_mode=core_mode,
-            rank_rotary=True,
+
             bias=True,
         )
     ).cuda()
@@ -575,11 +527,10 @@ def test_mixed_precision_reference_matches_fp64_oracle_for_outputs_and_gradients
     oracle = copy.deepcopy(layer).double()
     x = (0.4 * torch.randn(2, 17, 32, device="cuda")).requires_grad_()
     oracle_x = x.detach().double().requires_grad_()
-    positions = 3 * torch.arange(17, device="cuda", dtype=torch.int64) + 100_003
     upstream = torch.randn_like(x)
 
-    output = layer(x, position_ids=positions)
-    oracle_output = oracle(oracle_x, position_ids=positions)
+    output = layer(x, )
+    oracle_output = oracle(oracle_x, )
     actual_parameters = dict(layer.named_parameters())
     oracle_parameters = dict(oracle.named_parameters())
     assert actual_parameters.keys() == oracle_parameters.keys()
@@ -627,7 +578,6 @@ def test_reference_accepts_bfloat16_input() -> None:
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
-
 @pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.float8_e5m2))
 def test_reference_rejects_float8_input(dtype: torch.dtype) -> None:
     layer = LSSO(LSSOConfig(dim=32, num_heads=2, rank=8)).eval()
@@ -637,10 +587,54 @@ def test_reference_rejects_float8_input(dtype: torch.dtype) -> None:
         layer(x, implementation="reference")
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_low_precision_position_ids_are_rejected(dtype: torch.dtype) -> None:
-    layer = LSSO(LSSOConfig(dim=8, num_heads=2, rank=4))
-    x = torch.randn(1, 5, 8)
-    positions = torch.arange(5, dtype=dtype)
-    with pytest.raises(TypeError, match="torch.float32 or torch.float64"):
-        layer(x, position_ids=positions)
+def test_symmetric_core_ablation_matches_triangular_coordinates_and_gradients() -> None:
+    from lsso.ball.reference import accretive_generator
+    raw = torch.randn(2, 4, 4, dtype=torch.float64, requires_grad=True)
+    actual = accretive_generator(raw, skew_coupling=False)
+    expected = accretive_generator(torch.tril(raw))
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, actual.mT)
+    weight = torch.randn_like(actual)
+    actual_grad = torch.autograd.grad((actual * weight).sum(), raw)[0]
+    expected_grad = torch.autograd.grad((expected * weight).sum(), raw)[0]
+    torch.testing.assert_close(actual_grad, expected_grad)
+    assert torch.count_nonzero(torch.triu(actual_grad, diagonal=1)) == 0
+
+
+def test_zero_complement_ablation_is_fixed_and_has_distinct_checkpoint_contract() -> None:
+    model = LSSO(LSSOConfig(8, 2, rank=4, scalar_complement=False)).double()
+    assert not model.eta_raw.requires_grad
+    assert torch.count_nonzero(model.complement()) == 0
+    x = torch.randn(2, 7, 8, dtype=torch.float64, requires_grad=True)
+    output = model(x, implementation="reference")
+    output.square().sum().backward()
+    assert torch.isfinite(x.grad).all()
+    assert model.eta_raw.grad is None
+    default = LSSO(LSSOConfig(8, 2, rank=4)).double()
+    with pytest.raises(RuntimeError, match="contract"):
+        default.load_state_dict(model.state_dict())
+
+
+@pytest.mark.parametrize("option", ["skew_coupling", "scalar_complement"])
+def test_new_ablations_require_boolean_flags_and_explicit_reference(option: str) -> None:
+    with pytest.raises(TypeError, match=option):
+        LSSOConfig(16, 1, rank=16, **{option: "false"})
+    model = LSSO(LSSOConfig(16, 1, rank=16, **{option: False}))
+    with pytest.raises(ValueError, match="requires"):
+        model(torch.randn(1, 3, 16), implementation="cuda")
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+def test_unrotated_operator_is_token_permutation_equivariant(mode: CoreMode) -> None:
+    torch.manual_seed(194)
+    layer = LSSO(LSSOConfig(16, 2, rank=5, core_mode=mode)).double()
+    with torch.no_grad():
+        if layer.core_base_raw is not None:
+            layer.core_base_raw.normal_(0, 0.1)
+        if layer.core_drive_weight is not None:
+            layer.core_drive_weight.normal_(0, 0.1)
+    x = torch.randn(2, 11, 16, dtype=torch.float64)
+    mask = torch.rand(2, 11) > 0.25
+    permutation = torch.randperm(11)
+    expected = layer(x, valid_mask=mask)[:, permutation]
+    actual = layer(x[:, permutation], valid_mask=mask[:, permutation])
+    torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-10)

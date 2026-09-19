@@ -10,7 +10,6 @@ validation_fraction = 0.1
 mixer = "lsso"
 implementation = "cuda"
 core_mode = "dynamic"
-rank_rotary = true
 dim = 128
 depth = 4
 heads = 4

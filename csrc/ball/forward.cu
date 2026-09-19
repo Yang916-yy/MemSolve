@@ -52,8 +52,6 @@ constexpr int kGenericTokenTile = 32;
 // independent groups. Keep token-group parallelism instead of a full-sequence CTA.
 constexpr int kCrossTilesPerBlock = 4;
 constexpr int kCrossTokenChunk = 64;
-constexpr int kDefaultPhaseCacheEntriesPerDevice = 2;
-constexpr size_t kDefaultPhaseCacheBytes = 4 * 1024 * 1024;
 // Below this point, an extra partial-Gram launch and global workspace cost more
 // than keeping the complete reduction in one system block.
 constexpr int kParallelGramMinimumTokenTiles = 32;
@@ -64,113 +62,6 @@ constexpr int generic_frame_materialize_token_tile() {
     // and triangular-solve setup across four adjacent token tiles.
     return 128;
 }
-
-template <int rank>
-__device__ __forceinline__ float generic_inverse_frequency(int pair) {
-    constexpr float kLog2PhaseBase = 13.287712379549449f;
-    return exp2f(
-        -kLog2PhaseBase * static_cast<float>(pair) / static_cast<float>(rank / 2));
-}
-
-template <int rank>
-__global__ __launch_bounds__(kThreads) void rank_rotary_phase_kernel(
-    const float* __restrict__ centered_positions,
-    __half2* __restrict__ phases,
-    int64_t batch_count,
-    int64_t length,
-    bool batch_specific) {
-    const int64_t linear =
-        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t phase_count =
-        (batch_specific ? batch_count : 1) * length * (rank / 2);
-    if (linear >= phase_count) {
-        return;
-    }
-    const int64_t phase_token = linear / (rank / 2);
-    const int64_t batch = batch_specific ? phase_token / length : 0;
-    const int64_t token = batch_specific ? phase_token - batch * length : phase_token;
-    const int pair = static_cast<int>(linear - phase_token * (rank / 2));
-    const float position = centered_positions == nullptr
-        ? static_cast<float>(token) - 0.5f * static_cast<float>(length - 1)
-        : centered_positions[batch * (batch_specific ? length : 0) + token];
-    float sine = 0.0f;
-    float cosine = 0.0f;
-    sincosf(position * generic_inverse_frequency<rank>(pair), &sine, &cosine);
-    phases[linear] = __floats2half2_rn(cosine, sine);
-}
-
-template <int rank>
-at::Tensor launch_rank_rotary_phase_table(
-    const at::Tensor& projected,
-    const c10::optional<at::Tensor>& centered_positions,
-    FastPathShape shape) {
-    const bool batch_specific =
-        centered_positions.has_value() && centered_positions->dim() == 2;
-    c10::cuda::CUDAGuard guard(projected.device());
-    const auto stream = at::cuda::getCurrentCUDAStream(projected.get_device()).stream();
-    if (!centered_positions.has_value() &&
-        shape.length <=
-            static_cast<int64_t>(kDefaultPhaseCacheBytes / (rank * sizeof(at::Half)))) {
-        struct CachedPhaseTable {
-            at::Tensor phases;
-            cudaEvent_t ready;
-            cudaStream_t producer_stream;
-        };
-        static std::mutex mutex;
-        static std::map<std::pair<int, int64_t>, CachedPhaseTable> cache;
-        static std::unordered_map<int, int> entries_per_device;
-
-        const auto key = std::make_pair(projected.get_device(), shape.length);
-        std::lock_guard<std::mutex> lock(mutex);
-        const auto existing = cache.find(key);
-        if (existing != cache.end()) {
-            if (existing->second.producer_stream != stream) {
-                C10_CUDA_CHECK(cudaStreamWaitEvent(stream, existing->second.ready, 0));
-            }
-            return existing->second.phases;
-        }
-        if (entries_per_device[projected.get_device()] <
-            kDefaultPhaseCacheEntriesPerDevice) {
-            auto phases = at::empty(
-                {shape.length, rank / 2, 2},
-                projected.options().dtype(at::kHalf));
-            const int64_t phase_count = shape.length * (rank / 2);
-            const int64_t blocks = (phase_count + kThreads - 1) / kThreads;
-            rank_rotary_phase_kernel<rank><<<blocks, kThreads, 0, stream>>>(
-                nullptr,
-                reinterpret_cast<__half2*>(phases.data_ptr<at::Half>()),
-                shape.batch,
-                shape.length,
-                false);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-            cudaEvent_t ready;
-            C10_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
-            C10_CUDA_CHECK(cudaEventRecord(ready, stream));
-            cache.emplace(key, CachedPhaseTable{phases, ready, stream});
-            ++entries_per_device[projected.get_device()];
-            return phases;
-        }
-    }
-    auto phases = batch_specific
-        ? at::empty(
-              {shape.batch, shape.length, rank / 2, 2},
-              projected.options().dtype(at::kHalf))
-        : at::empty(
-              {shape.length, rank / 2, 2},
-              projected.options().dtype(at::kHalf));
-    const int64_t phase_count =
-        (batch_specific ? shape.batch : 1) * shape.length * (rank / 2);
-    const int64_t blocks = (phase_count + kThreads - 1) / kThreads;
-    rank_rotary_phase_kernel<rank><<<blocks, kThreads, 0, stream>>>(
-        centered_positions.has_value() ? centered_positions->data_ptr<float>() : nullptr,
-        reinterpret_cast<__half2*>(phases.data_ptr<at::Half>()),
-        shape.batch,
-        shape.length,
-        batch_specific);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return phases;
-}
-
 
 template <int rank>
 struct GenericFrameMathDx {
@@ -360,15 +251,13 @@ constexpr size_t generic_output_shared_bytes() {
 template <typename scalar_t, int rank>
 __global__ __launch_bounds__(kThreads) void generic_frame_kernel(
     const scalar_t* __restrict__ projected,
-    const __half2* __restrict__ phases,
     const float* __restrict__ valid_counts,
     float* __restrict__ tape,
     ForwardWorkspaceLayout workspace_layout,
     int64_t batch_count,
     int64_t length,
     int64_t heads,
-    int64_t dim,
-    int64_t phase_batch_stride) {
+    int64_t dim) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     const int64_t system_count = batch_count * heads;
     if (system_index >= system_count) {
@@ -390,16 +279,14 @@ __global__ __launch_bounds__(kThreads) void generic_frame_kernel(
          linear += blockDim.x) {
         const int64_t token = linear / (rank / 2);
         const int pair = static_cast<int>(linear - token * (rank / 2));
-        const float2 relation = generic_rotated_relation_from_phase<scalar_t, rank>(
+        const float2 relation = generic_relation_pair<scalar_t, rank>(
             projected,
-            phases,
             batch,
             head,
             token,
             pair,
             length,
             projected_width,
-            phase_batch_stride,
             inverse_length_sqrt);
         b[token * rank + 2 * pair] = relation.x;
         b[token * rank + 2 * pair + 1] = relation.y;
@@ -926,7 +813,7 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
         gemm_output[linear] = 0.0f;
     }
     __syncthreads();
-    for (int64_t feature_start = 0; feature_start < head_dim;
+    for (int64_t feature_start = 0; core_drive_weight != nullptr && feature_start < head_dim;
          feature_start += kRhsTile) {
         for (int linear = threadIdx.x; linear < rank * kRhsTile;
              linear += blockDim.x) {
@@ -1018,13 +905,24 @@ __global__ __launch_bounds__(kThreads) void generic_core_factor_kernel(
 }
 
 template <int rank>
+__global__ void zero_state_kernel(float* tape, ForwardWorkspaceLayout layout,
+                                  int64_t systems, int64_t head_dim) {
+    const int64_t system = blockIdx.x;
+    if (system >= systems) return;
+    float* entry = tape + system * layout.stride;
+    for (int64_t i = threadIdx.x; i < rank * head_dim; i += blockDim.x)
+        entry[layout.u_offset + i] = 0.5f * entry[layout.z_offset + i];
+}
+
+template <int rank>
 __global__ __launch_bounds__(kRhsTile) void generic_solve_kernel(
     const float* __restrict__ tape,
     const int* __restrict__ pivots,
     ForwardWorkspaceLayout workspace_layout,
     int64_t batch_count,
     int64_t heads,
-    int64_t head_dim) {
+    int64_t head_dim,
+    int core_mode) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     const int64_t rhs_tile = static_cast<int64_t>(blockIdx.y);
     const int64_t system_count = batch_count * heads;
@@ -1034,9 +932,10 @@ __global__ __launch_bounds__(kRhsTile) void generic_solve_kernel(
     const int64_t rhs_start = rhs_tile * kRhsTile;
     const float* system_tape = tape + system_index * workspace_layout.stride;
     const float* compact_state = system_tape + workspace_layout.z_offset;
-    const float* lu = system_tape + workspace_layout.lu_offset;
+    const int64_t core_index = core_mode == 1 ? system_index % heads : system_index;
+    const float* lu = tape + core_index * workspace_layout.stride + workspace_layout.lu_offset;
     float* equilibrium = const_cast<float*>(system_tape) + workspace_layout.u_offset;
-    const int* system_pivots = pivots + system_index * rank;
+    const int* system_pivots = pivots + core_index * rank;
 
     using Getrs = typename GenericCoreSolveMathDx<rank>::Getrs;
 
@@ -1229,7 +1128,6 @@ ForwardResult launch_generic_forward(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts,
     FastPathShape shape) {
     auto output = at::empty({shape.batch, shape.length, shape.dim}, projected.options());
@@ -1254,23 +1152,15 @@ ForwardResult launch_generic_forward(
     configure_forward_kernel_attributes<scalar_t, rank, record_tape>(
         projected.get_device());
     const auto stream = at::cuda::getCurrentCUDAStream(projected.get_device()).stream();
-    auto phases = rank_rotary_phase_table_cuda(
-        projected, centered_positions, shape);
-    const int64_t phase_batch_stride =
-        centered_positions.has_value() && centered_positions->dim() == 2
-        ? shape.length * (rank / 2)
-        : 0;
     generic_frame_kernel<scalar_t, rank><<<system_count, kThreads, 0, stream>>>(
         projected.data_ptr<scalar_t>(),
-        reinterpret_cast<const __half2*>(phases.data_ptr<at::Half>()),
         valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
         workspace.data_ptr<float>(),
         workspace_layout,
         shape.batch,
         shape.length,
         shape.heads,
-        shape.dim,
-        phase_batch_stride);
+        shape.dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const int64_t token_tiles =
@@ -1401,16 +1291,18 @@ ForwardResult launch_generic_forward(
         }
     }
 
+    if (shape.core_mode != 2) {
+    const int64_t core_systems = shape.core_mode == 1 ? shape.heads : system_count;
     constexpr size_t core_factor_shared_bytes = generic_core_factor_shared_bytes<rank>();
     generic_core_factor_kernel<rank, record_tape><<<
-        system_count, kThreads, core_factor_shared_bytes, stream>>>(
+        core_systems, kThreads, core_factor_shared_bytes, stream>>>(
         workspace.data_ptr<float>(),
         core_base_raw.data_ptr<float>(),
-        core_drive_weight.data_ptr<float>(),
+        shape.core_mode == 0 ? core_drive_weight.data_ptr<float>() : nullptr,
         valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
         pivot_workspace.data_ptr<int>(),
         workspace_layout,
-        shape.batch,
+        shape.core_mode == 1 ? 1 : shape.batch,
         shape.heads,
         shape.head_dim,
         1.0f / std::sqrt(static_cast<float>(shape.length)));
@@ -1424,8 +1316,14 @@ ForwardResult launch_generic_forward(
         workspace_layout,
         shape.batch,
         shape.heads,
-        shape.head_dim);
+        shape.head_dim, shape.core_mode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    } else {
+        zero_state_kernel<rank><<<system_count, kThreads, 0, stream>>>(
+            workspace.data_ptr<float>(), workspace_layout, system_count, shape.head_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
     const dim3 output_grid(
         static_cast<unsigned int>(system_count), static_cast<unsigned int>(token_tiles));
@@ -1453,26 +1351,25 @@ ForwardResult dispatch_expanded_forward(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts,
     FastPathShape shape) {
     switch (shape.rank) {
         case 16:
             return launch_generic_forward<scalar_t, 16, record_tape>(
                 projected, core_base_raw, core_drive_weight, eta_raw,
-                centered_positions, valid_counts, shape);
+                valid_counts, shape);
         case 32:
             return launch_generic_forward<scalar_t, 32, record_tape>(
                 projected, core_base_raw, core_drive_weight, eta_raw,
-                centered_positions, valid_counts, shape);
+                valid_counts, shape);
         case 48:
             return launch_generic_forward<scalar_t, 48, record_tape>(
                 projected, core_base_raw, core_drive_weight, eta_raw,
-                centered_positions, valid_counts, shape);
+                valid_counts, shape);
         case 64:
             return launch_generic_forward<scalar_t, 64, record_tape>(
                 projected, core_base_raw, core_drive_weight, eta_raw,
-                centered_positions, valid_counts, shape);
+                valid_counts, shape);
         default:
             TORCH_CHECK(false, "unreachable supported rank");
     }
@@ -1480,41 +1377,17 @@ ForwardResult dispatch_expanded_forward(
 
 }  // namespace
 
-at::Tensor rank_rotary_phase_table_cuda(
-    const at::Tensor& projected,
-    const c10::optional<at::Tensor>& centered_positions,
-    FastPathShape shape) {
-    switch (shape.rank) {
-        case 16:
-            return launch_rank_rotary_phase_table<16>(
-                projected, centered_positions, shape);
-        case 32:
-            return launch_rank_rotary_phase_table<32>(
-                projected, centered_positions, shape);
-        case 48:
-            return launch_rank_rotary_phase_table<48>(
-                projected, centered_positions, shape);
-        case 64:
-            return launch_rank_rotary_phase_table<64>(
-                projected, centered_positions, shape);
-        default:
-            TORCH_CHECK(false, "unreachable supported rank");
-    }
-}
-
 at::Tensor forward_inference_cuda(
     const at::Tensor& projected,
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts) {
     const auto shape = validate_fast_inputs(
         projected,
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts);
     c10::cuda::CUDAGuard guard(projected.device());
     (void)supported_sm();
@@ -1523,7 +1396,6 @@ at::Tensor forward_inference_cuda(
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts,
         shape).output;
 }
@@ -1533,14 +1405,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_cuda(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts) {
     const auto shape = validate_fast_inputs(
         projected,
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts);
     c10::cuda::CUDAGuard guard(projected.device());
     (void)supported_sm();
@@ -1549,7 +1419,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_cuda(
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts,
         shape);
     return {result.output, result.tape, result.pivots};

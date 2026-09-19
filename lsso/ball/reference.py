@@ -9,7 +9,6 @@ import torch.nn.functional as functional
 from torch.autograd.function import once_differentiable
 
 
-_RANK_PHASE_BASE = 10000.0
 _SOFTPLUS_ONE_OFFSET = math.log(math.expm1(1.0))
 
 
@@ -249,7 +248,7 @@ class _TensorCoreLinear(torch.autograd.Function):
 
 @contextmanager
 def _ieee_fp32_matmul(device: torch.device):
-    """Temporarily retain full FP32 products for the accretive factor Gram."""
+    """Temporarily retain full FP32 products for compact-system arithmetic."""
 
     if device.type != "cuda":
         yield
@@ -342,6 +341,80 @@ def _fp32_factor_gram(factor: torch.Tensor) -> torch.Tensor:
         value = factor.to(dtype=torch.float32)
         return torch.matmul(value, value.mT)
     return _FP32FactorGram.apply(factor)
+
+
+class _FP32CompactMatmul(torch.autograd.Function):
+    """Compact correction products and VJPs without BF16 operand rounding."""
+
+    @staticmethod
+    def forward(ctx, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(left, right)
+        with torch.autocast(device_type=left.device.type, enabled=False):
+            with _ieee_fp32_matmul(left.device):
+                return left @ right
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        left, right = ctx.saved_tensors
+        with torch.autocast(device_type=left.device.type, enabled=False):
+            with _ieee_fp32_matmul(left.device):
+                gradient = grad_output.to(dtype=left.dtype)
+                grad_left = (
+                    (gradient @ right.mT).sum_to_size(left.shape)
+                    if ctx.needs_input_grad[0] else None
+                )
+                grad_right = (
+                    (left.mT @ gradient).sum_to_size(right.shape)
+                    if ctx.needs_input_grad[1] else None
+                )
+        return grad_left, grad_right
+
+
+def _compact_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if left.device.type == "cuda" and left.dtype == torch.float32:
+        return _FP32CompactMatmul.apply(left, right)
+    return left @ right
+
+
+class _FP32CoreCorrection(torch.autograd.Function):
+    """Residual-form forward with the simplified resolvent VJP.
+
+    For D = (I+K)^-1 (I-K) Z and V = (I+K)^-T dD,
+    dZ = 2 V - dD and dK = -V (D+Z)^T. This avoids separately
+    differentiating both occurrences of K in the residual-form solve.
+    """
+
+    @staticmethod
+    def forward(ctx, generator: torch.Tensor, state: torch.Tensor | None) -> torch.Tensor:
+        with torch.autocast(device_type=generator.device.type, enabled=False):
+            identity = torch.eye(generator.shape[-1], device=generator.device, dtype=generator.dtype)
+            system = identity + generator
+            if state is None:
+                state = identity
+                rhs = identity - generator
+            else:
+                with _ieee_fp32_matmul(generator.device):
+                    rhs = (identity - generator) @ state
+            lu, pivots, _info = torch.linalg.lu_factor_ex(system, check_errors=True)
+            correction = torch.linalg.lu_solve(lu, pivots, rhs)
+            ctx.save_for_backward(lu, pivots, correction + state)
+        return correction
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        lu, pivots, twice_equilibrium = ctx.saved_tensors
+        with torch.autocast(device_type=lu.device.type, enabled=False):
+            gradient = grad_output.to(dtype=lu.dtype)
+            adjoint = torch.linalg.lu_solve(lu, pivots, gradient, adjoint=True)
+            with _ieee_fp32_matmul(lu.device):
+                grad_generator = (
+                    -(adjoint @ twice_equilibrium.mT)
+                    if ctx.needs_input_grad[0] else None
+                )
+            grad_state = 2.0 * adjoint - gradient if ctx.needs_input_grad[1] else None
+        return grad_generator, grad_state
 
 
 def tensor_core_linear(
@@ -471,7 +544,7 @@ def bounded_complement(raw: torch.Tensor) -> torch.Tensor:
         return interior_scale * torch.where(value >= 0.0, positive, negative)
 
 
-def accretive_generator(raw: torch.Tensor) -> torch.Tensor:
+def accretive_generator(raw: torch.Tensor, *, skew_coupling: bool = True) -> torch.Tensor:
     r"""Build K = L L^T + Omega from compact raw coordinates."""
 
     if raw.ndim < 2:
@@ -492,6 +565,8 @@ def accretive_generator(raw: torch.Tensor) -> torch.Tensor:
         factor = torch.tril(value, diagonal=-1) + torch.diag_embed(
             functional.softplus(diagonal + _SOFTPLUS_ONE_OFFSET)
         )
+        if not skew_coupling:
+            return _fp32_factor_gram(factor)
         upper = torch.triu(value, diagonal=1)
         skew = upper - upper.mT
         return _fp32_factor_gram(factor) + skew
@@ -506,12 +581,16 @@ def accretive_equilibrium_mix(
 ) -> torch.Tensor:
     r"""Apply the zero or accretive-equilibrium compact token mix.
 
-    For a nonzero compact generator K, this evaluates
+    The Zero base and learned correction are
 
-        U* = (I + K)^-1 Z,
-        Y = eta C + P [2 U* - (1 + eta) Z],
+        correction = (I + K)^-1 (I - K) Z,
+        Y = eta (C - P Z) + P correction.
 
-    where Z = P^T C. generator=None is the zero compact-core ablation.
+    This equals the reflected-resolvent readout because
+    (I + K)^-1 (I - K) = 2 (I + K)^-1 - I. The two frame
+    products are fused as P (correction - eta Z). Static K is solved
+    once per head, with gradients retained and no cross-forward cache.
+    Z = P^T C; generator=None means zero correction, equivalent to K=I.
     """
 
     if frame.ndim != 4:
@@ -554,20 +633,36 @@ def accretive_equilibrium_mix(
                     f"static generator must have shape {(heads, rank, rank)}, "
                     f"got {tuple(generator.shape)}"
                 )
-            generator_batch = generator.unsqueeze(0).expand(batch, -1, -1, -1)
         elif generator.ndim == 4:
             if generator.shape != (batch, heads, rank, rank):
                 raise ValueError(
                     f"dynamic generator must have shape {(batch, heads, rank, rank)}, "
                     f"got {tuple(generator.shape)}"
                 )
-            generator_batch = generator
         else:
             raise ValueError("generator must have shape [H, R, R] or [B, H, R, R]")
 
-        identity = torch.eye(rank, dtype=content.dtype, device=content.device)
-        equilibrium = torch.linalg.solve(generator_batch + identity, compact_state)
-        compact = 2.0 * equilibrium - (1.0 + eta_batch) * compact_state
+        # Keep the small-system products in FP32, like the solve itself.
+        # Avoid adding a BF16 operand-rounding boundary to the correction.
+        with torch.autocast(device_type=content.device.type, enabled=False):
+            fp32_cuda = generator.device.type == "cuda" and generator.dtype == torch.float32
+            if not fp32_cuda:
+                identity = torch.eye(rank, dtype=content.dtype, device=content.device)
+                system = identity + generator
+                deviation = identity - generator
+            if generator.ndim == 3:
+                # [H,R,R] solve, rather than B copies of the same system.
+                if fp32_cuda:
+                    correction_map = _FP32CoreCorrection.apply(generator, None)
+                else:
+                    correction_map = torch.linalg.solve(system, deviation)
+                correction = _compact_matmul(correction_map, compact_state)
+            else:
+                if fp32_cuda:
+                    correction = _FP32CoreCorrection.apply(generator, compact_state)
+                else:
+                    correction = torch.linalg.solve(system, deviation @ compact_state)
+            compact = correction - eta_batch * compact_state
 
     return eta_batch * content + tensor_core_matmul(frame, compact)
 
@@ -688,49 +783,12 @@ def compact_equilibrium_diagnostics(
     }
 
 
-def rank_rotary(relation: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """Apply centered rank-space phases with the fixed LSSO frequency basis."""
-
-    if relation.ndim != 4:
-        raise ValueError("relation must have shape [B, H, N, R]")
-    batch, _heads, length, rank = relation.shape
-    if positions.shape != (batch, length):
-        raise ValueError(
-            f"positions must have shape {(batch, length)}, got {tuple(positions.shape)}"
-        )
-    if rank % 2:
-        raise ValueError(f"Rank-Rotary requires an even rank, got rank={rank}")
-
-    half = rank // 2
-    inv_freq = _RANK_PHASE_BASE ** (
-        -torch.arange(half, device=relation.device, dtype=relation.dtype) / half
-    )
-    angles = positions[:, :, None] * inv_freq[None, None, :]
-    cos = angles.cos()
-    sin = angles.sin()
-    if relation.dtype != torch.float64:
-        # Phases are bounded; compute angles/trigonometry in FP32, then store
-        # their FP16 values. Rotation arithmetic itself remains FP32.
-        cos = cos.to(torch.float16).to(relation.dtype)
-        sin = sin.to(torch.float16).to(relation.dtype)
-    cos = cos.view(batch, 1, length, half)
-    sin = sin.view(batch, 1, length, half)
-
-    even = relation[..., 0::2]
-    odd = relation[..., 1::2]
-    output = torch.empty_like(relation)
-    output[..., 0::2] = even * cos - odd * sin
-    output[..., 1::2] = even * sin + odd * cos
-    return output
-
-
 __all__ = [
     "accretive_equilibrium_mix",
     "accretive_generator",
     "bounded_complement",
     "compact_equilibrium_diagnostics",
     "qr_soft_frame",
-    "rank_rotary",
     "tensor_core_linear",
     "tensor_core_matmul",
 ]

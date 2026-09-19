@@ -40,10 +40,9 @@ _DEIT3_DEFAULT_RANKS: dict[str, int] = {
 
 @dataclass(frozen=True)
 class VisionTokenLayout:
-    """Token validity and Rank-Rotary coordinates for one vision forward."""
+    """Token validity for the vision mixer."""
 
     valid_mask: torch.Tensor | None
-    position_ids: torch.Tensor | None
 
 
 def deit3_spec(variant: str) -> DeiT3Spec:
@@ -103,7 +102,6 @@ class _TimmLSSOMixer(nn.Module):
         *,
         rank: int,
         core_mode: CoreMode,
-        rank_rotary: bool,
         implementation: _Implementation,
         qkv_bias: bool,
         qk_norm: bool,
@@ -132,28 +130,11 @@ class _TimmLSSOMixer(nn.Module):
                 num_heads=num_heads,
                 rank=rank,
                 core_mode=core_mode,
-                rank_rotary=rank_rotary,
                 bias=qkv_bias,
             )
         )
         if device is not None or dtype is not None:
             self.mixer.to(device=device, dtype=dtype)
-
-    @staticmethod
-    def _vision_position_ids(length: int, device: torch.device) -> torch.Tensor:
-        """Return zero-phase CLS and centered one-dimensional patch coordinates."""
-
-        if length <= 0:
-            return torch.empty(0, device=device, dtype=torch.float32)
-        patch_positions = torch.arange(
-            length - 1,
-            device=device,
-            dtype=torch.float32,
-        )
-        patch_positions -= 0.5 * (length - 2)
-        return torch.cat(
-            (torch.zeros(1, device=device, dtype=torch.float32), patch_positions)
-        )
 
     def forward(
         self,
@@ -175,22 +156,11 @@ class _TimmLSSOMixer(nn.Module):
                 "not a generic attention mask"
             )
         valid_mask = None if layout is None else layout.valid_mask
-        if not self.mixer.config.rank_rotary:
-            return self.mixer(
-                x,
-                valid_mask=valid_mask,
-                implementation=self.implementation,
-            )
-        positions = (
-            self._vision_position_ids(x.shape[1], x.device)
-            if layout is None or layout.position_ids is None
-            else layout.position_ids
-        )
+        # Residuals and learned position embeddings can keep timm tokens FP32 under AMP.
+        if self.implementation == "cuda" and x.is_cuda and torch.is_autocast_enabled("cuda"):
+            x = x.to(torch.get_autocast_dtype("cuda"))
         return self.mixer(
-            x,
-            valid_mask=valid_mask,
-            position_ids=positions,
-            implementation=self.implementation,
+            x, valid_mask=valid_mask, implementation=self.implementation,
         )
 
 
@@ -205,7 +175,6 @@ def create_lsso_vit(
     rank: int,
     mlp_ratio: float,
     core_mode: CoreMode | str,
-    rank_rotary: bool,
     bias: bool,
     implementation: _Implementation = "reference",
     drop_path_rate: float = 0.0,
@@ -233,7 +202,6 @@ def create_lsso_vit(
                 num_heads,
                 rank=rank,
                 core_mode=mode,
-                rank_rotary=rank_rotary,
                 implementation=resolved_implementation,
                 **kwargs,
             )
@@ -265,7 +233,6 @@ def _create_deit3_encoder(
     rank: int,
     mlp_ratio: float,
     core_mode: CoreMode | str,
-    rank_rotary: bool,
     bias: bool,
     implementation: _Implementation,
     drop_path_rate: float,
@@ -310,7 +277,6 @@ def _create_deit3_encoder(
                 num_heads,
                 rank=rank,
                 core_mode=mode,
-                rank_rotary=rank_rotary,
                 implementation=resolved_implementation,
                 **kwargs,
             )
@@ -362,7 +328,6 @@ class LSSODeiT3(nn.Module):
         rank: int,
         mlp_ratio: float = 4.0,
         core_mode: CoreMode | str = CoreMode.DYNAMIC,
-        rank_rotary: bool = True,
         bias: bool = True,
         implementation: _Implementation = "reference",
         drop_path_rate: float = 0.0,
@@ -385,7 +350,6 @@ class LSSODeiT3(nn.Module):
             rank=rank,
             mlp_ratio=mlp_ratio,
             core_mode=core_mode,
-            rank_rotary=rank_rotary,
             bias=bias,
             implementation=implementation,
             drop_path_rate=drop_path_rate,
@@ -408,12 +372,11 @@ class LSSODeiT3(nn.Module):
         x: torch.Tensor,
         *,
         valid_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layout = (
             None
-            if valid_mask is None and position_ids is None
-            else VisionTokenLayout(valid_mask, position_ids)
+            if valid_mask is None
+            else VisionTokenLayout(valid_mask)
         )
         return self.encoder(x, attn_mask=layout)
 
@@ -423,13 +386,12 @@ class LSSODeiT3(nn.Module):
         *,
         indices: int | Sequence[int] | None = None,
         valid_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
         norm: bool = False,
     ) -> list[torch.Tensor]:
         layout = (
             None
-            if valid_mask is None and position_ids is None
-            else VisionTokenLayout(valid_mask, position_ids)
+            if valid_mask is None
+            else VisionTokenLayout(valid_mask)
         )
         result = self.encoder.forward_intermediates(
             x,
@@ -454,7 +416,6 @@ def create_lsso_deit3(
     rank: int,
     mlp_ratio: float,
     core_mode: CoreMode | str,
-    rank_rotary: bool,
     bias: bool,
     implementation: _Implementation = "reference",
     drop_path_rate: float = 0.0,
@@ -477,7 +438,6 @@ def create_lsso_deit3(
         rank=rank,
         mlp_ratio=mlp_ratio,
         core_mode=core_mode,
-        rank_rotary=rank_rotary,
         bias=bias,
         implementation=implementation,
         drop_path_rate=drop_path_rate,
@@ -496,7 +456,6 @@ def create_lsso_deit3_variant(
     num_classes: int = 1000,
     rank: int | None = None,
     core_mode: CoreMode | str = CoreMode.DYNAMIC,
-    rank_rotary: bool = True,
     bias: bool = True,
     implementation: _Implementation = "reference",
     dynamic_img_size: bool = False,
@@ -514,7 +473,6 @@ def create_lsso_deit3_variant(
         rank=deit3_default_rank(variant) if rank is None else rank,
         mlp_ratio=4.0,
         core_mode=core_mode,
-        rank_rotary=rank_rotary,
         bias=bias,
         implementation=implementation,
         drop_path_rate=spec.drop_path_rate,

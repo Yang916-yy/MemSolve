@@ -12,13 +12,12 @@ from .reference import (
     bounded_complement,
     compact_equilibrium_diagnostics,
     qr_soft_frame,
-    rank_rotary,
     tensor_core_linear,
     tensor_core_matmul,
 )
 
 
-_CONTRACT_VERSION = 12
+_CONTRACT_VERSION = 13
 _ETA_INIT = 0.9
 _ETA_INIT_RAW = math.atanh(_ETA_INIT)
 _SUPPORTED_ACTIVATION_DTYPES = frozenset(
@@ -34,7 +33,7 @@ class LSSO(nn.Module):
     evaluates its reflected-resolvent equilibrium directly.
 
     Dynamic, static, and zero compact-core ownership share this one forward
-    path. Rank-Rotary is the sole positional ablation.
+    path. Position features, if needed, belong to the surrounding encoder.
     """
 
     def __init__(self, config: LSSOConfig) -> None:
@@ -66,14 +65,17 @@ class LSSO(nn.Module):
         self.eta_raw = nn.Parameter(
             torch.full(
                 (config.num_heads,),
-                _ETA_INIT_RAW,
+                _ETA_INIT_RAW if config.scalar_complement else 0.0,
                 dtype=torch.float32,
-            )
+            ),
+            requires_grad=config.scalar_complement,
         )
 
     def complement(self) -> torch.Tensor:
         """Return the learned per-head complement."""
 
+        if not self.config.scalar_complement:
+            return torch.zeros_like(self.eta_raw)
         return bounded_complement(self.eta_raw)
 
     def _contract_state(self) -> dict[str, object]:
@@ -85,10 +87,11 @@ class LSSO(nn.Module):
             "num_heads": config.num_heads,
             "rank": config.rank,
             "core_mode": config.core_mode.value,
-            "rank_rotary": config.rank_rotary,
             "eta_parameterization": "per_head_interior_tanh",
             "numerics": "tf32-wbc-ieee-fgram-tc16-v6",
             "bias": config.bias,
+            **({"skew_coupling": False} if not config.skew_coupling else {}),
+            **({"scalar_complement": False} if not config.scalar_complement else {}),
         }
 
     def get_extra_state(self) -> dict[str, object]:
@@ -160,88 +163,6 @@ class LSSO(nn.Module):
             )
         return valid_mask.to(device=device)
 
-    @staticmethod
-    def _center_positions(
-        position_ids: torch.Tensor | None,
-        valid_mask: torch.Tensor | None,
-        *,
-        dtype: torch.dtype,
-        all_valid: bool,
-        batch: int | None = None,
-        length: int | None = None,
-        device: torch.device | None = None,
-    ) -> torch.Tensor:
-        if valid_mask is None:
-            if not all_valid:
-                raise ValueError("valid_mask is required when tokens are masked")
-            if batch is None or length is None or device is None:
-                raise ValueError(
-                    "batch, length, and device are required without valid_mask"
-                )
-        else:
-            batch, length = valid_mask.shape
-            device = valid_mask.device
-
-        if position_ids is None:
-            positions = torch.arange(length, device=device, dtype=dtype)
-            positions = positions.view(1, length).expand(batch, length)
-        else:
-            if position_ids.is_floating_point():
-                if position_ids.dtype not in (torch.float32, torch.float64):
-                    raise TypeError(
-                        "floating position_ids must use torch.float32 or "
-                        f"torch.float64, got {position_ids.dtype}"
-                    )
-                # Float64 coordinates retain their relative precision until
-                # centering; converting a large absolute offset first loses it.
-                position_dtype = (
-                    torch.float64
-                    if position_ids.dtype == torch.float64
-                    else dtype
-                )
-                positions = position_ids.to(device=device, dtype=position_dtype)
-            else:
-                if position_ids.dtype == torch.bool or position_ids.is_complex():
-                    raise TypeError(
-                        "position_ids must use an integer dtype, torch.float32, "
-                        f"or torch.float64, got {position_ids.dtype}"
-                    )
-                positions = position_ids.to(device=device, dtype=torch.int64)
-            if positions.ndim == 1:
-                if positions.numel() != length:
-                    raise ValueError(
-                        f"position_ids length {positions.numel()} must match N={length}"
-                    )
-                positions = positions.view(1, length).expand(batch, length)
-            elif positions.shape != (batch, length):
-                raise ValueError(
-                    "position_ids must be None, [N], or "
-                    f"[B, N]={batch, length}; got {tuple(positions.shape)}"
-                )
-
-        if all_valid:
-            centered = positions - positions[:, :1]
-            if centered.dtype == torch.int64:
-                centered = centered.to(dtype=dtype)
-            centered = centered - centered.mean(dim=-1, keepdim=True)
-            return centered.to(dtype=dtype)
-
-        assert valid_mask is not None
-        first_valid = valid_mask.to(dtype=torch.int64).argmax(dim=-1, keepdim=True)
-        anchor = positions.gather(dim=1, index=first_valid)
-        centered = positions - anchor
-        if centered.dtype == torch.int64:
-            centered = centered.to(dtype=dtype)
-        weights = valid_mask.to(dtype=centered.dtype)
-        count = weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        safe_positions = torch.where(
-            valid_mask, centered, torch.zeros_like(centered)
-        )
-        mean = (safe_positions * weights).sum(dim=-1, keepdim=True) / count
-        return torch.where(
-            valid_mask, centered - mean, torch.zeros_like(centered)
-        ).to(dtype=dtype)
-
     def _compact_coordinates(
         self,
         compact_state: torch.Tensor,
@@ -271,23 +192,18 @@ class LSSO(nn.Module):
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor | None,
-        position_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run the explicit strict native implementation of the default operator."""
 
         config = self.config
         if (
-            config.core_mode is not CoreMode.DYNAMIC
-            or not config.rank_rotary
+            not config.skew_coupling
+            or not config.scalar_complement
             or config.rank not in (16, 32, 48, 64)
         ):
             raise ValueError(
-                "implementation='cuda' requires core_mode='dynamic', "
-                "rank_rotary=True, and rank in {16, 32, 48, 64}"
-            )
-        if position_ids is not None and position_ids.requires_grad:
-            raise ValueError(
-                "implementation='cuda' does not support gradients for position_ids"
+                "implementation='cuda' requires skew_coupling=True, scalar_complement=True, "
+                "and rank in {16, 32, 48, 64}"
             )
         if x.device.type != "cuda":
             raise ValueError("implementation='cuda' requires x to be a CUDA tensor")
@@ -298,8 +214,6 @@ class LSSO(nn.Module):
                 f"got {x.dtype}"
             )
 
-        if self.core_base_raw is None or self.core_drive_weight is None:
-            raise RuntimeError("dynamic compact parameters are missing")
 
         for name, parameter in self.named_parameters():
             if parameter.device != x.device:
@@ -340,25 +254,6 @@ class LSSO(nn.Module):
                 device=x.device,
             )
         )
-        centered_positions: torch.Tensor | None = None
-        if config.rank_rotary and (valid_mask is not None or position_ids is not None):
-            centered = self._center_positions(
-                position_ids,
-                mask,
-                dtype=torch.float32,
-                all_valid=all_valid,
-                batch=batch,
-                length=length,
-                device=x.device,
-            )
-            if position_ids is None or position_ids.ndim == 1:
-                centered_positions = (
-                    centered[0].contiguous()
-                    if all_valid
-                    else centered.contiguous()
-                )
-            else:
-                centered_positions = centered.contiguous()
         if all_valid:
             valid_counts = None
         else:
@@ -390,10 +285,9 @@ class LSSO(nn.Module):
 
         mixed = cuda_backend.fast_mix(
             projected,
-            self.core_base_raw,
-            self.core_drive_weight,
+            self.core_base_raw if self.core_base_raw is not None else self.eta_raw.new_empty((config.num_heads, config.rank, 0)),
+            self.core_drive_weight if self.core_drive_weight is not None else self.eta_raw.new_empty((config.num_heads, config.head_dim, 0)),
             self.eta_raw,
-            centered_positions,
             valid_counts,
         )
         output = tensor_core_linear(
@@ -408,7 +302,6 @@ class LSSO(nn.Module):
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor | None,
-        position_ids: torch.Tensor | None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -463,18 +356,6 @@ class LSSO(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             relation = relation.to(dtype=calc_dtype)
             content = content.to(dtype=calc_dtype)
-            if config.rank_rotary:
-                centered = self._center_positions(
-                    position_ids,
-                    mask,
-                    dtype=calc_dtype,
-                    all_valid=all_valid,
-                    batch=batch,
-                    length=length,
-                    device=x.device,
-                )
-                relation = rank_rotary(relation, centered)
-
             valid_count = (
                 torch.full(
                     (batch,),
@@ -490,7 +371,9 @@ class LSSO(nn.Module):
             compact_state = tensor_core_matmul(frame.mT, content)
             coordinates = self._compact_coordinates(compact_state, valid_count)
             generator = (
-                None if coordinates is None else accretive_generator(coordinates)
+                None if coordinates is None else accretive_generator(
+                    coordinates, skew_coupling=config.skew_coupling
+                )
             )
             eta = self.complement().to(device=x.device, dtype=calc_dtype)
         return projected, frame, compact_state, content, generator, eta, mask
@@ -500,7 +383,6 @@ class LSSO(nn.Module):
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
         *,
         adjoint_rhs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
@@ -510,7 +392,7 @@ class LSSO(nn.Module):
         if self.config.core_mode is CoreMode.ZERO:
             raise ValueError("compact diagnostics require a nonzero compact core")
         _projected, frame, compact_state, _content, generator, eta, _mask = (
-            self._reference_compact_problem(x, valid_mask, position_ids)
+            self._reference_compact_problem(x, valid_mask)
         )
         assert generator is not None
         return compact_equilibrium_diagnostics(
@@ -543,7 +425,6 @@ class LSSO(nn.Module):
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
         *,
         implementation: str = "reference",
     ) -> torch.Tensor:
@@ -552,7 +433,7 @@ class LSSO(nn.Module):
         batch, length, _dim = x.shape
 
         if implementation == "cuda":
-            return self._forward_cuda(x, valid_mask, position_ids)
+            return self._forward_cuda(x, valid_mask)
         if implementation != "reference":
             raise ValueError(
                 "implementation must be 'reference' or 'cuda', "
@@ -560,7 +441,7 @@ class LSSO(nn.Module):
             )
 
         projected, frame, compact_state, content, generator, eta, mask = (
-            self._reference_compact_problem(x, valid_mask, position_ids)
+            self._reference_compact_problem(x, valid_mask)
         )
         with torch.autocast(device_type=x.device.type, enabled=False):
             output = accretive_equilibrium_mix(
@@ -589,7 +470,7 @@ class LSSO(nn.Module):
         return (
             f"dim={config.dim}, num_heads={config.num_heads}, rank={config.rank}, "
             f"core_mode={config.core_mode.value}, "
-            f"rank_rotary={config.rank_rotary}, eta=per-head-interior-tanh"
+            "eta=per-head-interior-tanh"
         )
 
 

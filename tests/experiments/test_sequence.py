@@ -103,7 +103,7 @@ def _encoder(mixer: str) -> SequenceEncoder:
         rank=4,
         mixer=mixer,  # type: ignore[arg-type]
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="reference",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -123,7 +123,7 @@ def _grid_encoder(mixer: str) -> SequenceEncoder:
         rank=4,
         mixer=mixer,  # type: ignore[arg-type]
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="reference",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -166,7 +166,7 @@ def test_factorized_grid_positions_reject_invalid_grids() -> None:
             rank=4,
             mixer="mha",
             core_mode=CoreMode.DYNAMIC,
-            rank_rotary=False,
+
             implementation="reference",
             mlp_ratio=2.0,
             dropout=0.0,
@@ -185,7 +185,7 @@ def test_factorized_grid_positions_reject_invalid_grids() -> None:
             rank=4,
             mixer="mha",
             core_mode=CoreMode.DYNAMIC,
-            rank_rotary=False,
+
             implementation="reference",
             mlp_ratio=2.0,
             dropout=0.0,
@@ -208,7 +208,7 @@ def test_pathx_length_is_covered_by_the_learned_position_table() -> None:
         rank=4,
         mixer="mha",
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=False,
+
         implementation="reference",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -230,7 +230,7 @@ def test_pathx_full_length_reference_forward_and_backward_are_finite() -> None:
         rank=4,
         mixer="lsso",
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="reference",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -854,7 +854,7 @@ def test_cuda_lsso_meanmax_readout_is_finite_with_masked_values() -> None:
         rank=16,
         mixer="lsso",
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="cuda",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -893,7 +893,7 @@ def test_cuda_lsso_sequence_path_receives_fp16_amp_activations() -> None:
         rank=16,
         mixer="lsso",
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="cuda",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -926,7 +926,7 @@ def test_cuda_lsso_sequence_path_accepts_bf16_amp() -> None:
         rank=16,
         mixer="lsso",
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="cuda",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -1879,3 +1879,42 @@ def test_checkpoint_allows_explicit_resume_for_the_same_run(tmp_path) -> None:
     assert state["completed"]
     assert state["format_version"] == 2
     assert "early_stop_best_accuracy" in state
+
+
+def test_mha_rope_matches_explicit_rotation_and_preserves_initialization():
+    cls = train_transformers.MaskedMultiheadAttention
+    torch.manual_seed(19)
+    baseline = cls(8, 2, bias=True).double()
+    torch.manual_seed(19)
+    rotated = cls(8, 2, bias=True, rope=True).double()
+    for name, value in baseline.state_dict().items():
+        torch.testing.assert_close(value, rotated.state_dict()[name], rtol=0, atol=0)
+    x = torch.randn(2, 5, 8, dtype=torch.float64, requires_grad=True)
+    mask = torch.tensor([[True, True, True, False, False], [False]*5])
+    actual = rotated(x, mask)
+    attn = rotated.attention
+    q, k, v = F.linear(x[:1], attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
+    q, k, v = [t.reshape(1, 5, 2, 4).transpose(1, 2) for t in (q, k, v)]
+    matrices = []
+    for position in range(5):
+        blocks = []
+        for frequency in (1.0, 0.01):
+            angle = position * frequency
+            blocks.append(torch.tensor([[math.cos(angle), -math.sin(angle)],
+                                        [math.sin(angle), math.cos(angle)]], dtype=torch.float64))
+        matrices.append(torch.block_diag(*blocks))
+    rotation = torch.stack(matrices)
+    q, k = [torch.einsum('nij,bhnj->bhni', rotation, t) for t in (q, k)]
+    scores = (q @ k.transpose(-2, -1)) / 2
+    scores = scores.masked_fill(~mask[:1, None, None, :], -torch.inf)
+    expected = attn.out_proj((scores.softmax(-1) @ v).transpose(1, 2).reshape(1, 5, 8))
+    expected = expected * mask[:1, :, None]
+    torch.testing.assert_close(actual[:1], expected, rtol=1e-10, atol=1e-10)
+    assert torch.count_nonzero(actual[1]) == 0
+    grad_a = torch.autograd.grad(actual.square().sum(), x, retain_graph=True)[0]
+    grad_b = torch.autograd.grad(expected.square().sum(), x)[0]
+    torch.testing.assert_close(grad_a, grad_b, rtol=1e-10, atol=1e-10)
+    # Position zero has identity rotation, including the original MHA gradient.
+    one = x.detach()[:, :1].requires_grad_()
+    valid = torch.ones(2, 1, dtype=torch.bool)
+    torch.testing.assert_close(rotated(one, valid), baseline(one, valid), rtol=1e-10, atol=1e-10)

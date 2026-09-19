@@ -11,11 +11,12 @@ token mixer, after its sample-conditioned quantities are fixed, is a strict
 L2 contraction around a learned scalar complement. This is a per-mixer
 certificate, not an end-to-end Lipschitz claim for the surrounding network.
 
-The default DYNAMIC + Rank-Rotary operator has native CUDA inference and an
-analytic first-order backward. On the measured RTX 5070 Ti long-sequence
+The operator has no internal rotation; learned position embeddings belong to
+the surrounding model. DYNAMIC, STATIC and ZERO have native CUDA inference
+and an analytic first-order backward. On the measured RTX 5070 Ti long-sequence
 workloads, the complete mixer reaches up to 1.79x the forward speed and 2.30x
-the forward-backward speed of PyTorch MHA backed by Flash SDPA. Those published
-measurements use native contract 6; current ABI-8 optimizations have not rerun
+the forward-backward speed of PyTorch MHA backed by Flash SDPA. Those historical measurements use an earlier operator (native contract 6);
+current ABI-9 changes have not rerun
 those formal panels. See [result provenance](results/README.md).
 
 Read the current paper: **[LSSO: Solving Contextual Adaptation with Certified
@@ -31,6 +32,7 @@ Global Mixing](paper/main.pdf)**. The LaTeX source is in
 | Native build, Triton JIT and GPU validation | [CUDA contract](docs/CUDA_CONTRACT.md) |
 | ImageNet pretraining and checkpoint transfer | [DeiT III workflow](docs/IMAGENET_DEIT3.md) |
 | COCO detection/instance segmentation and ADE20K semantic segmentation | [Dense downstream protocols](docs/DOWNSTREAM_PROTOCOLS.md) |
+| Assembly101 data and validation protocol | [Assembly101 workflow](docs/ASSEMBLY101.md) |
 | GenomicBenchmarks and LRA | [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) |
 | Supported ablations | [Ablation guide](docs/ABLATIONS.md) |
 | Test commands and historical evidence | [Tests](tests/README.md), [results](results/README.md) |
@@ -46,11 +48,11 @@ x = torch.randn(8, 65, 192, device="cuda")
 y = layer(x)
 ~~~
 
-The native CUDA path covers only the complete DYNAMIC + Rank-Rotary
-operator, with rank 16, 32, 48, or 64 and any positive practical head dimension.
-It accepts the current operator's optional boolean `valid_mask` and shared or
-per-sample position IDs without falling back to another implementation. It
+The native CUDA path covers DYNAMIC, STATIC and ZERO
+operators, with rank 16, 32, 48, or 64 and any positive practical head dimension.
+It accepts the current operator's optional boolean `valid_mask`  without falling back to another implementation. It
 targets Ampere SM80 and newer supported NVIDIA architectures.
+Build with CMake 3.25+, a C++20 compiler, and MathDx 26.06.1 (CUDA 13 package).
 Build its strict per-SM artifacts with `tools/build_cuda.sh`, then load the
 artifact for the device before requesting it:
 
@@ -62,28 +64,29 @@ x = x.to(torch.bfloat16)  # Native inputs must be FP16 or BF16.
 y = layer(x, implementation="cuda")
 ~~~
 
-The current source requires `torch==2.11.0+cu128`, CUDA `12.8`, native
-contract `8`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
+The current source requires `torch==2.14.0+cu132`, CUDA `13.2`, native
+contract `9`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
 must not be mixed with this newer source contract; build matching native
 artifacts from this checkout:
 
 ~~~bash
-python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
-  'torch==2.11.0+cu128'
+python -m pip install --index-url https://download.pytorch.org/whl/cu132 \
+  'torch==2.14.0+cu132'
 python -m pip install -e .
 PYTHON=python bash tools/build_cuda.sh
 ~~~
 
 A matching runtime wheel can also be built with `tools/package_cuda_runtime.py`.
 It packages seven architecture-specific artifacts (SM80 through supported
-Blackwell targets). Only SM120 was executed for the latest optimization checks.
+Blackwell targets). The toolchain migration was validated on SM80 (A800); earlier optimization
+checks used SM120. Other targets require validation with the new toolchain.
 Biased FP16/BF16 projections additionally use the Triton runtime supplied by
 Linux CUDA PyTorch; their first call JIT-compiles a fused GEMM. Warm up on the
 capture stream before CUDA Graph capture. CPU reference imports do not require
 Triton. See [the CUDA contract](docs/CUDA_CONTRACT.md) for precision and build
 coverage.
 
-The current model checkpoint contract is version 12. A v0.6.3 checkpoint with
+The current model checkpoint contract is version 13. A v0.6.3 checkpoint with
 version 11 requires an explicit, validated migration; `strict=False` does not
 bypass the contract check. Keep the original checkpoint when transferring
 pretrained weights.
@@ -94,8 +97,7 @@ Source checkouts still prefer `build/cuda/lib/` for development; an explicit
 The timm adapter keeps the backend explicit for the ImageNet and downstream
 workflows.
 
-The only supported ablations are DYNAMIC, STATIC, and ZERO core ownership, plus
-the Rank-Rotary on/off switch. See
+Supported ablations include DYNAMIC, STATIC, and ZERO core ownership, skew coupling, and the scalar complement. See
 [`docs/CORE_CONTRACT.md`](docs/CORE_CONTRACT.md) for the canonical mathematical
 and numerical contract.
 

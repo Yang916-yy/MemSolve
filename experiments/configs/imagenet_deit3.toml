@@ -30,7 +30,6 @@ save_every = 1
 
 [operator]
 core_mode = "dynamic"
-rank_rotary = true
 bias = true
 implementation = "cuda"
 

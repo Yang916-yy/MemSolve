@@ -1,24 +1,25 @@
 # Sequence Experiments
 
+> Current source uses model contract 13 and native ABI 9. External position
+> embeddings belong to the surrounding model. Historical measurements retain
+> their recorded source versions and are not new-source results.
+
+
 `python -m experiments.train_transformers` is the single PyTorch entrypoint
 for the current GenomicBenchmarks and Long Range Arena (LRA) experiments. It
 owns data preparation, the shared encoder shell, validation-based checkpoint
 selection, and the one-time held-out test evaluation.
 
-The LSSO default is the complete DYNAMIC + Rank-Rotary CUDA contract. STATIC,
-ZERO, and Rank-Rotary-off remain reference-only ablations. Rank-Rotary is an
-internal rank-space coordinate transform, so it is used in addition to, never
-instead of, the learned absolute position encoding in the experiment shell.
-Learned position parameters are initialized from `Normal(0, 0.02)`. The CUDA
-sequence encoder accepts FP16 and BF16 AMP under native contract 8. Existing
-training recipes still default to FP16. Historical results below used contract 6
-and have not been rerun under the new precision contract.
+The default LSSO core is DYNAMIC. DYNAMIC, STATIC and ZERO support native
+CUDA; no-skew and no-complement require the reference backend. The shared
+encoder supplies learned absolute position embeddings initialized from
+`Normal(0, 0.02)`. Native ABI 9 accepts FP16 and BF16 inputs. Training recipes
+still default to FP16; current model checkpoints use contract 13.
 
-Current model state uses contract 12 in addition to the sequence runner's own
-configuration checks. Historical contract-11 checkpoints are not automatically
-loadable under current source. No migration tool is provided; preserve the
-original and validate any explicit conversion. Keep historical metrics tied
-to their recorded runtime rather than treating them as a rerun of current main.
+Historical results below used earlier operator and numerical contracts,
+including internal relation-feature preprocessing absent from current source.
+Use the recorded source revision to reproduce them. Old checkpoints are not
+automatically migrated, and current recipes do not reproduce old model semantics.
 
 All accuracies below are held-out test percentages. Three-seed summaries use
 the arithmetic mean and sample standard deviation (`n - 1`) over seeds 0, 1,
@@ -80,7 +81,7 @@ decay 0.01, FP16 AMP, 5% linear warmup followed by cosine decay, gradient clip
 1.0, and a 40-epoch budget. Both mixers use the same seed, split, optimizer,
 schedule, checkpoint rule, and data order. The usual physical/effective batch
 is `128/128`; Mouse Enhancers Ensembl uses physical batch 64 and accumulation
-2, retaining effective batch 128. LSSO uses DYNAMIC + Rank-Rotary CUDA at rank
+2, retaining effective batch 128. LSSO uses DYNAMIC CUDA at rank
 32. The baseline mixer is PyTorch MHA with learned absolute positions.
 The mixer parameterizations are not forced to have identical parameter counts:
 for every task, LSSO has 33,264 fewer parameters than MHA. For example, the
@@ -111,11 +112,11 @@ Nyströmformer and ReBased are frozen as numerical references and rejected by
 `--formal` until suitable bidirectional Triton implementations are available.
 
 Some MHA `config.json` files retain generic parser fields such as
-`core_mode=dynamic`, `rank=32`, `rank_rotary=true`, and
+`core_mode=dynamic`, `rank=32`, and
 `implementation=cuda` under `resolved_arguments`. Those fields are inactive
 for MHA. The authoritative `model` record is `mixer=mha`,
 `implementation=torch-mha`, `position_encoding=learned-absolute`; the MHA
-runs do not execute LSSO or Rank-Rotary.
+runs do not execute LSSO.
 
 ### Formal results
 
@@ -176,11 +177,10 @@ different sequence and input structure. The four formal recipes are:
 | Retrieval | `D128/L6/H8`, MLP 4, dropout .1, learned absolute PE + mean | `16 x 4` | 64 | `5e-4` / 20 |
 | Pathfinder-32 | `D256/L6/H4`, MLP 2, dropout 0, factorized row/column learned absolute PE (no PEG) + meanmax | `64 x 2` | 128 | `2e-4` / 200 |
 
-All four use rank-32 DYNAMIC + Rank-Rotary CUDA, AdamW, weight decay 0.01,
+All four use rank-32 DYNAMIC CUDA, AdamW, weight decay 0.01,
 5% linear warmup followed by cosine decay, and gradient clip 1.0. Pathfinder
 adds the factorized row/column position features before applying the official
-nonzero-pixel mask; Rank-Rotary remains a flat rank-space transform over the
-retained row-major positions. Its earliest possible stop is epoch 150 with
+nonzero-pixel mask. Its earliest possible stop is epoch 150 with
 patience 10. The other tasks cannot stop before 75% of their declared budget.
 
 ### Formal LSSO results
@@ -335,3 +335,14 @@ The command requires CUDA because it advances the trained encoder through its
 native mixer path. Diagnostics themselves use FP64 compact linear algebra and
 never construct an `N x N` token operator. The output directory contains raw
 observations, percentile summaries, complete protocol metadata, and the plot.
+
+### MHA + RoPE + learned absolute embeddings control
+
+`--mixer mha_rope` preserves the MHA baseline's QKV/output parameters and
+initialization, and retains the encoder's learned absolute position embeddings.
+It applies standard RoFormer adjacent-pair rotation to Q and K only, across the
+full head dimension, with base 10000 and token indices starting at zero. V is
+unchanged. Source: https://github.com/ZhuiyiTechnology/roformer . This is a
+standard MHA RoPE control; LSSO does not use it.
+Explicit rotation-matrix forward/input-gradient oracles cover padding and empty
+examples, and the position-zero case agrees with ordinary MHA.

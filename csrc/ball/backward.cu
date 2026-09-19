@@ -488,7 +488,8 @@ __global__ __launch_bounds__(kRhsTile) void generic_equilibrium_vjp_kernel(
     TrainingTapeLayout tape_layout,
     int64_t system_count,
     int64_t heads,
-    int64_t head_dim) {
+    int64_t head_dim,
+    int core_mode) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     const int64_t rhs_tile = static_cast<int64_t>(blockIdx.y);
     if (system_index >= system_count) {
@@ -497,12 +498,26 @@ __global__ __launch_bounds__(kRhsTile) void generic_equilibrium_vjp_kernel(
     const int64_t head = system_index - (system_index / heads) * heads;
     const int64_t rhs_start = rhs_tile * kRhsTile;
     const float* system_tape = tape + system_index * tape_layout.stride;
-    const float* lu = system_tape + tape_layout.lu_offset;
-    const int* system_pivots = pivots + system_index * rank;
+    const int64_t core_index = core_mode == 1 ? head : system_index;
+    const float* lu = tape + core_index * tape_layout.stride + tape_layout.lu_offset;
+    const int* system_pivots = pivots + core_index * rank;
     const float* system_d_t = d_t + system_index * rank * head_dim;
     float* system_equilibrium_adjoint = equilibrium_adjoint + system_index * rank * head_dim;
     float* system_state_adjoint = state_adjoint + system_index * rank * head_dim;
     const float eta = bounded_complement(eta_raw[head]);
+
+    if (core_mode == 2) {
+        for (int linear = threadIdx.x; linear < rank * kRhsTile; linear += blockDim.x) {
+            const int row = linear / kRhsTile;
+            const int column = linear % kRhsTile;
+            if (rhs_start + column < head_dim) {
+                const int offset = row * head_dim + rhs_start + column;
+                system_equilibrium_adjoint[offset] = system_d_t[offset];
+                system_state_adjoint[offset] = -eta * system_d_t[offset];
+            }
+        }
+        return;
+    }
 
     using Getrs = typename GenericEquilibriumGetrsMathDx<rank>::Transposed;
 
@@ -615,13 +630,14 @@ __global__ __launch_bounds__(kThreads) void generic_core_relation_vjp_kernel(
     float* __restrict__ grad_core_base_raw,
     TrainingTapeLayout tape_layout,
     int64_t system_count,
-    int64_t heads) {
+    int64_t heads,
+    int core_mode) {
     const int64_t system_index = static_cast<int64_t>(blockIdx.x);
     if (system_index >= system_count) {
         return;
     }
     const int64_t head = system_index - (system_index / heads) * heads;
-    const float* system_tape = tape + system_index * tape_layout.stride;
+    const float* system_tape = tape + (core_mode == 1 ? head : system_index) * tape_layout.stride;
     const float* saved_coordinates = system_tape + tape_layout.coordinates_offset;
     float* system_d_k = d_k + system_index * rank * rank;
 
@@ -992,7 +1008,7 @@ __global__ __launch_bounds__(kThreads) void generic_frame_vjp_kernel(
 //   D_P = G F^T + X D_U^T,
 //   D_B = D_P L^{-1} + 2 B C,
 //
-// followed by the rank-rotary VJP. D_P has one consumer, so it stays in
+// followed by length normalization. D_P has one consumer, so it stays in
 // shared memory rather than round-tripping [B*H, N, R] FP32 storage.
 template <typename scalar_t, int rank>
 __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
@@ -1002,7 +1018,6 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
     const float* __restrict__ frame_state,
     const float* __restrict__ tape,
     const float* __restrict__ frame_c,
-    const __half2* __restrict__ phases,
     const float* __restrict__ valid_counts,
     scalar_t* __restrict__ grad_projected,
     TrainingTapeLayout tape_layout,
@@ -1011,8 +1026,7 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
     int64_t heads,
     int64_t dim,
     int64_t head_dim,
-    int64_t tile_count,
-    int64_t phase_batch_stride) {
+    int64_t tile_count) {
     constexpr int kRelationPanel = PanelRelationVjpMathDx<rank>::kTokenPanel;
     using Token = typename PanelRelationVjpMathDx<rank>::Token;
     using Trsm = typename PanelRelationVjpMathDx<rank>::Trsm;
@@ -1168,9 +1182,9 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
             const int pair = linear - row * (rank / 2);
             float2 value = make_float2(0.0f, 0.0f);
             if (row < subtile_count) {
-                value = generic_rotated_relation_from_phase<scalar_t, rank>(
-                    projected, phases, batch, head, token_start + token_offset + row,
-                    pair, length, projected_width, phase_batch_stride, inverse_length_sqrt);
+                value = generic_relation_pair<scalar_t, rank>(
+                    projected, batch, head, token_start + token_offset + row,
+                    pair, length, projected_width, inverse_length_sqrt);
                 value.x *= inverse_scale;
                 value.y *= inverse_scale;
             }
@@ -1204,18 +1218,16 @@ __global__ __launch_bounds__(kThreads) void fused_frame_relation_vjp_kernel(
             const float d_odd = (
                 relation_adjoint[local_token * Trsm::ldb + even_rank + 1] +
                 correction_c_tensor(local_token, even_rank + 1)) * inverse_scale;
-            const float2 phase = __half22float2(phases[
-                batch * phase_batch_stride + token * (rank / 2) + pair]);
             const int64_t relation_base =
                 (batch * length + token) * projected_width + head * rank;
             store_scalar(
                 grad_projected,
                 relation_base + even_rank,
-                (d_even * phase.x + d_odd * phase.y) * inverse_length_sqrt);
+                d_even * inverse_length_sqrt);
             store_scalar(
                 grad_projected,
                 relation_base + even_rank + 1,
-                (-d_even * phase.y + d_odd * phase.x) * inverse_length_sqrt);
+                d_odd * inverse_length_sqrt);
         }
         __syncthreads();
     }
@@ -1372,7 +1384,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
     const at::Tensor& eta_raw,
     const at::Tensor& tape,
     const at::Tensor& pivots,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts,
     FastPathShape shape) {
     c10::cuda::CUDAGuard guard(projected.device());
@@ -1398,20 +1409,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
     // holds the direct QR-frame adjoint.
     auto frame_adjoint = d_k;
     auto frame_c = at::empty({system_count, rank, rank}, options);
-    auto phases = rank_rotary_phase_table_cuda(
-        projected, centered_positions, shape);
-    const int64_t phase_batch_stride =
-        centered_positions.has_value() && centered_positions->dim() == 2
-        ? shape.length * (rank / 2)
-        : 0;
 
     const auto stream = at::cuda::getCurrentCUDAStream(projected.get_device()).stream();
-    C10_CUDA_CHECK(cudaMemsetAsync(
+    if (grad_core_base_raw.numel() > 0) C10_CUDA_CHECK(cudaMemsetAsync(
         grad_core_base_raw.data_ptr<float>(),
         0,
         grad_core_base_raw.numel() * sizeof(float),
         stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(
+    if (grad_core_drive_weight.numel() > 0) C10_CUDA_CHECK(cudaMemsetAsync(
         grad_core_drive_weight.data_ptr<float>(),
         0,
         grad_core_drive_weight.numel() * sizeof(float),
@@ -1480,8 +1485,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         tape_layout,
         system_count,
         shape.heads,
-        shape.head_dim);
+        shape.head_dim, shape.core_mode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (shape.core_mode != 2) {
     generic_d_k_kernel<rank><<<system_count, kThreads, 0, stream>>>(
         equilibrium_adjoint.data_ptr<float>(),
         tape.data_ptr<float>(),
@@ -1490,6 +1496,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         system_count,
         shape.head_dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     // d_k is the equilibrium adjoint's final consumer.  Reduce the exact
     // FP32 compact-state partials once into that dead buffer: this is the
     // same ascending-tile sum previously reconstructed per frame CTA.
@@ -1501,14 +1508,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         token_tiles,
         shape.head_dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (shape.core_mode != 2) {
     generic_core_relation_vjp_kernel<rank><<<system_count, kThreads, 0, stream>>>(
         tape.data_ptr<float>(),
         d_k.data_ptr<float>(),
         grad_core_base_raw.data_ptr<float>(),
         tape_layout,
         system_count,
-        shape.heads);
+        shape.heads, shape.core_mode);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    if (shape.core_mode == 0) {
     constexpr size_t core_content_vjp_shared_bytes = generic_core_content_vjp_shared_bytes<rank>();
     generic_core_content_vjp_kernel<rank><<<
         system_count, kThreads, core_content_vjp_shared_bytes, stream>>>(
@@ -1524,6 +1534,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         shape.head_dim,
         1.0f / std::sqrt(static_cast<float>(shape.length)));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     constexpr size_t frame_compact_shared_bytes = generic_frame_compact_shared_bytes<rank>();
     generic_frame_compact_adjoint_kernel<rank><<<
         system_count, kThreads, frame_compact_shared_bytes, stream>>>(
@@ -1575,7 +1586,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         equilibrium_adjoint.data_ptr<float>(),
         tape.data_ptr<float>(),
         frame_c.data_ptr<float>(),
-        reinterpret_cast<const __half2*>(phases.data_ptr<at::Half>()),
         valid_counts.has_value() ? valid_counts->data_ptr<float>() : nullptr,
         grad_projected.data_ptr<scalar_t>(),
         tape_layout,
@@ -1584,8 +1594,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> launch_generic_backwa
         shape.heads,
         shape.dim,
         shape.head_dim,
-        token_tiles,
-        phase_batch_stride);
+        token_tiles);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {
         grad_projected,
@@ -1604,26 +1613,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_expanded_bac
     const at::Tensor& eta_raw,
     const at::Tensor& tape,
     const at::Tensor& pivots,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts,
     FastPathShape shape) {
     switch (shape.rank) {
         case 16:
             return launch_generic_backward<scalar_t, 16>(
                 grad_output, projected, core_base_raw, core_drive_weight, eta_raw,
-                tape, pivots, centered_positions, valid_counts, shape);
+                tape, pivots, valid_counts, shape);
         case 32:
             return launch_generic_backward<scalar_t, 32>(
                 grad_output, projected, core_base_raw, core_drive_weight, eta_raw,
-                tape, pivots, centered_positions, valid_counts, shape);
+                tape, pivots, valid_counts, shape);
         case 48:
             return launch_generic_backward<scalar_t, 48>(
                 grad_output, projected, core_base_raw, core_drive_weight, eta_raw,
-                tape, pivots, centered_positions, valid_counts, shape);
+                tape, pivots, valid_counts, shape);
         case 64:
             return launch_generic_backward<scalar_t, 64>(
                 grad_output, projected, core_base_raw, core_drive_weight, eta_raw,
-                tape, pivots, centered_positions, valid_counts, shape);
+                tape, pivots, valid_counts, shape);
         default:
             TORCH_CHECK(false, "unreachable supported rank");
     }
@@ -1639,14 +1647,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> backward_cuda(
     const at::Tensor& eta_raw,
     const at::Tensor& tape,
     const at::Tensor& pivots,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts) {
     const auto shape = validate_fast_inputs(
         projected,
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts);
     validate_grad_output(grad_output, projected, shape);
     validate_training_tape(tape, pivots, projected, shape);
@@ -1661,7 +1667,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> backward_cuda(
         eta_raw,
         tape,
         pivots,
-        centered_positions,
         valid_counts,
         shape);
 }

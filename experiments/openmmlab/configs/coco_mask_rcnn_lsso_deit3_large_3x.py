@@ -15,7 +15,6 @@ model = dict(
         out_indices=(7, 11, 15, 23),
         implementation="cuda",
         core_mode="dynamic",
-        rank_rotary=True,
     ),
     neck=dict(in_channels=[1024, 1024, 1024, 1024]),
 )

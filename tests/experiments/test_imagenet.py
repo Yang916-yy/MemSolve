@@ -265,7 +265,6 @@ def test_small_recipe_preserves_deit3_geometry_and_800_epoch_contract(tmp_path: 
     assert (run.train["train_workers"], run.train["val_workers"]) == (10, 4)
     assert run.operator == {
         "core_mode": "dynamic",
-        "rank_rotary": True,
         "bias": True,
         "implementation": "cuda",
     }

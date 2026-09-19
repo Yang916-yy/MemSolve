@@ -1,16 +1,28 @@
 # CUDA Contract
 
-Native contract version 8 implements exactly the complete default operator:
+Native contract version 9 implements the unrotated operator in three core modes:
 
-- `core_mode=DYNAMIC`;
-- `rank_rotary=True`;
+- `core_mode=DYNAMIC`, `STATIC`, or `ZERO`;
+- `skew_coupling=True` and `scalar_complement=True`;
 - learned per-head one-ULP interiorized tanh complement;
 - the soft frame, shared compact state, dynamic accretive generator, and
   direct equilibrium readout defined by `lsso/ball/reference.py`.
 
-STATIC, ZERO, and Rank-Rotary-off are PyTorch-only ablations. CUDA rejects
+No-skew and no-complement are PyTorch-only ablations. CUDA rejects
 them explicitly. It never falls back to the reference implementation, retains
 an old ABI, or redefines the operator mathematics outside `reference.py`.
+
+## Build environment
+
+The current native build targets PyTorch 2.14.0+cu132, CUDA Toolkit 13.2,
+MathDx 26.06.1 (CUDA 13 package), and C++20. CMake 3.25 is sufficient
+for consuming the installed MathDx package with device LTO; building MathDx
+itself has different requirements. See NVIDIA
+[installed-package requirements](https://docs.nvidia.com/cuda/cublasdx/requirements_func.html).
+The projection runtime is Triton 3.8.0 supplied by this PyTorch environment.
+Use `LSSO_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh` for an A800.
+The current unrotated implementation uses native ABI 9 and checkpoint contract 13.
+Historical rotated checkpoints and results retain their original contracts.
 
 ## Public And Native Boundaries
 
@@ -24,9 +36,7 @@ Parameters remain FP32. FP32/FP64 public inputs are reference-only.
 The native `projected` input must be contiguous CUDA BF16 with shape
 `[B, N, H * R + D]`. FP16 and FP32 packed coordinates are rejected.
 `core_base_raw`, `core_drive_weight`, and `eta_raw` must
-also be contiguous FP32 CUDA tensors on the same device. Optional
-`centered_positions` is contiguous FP32 CUDA metadata of shape `[N]` or
-`[B, N]`, not a differentiable input. When the public caller supplies a
+also be contiguous FP32 CUDA tensors on the same device. When the public caller supplies a
 `valid_mask`, it zeros masked packed coordinates and supplies contiguous FP32
 `valid_counts[B] = max(n_valid, 1)`; this is also metadata and is not
 differentiable. The native ABI rejects unsupported dtypes, layouts, shapes,
@@ -39,7 +49,7 @@ and mask invalid upstream output gradients.
 The supported native shape range is rank in `{16, 32, 48, 64}` and any positive
 head dimension within ordinary CUDA allocation and launch limits. Rank and head
 dimension are independent; rank may exceed head dimension. The public CUDA path
-accepts `valid_mask[B, N]` and position IDs of shape `[N]` or `[B, N]`,
+accepts `valid_mask[B, N]`,
 including gapped padding and an
 entirely masked sample. Masking retains the one generic physical `[B, N]`
 schedule: invalid coordinates are zero and every per-sample normalization uses
@@ -69,8 +79,6 @@ CUDA uses a fixed mixed BF16/FP16/FP32 contract:
 - ordinary projection, content and compact GEMMs use BF16 multiplicands and
   FP32 accumulators; PyTorch reduced-precision BF16 reductions are disabled
   inside these operations, independently of ambient AMP;
-- Rank-Rotary computes angles and trigonometry in FP32, stores bounded sin/cos
-  pairs in FP16, and performs rotation arithmetic in FP32;
 - frame storage, Gram/factorization, one-ULP interiorized eta, LU and triangular
   solves, sensitive backward statistics, and parameter gradients remain FP32;
 - packed activations, native output and packed-input gradients are BF16.
@@ -119,7 +127,7 @@ Biased CUDA linear outputs requesting FP16 or BF16 fuse `A B + bias` in a
 blocked Triton GEMM: BF16 multiplicands, FP32 accumulation, FP32 bias addition,
 then one final store conversion. FP16 output never rounds through BF16.
 The same projection autograd owner and first-order VJP remain in use. General
-FP32 outputs retain PyTorch 2.11 `aten.addmm.dtype`. Alternative FP32 summation
+FP32 outputs use PyTorch `aten.addmm.dtype`. Alternative FP32 summation
 orders can differ by an output rounding bin; bitwise agreement is not universal.
 
 The fused kernel follows the [Triton matrix-multiplication tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html).
@@ -128,7 +136,7 @@ It uses the Triton runtime supplied by Linux CUDA PyTorch (tested with Triton
 The first call compiles a kernel; warm up on the capture stream before CUDA
 Graph capture. Token counts are runtime arguments, avoiding one compilation
 for every image resolution. This adds a JIT projection boundary; the native
-MathDx mixer remains a precompiled artifact with ABI 8. No new parameters,
+MathDx mixer remains a precompiled artifact with ABI 9. No new parameters,
 checkpoint version, precision guards, or fallback implementation are added.
 
 
@@ -137,13 +145,13 @@ checkpoint version, precision guards, or fallback implementation are added.
 All supported ranks use one tiled generic workspace schedule. It builds the
 FP32 relation/soft-frame state, computes compact tiles, fuses dynamic-coordinate
 generation with accretive factor construction and LU factorization, then solves
-the equilibrium and performs the BF16/FP32 readout. Default Rank-Rotary phase
-tables are cached per device, rank, and sequence length and safely shared
-across streams; explicit position metadata uses an invocation-local table.
+the equilibrium and performs the BF16/FP32 readout. There are no phase tables
+or position coordinates. STATIC factors one matrix per head and shares its LU
+across the batch; each sample still solves its own compact right-hand side.
+ZERO skips core construction and LU solves, using U = Z / 2 in the shared tape.
 Training stores one token-sized FP32 frame: materialization overwrites `B`
-with `P` in place. Backward reconstructs `B` from the BF16 packed relation,
-the same FP16 phase table, FP32 length normalization, and saved detached
-scale. Forward and backward share the rotation helper and operation order.
+with `P` in place. Backward reconstructs `B` from BF16 packed relations,
+FP32 length normalization, and saved detached scale.
 The expensive triangular frame solve is not recomputed. Inference also reuses
 the token region and omits the training-only compact coordinates. Head dimensions use runtime 32-column RHS tiles with
 zero-filled tails, so they have no second shape whitelist; very small or very
@@ -164,7 +172,7 @@ The fused frame/relation VJP uses 64-token local GEMM/TRSM panels for
 `r=16/32/48`, and retains 32-token panels for `r=64`. Each CTA still owns 64
 tokens, independently across batch, head, and token range. The wider local
 panel replaces two serial subpanels without materializing `D_P` globally:
-`D_P = G F^T + X D_U^T`, `D_B = D_P L^{-1} + 2 B C`, then the Rank-Rotary
+`D_P = G F^T + X D_U^T`, `D_B = D_P L^{-1} + 2 B C`, then the relation normalization
 VJP. Tensor Core operand boundaries and the FP32 solve remain unchanged.
 SM120 measurements favored wider panels below rank 64; the rank-64 candidate
 regressed and was not adopted. Reducing the block to 128 threads or splitting
@@ -181,7 +189,7 @@ ascending-token-tile reduction and compact-state storage are unchanged;
 within-tile GEMM and scalar complement reductions may reorder FP32 sums.
 This uses the shared-memory GEMM pattern illustrated by NVIDIA's
 [cuBLASDx FP32 example](https://github.com/NVIDIA/CUDALibrarySamples/tree/main/MathDx/cuBLASDx),
-also shipped with the pinned MathDx 25.12 package. This native statistic kernel does not use Triton or replace the accretive solve.
+also shipped with the pinned MathDx 26.06.1 package. This native statistic kernel does not use Triton or replace the accretive solve.
 
 Forward compact-state formation groups four adjacent 32-token GEMMs per CTA,
 accumulating their results in FP32 before writing one partial. Groups remain
@@ -230,7 +238,7 @@ error bound. No existing gradient tolerance is relaxed by these optimizations.
 
 ## Artifacts
 
-CUDA 12.8 device-LTO with the cuSolverDx fatbin builds one executable image per
+CUDA 13.2 device-LTO with the cuSolverDx fatbin builds one executable image per
 device-link invocation. `tools/build_cuda.sh` therefore produces strict
 artifacts named `lsso_equilibrium_sm80.so`,
 `lsso_equilibrium_sm86.so`, `lsso_equilibrium_sm87.so`,
@@ -239,8 +247,9 @@ artifacts named `lsso_equilibrium_sm80.so`,
 claiming one universal binary.
 
 SM80 is the minimum architecture because the complete contract requires native
-BF16 Tensor Core operations. Local validation covers SM120; the other build
-targets require their own hardware validation.
+BF16 Tensor Core operations. The CUDA 13.2 toolchain upgrade is built and validated on SM80 (A800).
+Earlier scheduling optimizations were validated on SM120. Other targets and
+SM120 under the new toolchain still require their own hardware validation.
 
 `lsso.ball.cuda.load(device=...)` selects the artifact matching the requested
 device. It serializes loading and binds one native operator implementation per
@@ -257,7 +266,7 @@ mixed with current source. Its generated
 metadata is checked before loading: LSSO version, native contract, exact Torch
 version, CUDA version, and PyTorch's C++ ABI must all match. Release packaging
 removes every build-host RPATH/RUNPATH and rejects ELF artifacts requiring a
-GLIBC version above 2.31, so the published CUDA 12.8 runtime can load on
+GLIBC version above 2.31, so the packaged CUDA 13.2 runtime can load on
 Ubuntu 20.04 and newer x86_64 systems with the matching PyTorch runtime.
 
 ## Validation and performance scope
@@ -279,3 +288,36 @@ packages were absent, and other GPU architectures were not executed. Existing
 formal results retain their recorded contract-6 provenance in `results/`.
 For reproducible new measurements, record source commit, bias, dtype, rank,
 shape, GPU, warmup, eager/Graph mode, and the actual live-allocation peak.
+
+
+## 2026-09-17 toolchain migration validation
+
+The SM80 artifact built successfully with the installed CMake 3.25.2, CUDA
+13.2, MathDx 26.06.1 (cuBLASDx 0.7.1 / cuSolverDx 0.5.0), and PyTorch
+2.14.0+cu132. PyTorch's ATen headers now require C++20; both host and CUDA
+compilation use that standard. Triton 3.8.0 exercises the existing biased
+projection kernel without changing its math.
+
+On A800, core/CUDA/repository checks passed 195 tests. Integration and experiment
+checks passed 146 tests with 11 optional-dependency skips, including four new
+Assembly101 data/evaluation checks. Python 3.10 experiment imports now use the
+TOML backport where the standard-library `tomllib` is unavailable.
+
+Additional biased, single-head, width-64 native comparisons against the FP64
+reference covered FP16 at N=16384/rank=16 and BF16 at N=55296/rank=32, with
+nonzero dynamic parameters. Forward relative L2 errors were 0.348% and 0.345%;
+the largest parameter-gradient error was 0.738%. Existing tolerances were not
+relaxed. These finite fixtures do not establish a universal error bound.
+
+The old toolchain was not benchmarked on this machine. New-stack exploratory
+latencies therefore do not establish an upgrade speedup. Only SM80 was built;
+this validation did not produce a seven-architecture release wheel.
+
+## Private core-mode encoding
+
+Dynamic uses base `[H,R,R]` and drive `[H,Dh,R]`. Static uses the same base
+and an empty drive `[H,Dh,0]`. Zero uses empty base `[H,R,0]` and drive
+`[H,Dh,0]`. These placeholders are private ABI metadata, not model parameters.
+All modes share the fused readout `eta C + P (2U - (1+eta)Z)`, algebraically
+equal to the reference base-plus-correction form. Static backward sums core
+gradients across samples; no factors are cached between forward calls.

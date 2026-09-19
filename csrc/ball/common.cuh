@@ -64,6 +64,7 @@ struct FastPathShape {
     int64_t dim;
     int64_t head_dim;
     int64_t rank;
+    int core_mode; // 0 Dynamic, 1 Static, 2 Zero
 };
 
 // One contiguous FP32 activation tape per [batch, head] system.  The tensor is
@@ -107,29 +108,23 @@ inline TrainingTapeLayout training_tape_layout(FastPathShape shape) {
     };
 }
 
-// Share rotation arithmetic between forward and backward B reconstruction.
+// Share normalized relation loads between forward and backward reconstruction.
 template <typename scalar_t, int rank>
-__device__ __forceinline__ float2 generic_rotated_relation_from_phase(
+__device__ __forceinline__ float2 generic_relation_pair(
     const scalar_t* projected,
-    const __half2* phases,
     int64_t batch,
     int64_t head,
     int64_t token,
     int pair,
     int64_t length,
     int64_t projected_width,
-    int64_t phase_batch_stride,
     float inverse_length_sqrt) {
     const int even_rank = 2 * pair;
     const int64_t relation_base =
         (batch * length + token) * projected_width + head * rank;
     const float even = static_cast<float>(projected[relation_base + even_rank]);
     const float odd = static_cast<float>(projected[relation_base + even_rank + 1]);
-    const float2 phase = __half22float2(phases[
-        batch * phase_batch_stride + token * (rank / 2) + pair]);
-    return make_float2(
-        (even * phase.x - odd * phase.y) * inverse_length_sqrt,
-        (even * phase.y + odd * phase.x) * inverse_length_sqrt);
+    return make_float2(even * inverse_length_sqrt, odd * inverse_length_sqrt);
 }
 
 struct ForwardWorkspaceLayout {
@@ -196,7 +191,6 @@ inline FastPathShape validate_fast_inputs(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts) {
     TORCH_CHECK(projected.is_cuda(), "projected must be a CUDA tensor");
     TORCH_CHECK(projected.is_contiguous(), "projected must be contiguous [B, N, H*R + D]");
@@ -218,8 +212,8 @@ inline FastPathShape validate_fast_inputs(
     TORCH_CHECK(core_drive_weight.scalar_type() == at::kFloat,
                 "core_drive_weight must use float32");
     TORCH_CHECK(eta_raw.scalar_type() == at::kFloat, "eta_raw must use float32");
-    TORCH_CHECK(core_base_raw.dim() == 3 && core_base_raw.size(1) == core_base_raw.size(2),
-                "core_base_raw must have shape [H, R, R], got ", core_base_raw.sizes());
+    TORCH_CHECK(core_base_raw.dim() == 3 && (core_base_raw.size(2) == 0 || core_base_raw.size(1) == core_base_raw.size(2)),
+                "core_base_raw must have shape [H, R, R] or [H, R, 0] for Zero, got ", core_base_raw.sizes());
 
     const auto batch = projected.size(0);
     const auto length = projected.size(1);
@@ -236,25 +230,14 @@ inline FastPathShape validate_fast_inputs(
     TORCH_CHECK(dim % heads == 0,
                 "projected content width D must be divisible by H");
     const auto head_dim = dim / heads;
-    TORCH_CHECK(core_drive_weight.sizes() == at::IntArrayRef({heads, head_dim, rank}),
-                "core_drive_weight must have shape [H, D/H, R], got ",
+    const int core_mode = core_base_raw.numel() == 0 ? 2 : (core_drive_weight.numel() == 0 ? 1 : 0);
+    TORCH_CHECK(core_base_raw.numel() != 0 || core_drive_weight.numel() == 0, "Zero cannot have a dynamic drive");
+    TORCH_CHECK(core_drive_weight.sizes() == at::IntArrayRef({heads, head_dim, core_mode == 0 ? rank : 0}),
+                "core_drive_weight must have shape [H, D/H, R] for Dynamic or [H, D/H, 0] otherwise, got ",
                 core_drive_weight.sizes());
     TORCH_CHECK(eta_raw.sizes() == at::IntArrayRef({heads}),
                 "eta_raw must have shape [H], got ", eta_raw.sizes());
 
-    if (centered_positions.has_value()) {
-        const auto& positions = *centered_positions;
-        check_same_cuda_device(positions, projected, "centered_positions");
-        TORCH_CHECK(positions.is_contiguous(), "centered_positions must be contiguous");
-        TORCH_CHECK(positions.scalar_type() == at::kFloat,
-                    "centered_positions must use float32");
-        TORCH_CHECK(
-            (positions.dim() == 1 && positions.size(0) == length) ||
-                (positions.dim() == 2 && positions.size(0) == batch &&
-                 positions.size(1) == length),
-            "centered_positions must have shape [N] or [B, N], got ",
-            positions.sizes());
-    }
     if (valid_counts.has_value()) {
         const auto& counts = *valid_counts;
         check_same_cuda_device(counts, projected, "valid_counts");
@@ -265,7 +248,7 @@ inline FastPathShape validate_fast_inputs(
                     "valid_counts must have shape [B], got ", counts.sizes());
     }
 
-    return {batch, length, heads, dim, head_dim, rank};
+    return {batch, length, heads, dim, head_dim, rank, core_mode};
 }
 
 inline int supported_sm() {
@@ -300,17 +283,11 @@ inline int supported_sm() {
     }
 }
 
-at::Tensor rank_rotary_phase_table_cuda(
-    const at::Tensor& projected,
-    const c10::optional<at::Tensor>& centered_positions,
-    FastPathShape shape);
-
 at::Tensor forward_inference_cuda(
     const at::Tensor& projected,
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_cuda(
@@ -318,7 +295,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_cuda(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> backward_cuda(
@@ -329,7 +305,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> backward_cuda(
     const at::Tensor& eta_raw,
     const at::Tensor& tape,
     const at::Tensor& pivots,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts);
 
 }  // namespace lsso_equilibrium

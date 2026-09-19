@@ -1,9 +1,14 @@
 # Dense Downstream Protocols
 
+> Current source uses model contract 13 and native ABI 9. External position
+> embeddings belong to the surrounding model. Historical measurements retain
+> their recorded source versions and are not new-source results.
+
+
 The dense experiments share the DeiT III LSSO backbone used by ImageNet. They
 use a learned two-dimensional patch position table with no learned CLS
-position. Rank-Rotary remains an internal rank-space phase choice, rather than
-an image-coordinate embedding.
+position. The learned spatial position table belongs to the backbone; the
+mixer consumes token features and the validity mask.
 
 | Scale | Width | Depth | Heads | LSSO rank | Feature taps |
 | --- | ---: | ---: | ---: | ---: | --- |

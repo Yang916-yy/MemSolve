@@ -16,7 +16,6 @@ from lsso.ball.reference import (
     accretive_generator,
     bounded_complement,
     qr_soft_frame,
-    rank_rotary,
 )
 
 
@@ -35,7 +34,6 @@ def _reference_fast_mix(
     core_base_raw: torch.Tensor,
     core_drive_weight: torch.Tensor,
     eta_raw: torch.Tensor,
-    centered_positions: torch.Tensor | None,
     valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compose the FP64 reference oracle for the strict CUDA ABI."""
@@ -59,19 +57,10 @@ def _reference_fast_mix(
         )
     else:
         counts = valid_counts.to(device=projected.device, dtype=calc_dtype)
-    if centered_positions is None:
-        positions = torch.arange(length, device=projected.device, dtype=calc_dtype)
-        positions = positions - 0.5 * (length - 1)
-    else:
-        positions = centered_positions.to(dtype=calc_dtype)
-
     relation, content = projected.split((heads * rank, dim), dim=-1)
     relation = relation.view(batch, length, heads, rank).transpose(1, 2)
     content = content.view(batch, length, heads, head_dim).transpose(1, 2)
-    relation = rank_rotary(
-        relation,
-        positions.expand(batch, -1),
-    ) / counts.sqrt().view(batch, 1, 1, 1)
+    relation = relation / counts.sqrt().view(batch, 1, 1, 1)
     frame = qr_soft_frame(relation)
     compact_state = frame.mT @ content
     coordinates = core_base_raw.unsqueeze(0) + (
@@ -111,18 +100,6 @@ def test_cuda_boundary_is_explicit() -> None:
             cuda.require_available()
 
 
-def test_fast_mix_rejects_position_gradients_before_loading() -> None:
-    positions = torch.arange(4, dtype=torch.float32, requires_grad=True)
-    with pytest.raises(ValueError, match="does not support gradients"):
-        cuda.fast_mix(
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            positions,
-        )
-
-
 def test_fast_mix_selects_the_strict_train_and_inference_abis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -148,15 +125,13 @@ def test_fast_mix_selects_the_strict_train_and_inference_abis(
 
     def backward(*arguments: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
         calls.append("backward")
-        assert len(arguments) == 9
+        assert len(arguments) == 8
         assert isinstance(arguments[0], torch.Tensor)
         assert arguments[0].dtype == torch.bfloat16
-        tape, pivots, positions, counts = arguments[5:]
+        tape, pivots, counts = arguments[5:]
         assert isinstance(tape, torch.Tensor) and tape.dtype == torch.float32
         assert isinstance(pivots, torch.Tensor) and pivots.dtype == torch.int32
-        assert isinstance(positions, torch.Tensor)
         assert isinstance(counts, torch.Tensor)
-        torch.testing.assert_close(positions, torch.tensor([0.0, 1.0]))
         torch.testing.assert_close(counts, torch.tensor([2.0]))
         return tuple(torch.ones_like(argument) for argument in arguments[1:5])
 
@@ -180,15 +155,14 @@ def test_fast_mix_selects_the_strict_train_and_inference_abis(
     base = torch.randn(1, 16, 16, requires_grad=True)
     drive = torch.randn(1, 16, 16, requires_grad=True)
     eta = torch.randn(1, requires_grad=True)
-    positions = torch.tensor([0.0, 1.0])
     counts = torch.tensor([2.0])
-    output = cuda.fast_mix(projected, base, drive, eta, positions, counts)
+    output = cuda.fast_mix(projected, base, drive, eta, counts)
     output.sum().backward()
     assert calls == ["forward_train", "backward"]
 
     calls.clear()
     with torch.inference_mode():
-        inference_output = cuda.fast_mix(projected, base, drive, eta, positions, counts)
+        inference_output = cuda.fast_mix(projected, base, drive, eta, counts)
     assert not inference_output.requires_grad
     assert calls == ["forward_inference"]
 
@@ -450,8 +424,8 @@ def test_reference_is_default_and_cuda_is_explicit(
 @pytest.mark.parametrize(
     "config",
     [
-        LSSOConfig(32, 2, rank=16, core_mode=CoreMode.STATIC),
-        LSSOConfig(32, 2, rank=16, rank_rotary=False),
+        LSSOConfig(32, 2, rank=16, skew_coupling=False),
+        LSSOConfig(32, 2, rank=16, scalar_complement=False),
         LSSOConfig(32, 2, rank=24),
     ],
 )
@@ -481,7 +455,7 @@ def test_cuda_dispatch_accepts_supported_rank_and_generic_head_dimensions(
         layer(x, implementation="cuda")
 
 
-def test_cuda_dispatch_accepts_mask_and_batch_specific_positions() -> None:
+def test_cuda_dispatch_accepts_mask() -> None:
     layer = LSSO(LSSOConfig(dim=32, num_heads=2, rank=16))
     x = torch.randn(2, 4, 32)
     x = x.to(torch.float16).detach().requires_grad_(x.requires_grad)
@@ -489,7 +463,7 @@ def test_cuda_dispatch_accepts_mask_and_batch_specific_positions() -> None:
         layer(
             x,
             valid_mask=torch.ones(2, 4, dtype=torch.bool),
-            position_ids=torch.arange(4).expand(2, -1),
+
             implementation="cuda",
         )
 
@@ -511,7 +485,6 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
         LSSOConfig(dim=32, num_heads=2, rank=16, bias=True)
     ).cuda().eval()
     x = torch.randn(2, 5, 32, device="cuda", dtype=input_dtype)
-    positions = 3 * torch.arange(5, device="cuda", dtype=torch.int64) + 11
     captured: dict[str, torch.Tensor | None] = {}
 
     def fake_fast_mix(
@@ -519,14 +492,12 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
         core_base_raw: torch.Tensor,
         core_drive_weight: torch.Tensor,
         eta_raw: torch.Tensor,
-        centered_positions: torch.Tensor | None,
         valid_counts: torch.Tensor | None,
     ) -> torch.Tensor:
         captured["projected"] = projected
         captured["core_base_raw"] = core_base_raw
         captured["core_drive_weight"] = core_drive_weight
         captured["eta_raw"] = eta_raw
-        captured["centered_positions"] = centered_positions
         captured["valid_counts"] = valid_counts
         return torch.zeros(
             projected.shape[0],
@@ -537,7 +508,7 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
         )
 
     monkeypatch.setattr(cuda, "fast_mix", fake_fast_mix)
-    actual = layer(x, position_ids=positions, implementation="cuda")
+    actual = layer(x,  implementation="cuda")
 
     projected = captured["projected"]
     assert isinstance(projected, torch.Tensor)
@@ -547,15 +518,6 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
     assert captured["core_base_raw"] is layer.core_base_raw
     assert captured["core_drive_weight"] is layer.core_drive_weight
     assert captured["eta_raw"] is layer.eta_raw
-    centered = captured["centered_positions"]
-    assert isinstance(centered, torch.Tensor)
-    expected_positions = LSSO._center_positions(
-        positions,
-        torch.ones(2, 5, dtype=torch.bool, device="cuda"),
-        dtype=torch.float32,
-        all_valid=True,
-    )[0]
-    torch.testing.assert_close(centered, expected_positions)
     assert captured["valid_counts"] is None
     assert layer.w_o.bias is not None
     expected = layer.w_o.bias.to(dtype=input_dtype).view(1, 1, -1).expand_as(actual)
@@ -578,12 +540,6 @@ def test_cuda_dispatch_packs_masked_batch_specific_inputs(
     )
     clean = torch.randn(2, 6, 32, device="cuda", dtype=input_dtype)
     x = torch.where(mask[:, :, None], clean, torch.full_like(clean, float("nan")))
-    positions = torch.stack(
-        (
-            3 * torch.arange(6, device="cuda", dtype=torch.int64) + 11,
-            5 * torch.arange(6, device="cuda", dtype=torch.int64) + 101,
-        )
-    )
     captured: dict[str, torch.Tensor | None] = {}
 
     def fake_fast_mix(
@@ -591,12 +547,10 @@ def test_cuda_dispatch_packs_masked_batch_specific_inputs(
         core_base_raw: torch.Tensor,
         core_drive_weight: torch.Tensor,
         eta_raw: torch.Tensor,
-        centered_positions: torch.Tensor | None,
         valid_counts: torch.Tensor | None,
     ) -> torch.Tensor:
         del core_base_raw, core_drive_weight, eta_raw
         captured["projected"] = projected
-        captured["centered_positions"] = centered_positions
         captured["valid_counts"] = valid_counts
         return torch.zeros(
             projected.shape[0],
@@ -610,7 +564,7 @@ def test_cuda_dispatch_packs_masked_batch_specific_inputs(
     actual = layer(
         x,
         valid_mask=mask,
-        position_ids=positions,
+
         implementation="cuda",
     )
 
@@ -618,15 +572,6 @@ def test_cuda_dispatch_packs_masked_batch_specific_inputs(
     assert isinstance(projected, torch.Tensor)
     assert torch.isfinite(projected).all()
     assert torch.count_nonzero(projected[~mask]) == 0
-    centered = captured["centered_positions"]
-    assert isinstance(centered, torch.Tensor)
-    expected_positions = LSSO._center_positions(
-        positions,
-        mask,
-        dtype=torch.float32,
-        all_valid=False,
-    )
-    torch.testing.assert_close(centered, expected_positions)
     counts = captured["valid_counts"]
     assert isinstance(counts, torch.Tensor)
     torch.testing.assert_close(counts, mask.sum(dim=-1).to(dtype=torch.float32))
@@ -667,28 +612,12 @@ def test_cuda_dispatch_requires_fp32_projection_parameters(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_dispatch_rejects_position_gradients() -> None:
-    layer = LSSO(LSSOConfig(dim=32, num_heads=2, rank=16)).cuda()
-    x = torch.randn(1, 5, 32, device="cuda")
-    positions = torch.arange(
-        5,
-        device="cuda",
-        dtype=torch.float32,
-        requires_grad=True,
-    )
-    with pytest.raises(ValueError, match="does not support gradients"):
-        layer(x, position_ids=positions, implementation="cuda")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("length", (31, 32, 33, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513))
 def test_native_cuda_fast_mix_matches_reference_and_gradients(length: int) -> None:
     _require_native_cuda()
 
     torch.manual_seed(19)
     batch, heads, dim, rank = 1, 2, 32, 16
-    positions = torch.arange(length, device="cuda", dtype=torch.float32)
-    positions = positions - positions.mean()
     projected_seed = torch.randn(
         batch,
         length,
@@ -723,10 +652,12 @@ def test_native_cuda_fast_mix_matches_reference_and_gradients(length: int) -> No
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
     )
 
-    fast = cuda.fast_mix(*fast_inputs, positions)
+    fast = cuda.fast_mix(*fast_inputs)
     assert fast.dtype == torch.bfloat16
-    reference = _reference_fast_mix(*reference_inputs, positions)
+    reference = _reference_fast_mix(*reference_inputs)
 
+    # Native output gradients cross a BF16 boundary; give the oracle identical values.
+    upstream = upstream.to(fast.dtype)
     fast_gradients = torch.autograd.grad((fast * upstream).sum(), fast_inputs)
     reference_gradients = torch.autograd.grad(
         (reference * upstream).sum(),
@@ -901,8 +832,6 @@ def test_native_cuda_fast_mix_expanded_shapes_match_reference_and_gradients(
 
     torch.manual_seed(71 + batch + rank + head_dim)
     dim = heads * head_dim
-    positions = torch.arange(length, device="cuda", dtype=torch.float32)
-    positions = positions - positions.mean()
     projected_seed = torch.randn(
         batch,
         length,
@@ -936,8 +865,10 @@ def test_native_cuda_fast_mix_expanded_shapes_match_reference_and_gradients(
         value.detach().clone().requires_grad_()
         for value in (projected_seed, base_seed, drive_seed, eta_seed)
     )
-    fast = cuda.fast_mix(*fast_inputs, positions)
-    reference = _reference_fast_mix(*reference_inputs, positions)
+    fast = cuda.fast_mix(*fast_inputs)
+    reference = _reference_fast_mix(*reference_inputs)
+    # Native output gradients cross a BF16 boundary; give the oracle identical values.
+    upstream = upstream.to(fast.dtype)
     fast_gradients = torch.autograd.grad((fast * upstream).sum(), fast_inputs)
     reference_gradients = torch.autograd.grad(
         (reference * upstream).sum(), reference_inputs
@@ -988,18 +919,6 @@ def test_native_cuda_fast_mix_masked_generic_shapes_match_reference_and_gradient
             torch.zeros(length, device="cuda", dtype=torch.bool),
         )
     )
-    position_ids = torch.stack(
-        (
-            3 * torch.arange(length, device="cuda", dtype=torch.int64) + 7,
-            5 * torch.arange(length, device="cuda", dtype=torch.int64) + 101,
-        )
-    )
-    centered_positions = LSSO._center_positions(
-        position_ids,
-        mask,
-        dtype=torch.float32,
-        all_valid=False,
-    )
     valid_counts = mask.sum(dim=-1).to(dtype=torch.float32).clamp_min(1.0)
     projected_seed = torch.randn(
         batch,
@@ -1040,14 +959,14 @@ def test_native_cuda_fast_mix_masked_generic_shapes_match_reference_and_gradient
     )
     fast = cuda.fast_mix(
         *fast_inputs,
-        centered_positions,
         valid_counts,
     )
     reference = _reference_fast_mix(
         *reference_inputs,
-        centered_positions,
         valid_counts,
     )
+    # Native output gradients cross a BF16 boundary; give the oracle identical values.
+    upstream = upstream.to(fast.dtype)
     fast_gradients = torch.autograd.grad((fast * upstream).sum(), fast_inputs)
     reference_gradients = torch.autograd.grad(
         (reference * upstream).sum(), reference_inputs
@@ -1078,12 +997,6 @@ def test_native_cuda_full_lsso_masked_batch_matches_fp64_oracle() -> None:
         ],
         device="cuda",
     )
-    position_ids = torch.stack(
-        (
-            3 * torch.arange(35, device="cuda", dtype=torch.int64) + 7,
-            5 * torch.arange(35, device="cuda", dtype=torch.int64) + 101,
-        )
-    )
     fast_x = torch.randn(2, 35, config.dim, device="cuda", dtype=torch.float16)
     fast_x[~mask] = float("nan")
     fast_x.requires_grad_()
@@ -1098,13 +1011,13 @@ def test_native_cuda_full_lsso_masked_batch_matches_fp64_oracle() -> None:
     fast_output = fast_layer(
         fast_x,
         valid_mask=mask,
-        position_ids=position_ids,
+
         implementation="cuda",
     )
     reference_output = reference_layer(
         reference_x,
         valid_mask=mask,
-        position_ids=position_ids,
+
         implementation="reference",
     )
     fast_gradients = torch.autograd.grad(
@@ -1202,8 +1115,6 @@ def test_native_cuda_train_tape_and_inference_forward_match(
         dtype=torch.float32,
     ) * 0.1
     eta = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1
-    positions = torch.arange(length, device="cuda", dtype=torch.float32)
-    positions = positions - positions.mean()
 
     with torch.inference_mode():
         inference_output = torch.ops.lsso_equilibrium.forward_inference(
@@ -1211,14 +1122,12 @@ def test_native_cuda_train_tape_and_inference_forward_match(
             base,
             drive,
             eta,
-            positions,
         )
     train_output, tape, pivots = torch.ops.lsso_equilibrium.forward_train(
         projected,
         base,
         drive,
         eta,
-        positions,
     )
     torch.cuda.synchronize()
 
@@ -1327,7 +1236,6 @@ def test_native_cuda_full_lsso_matches_fp64_oracle(
     fast_layer = LSSO(config).cuda().eval()
     reference_layer = copy.deepcopy(fast_layer).double().eval()
     length = 33
-    position_ids = 3 * torch.arange(length, device="cuda", dtype=torch.int64) + 7
     x_seed = torch.randn(1, length, config.dim, device="cuda", dtype=torch.float16)
     upstream = torch.randn_like(x_seed)
     fast_x = x_seed.detach().clone().requires_grad_()
@@ -1340,12 +1248,12 @@ def test_native_cuda_full_lsso_matches_fp64_oracle(
 
     fast_output = fast_layer(
         fast_x,
-        position_ids=position_ids,
+
         implementation="cuda",
     )
     reference_output = reference_layer(
         reference_x,
-        position_ids=position_ids,
+
         implementation="reference",
     )
     fast_gradients = torch.autograd.grad(
@@ -1368,39 +1276,6 @@ def test_native_cuda_full_lsso_matches_fp64_oracle(
         reference_gradients,
     ):
         _assert_mixed_close(fast_gradient, reference_gradient, limit=3e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_float64_positions_preserve_relative_coordinates() -> None:
-    _require_native_cuda()
-
-    torch.manual_seed(113)
-    config = LSSOConfig(dim=32, num_heads=2, rank=16)
-    fast_layer = LSSO(config).cuda().eval()
-    reference_layer = copy.deepcopy(fast_layer).double().eval()
-    x = torch.randn(1, 9, config.dim, device="cuda")
-    x = x.to(torch.float16).detach().requires_grad_(x.requires_grad)
-    positions = torch.arange(9, device="cuda", dtype=torch.float64)
-    shifted_positions = positions + 1e12
-
-    fast_output = fast_layer(
-        x,
-        position_ids=shifted_positions,
-        implementation="cuda",
-    )
-    reference_output = reference_layer(
-        x.double(),
-        position_ids=shifted_positions,
-        implementation="reference",
-    )
-    unshifted_output = fast_layer(
-        x,
-        position_ids=positions,
-        implementation="cuda",
-    )
-
-    _assert_mixed_close(fast_output, reference_output, limit=5e-3)
-    torch.testing.assert_close(fast_output, unshifted_output, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1525,3 +1400,104 @@ def test_native_backward_requires_bf16_upstream() -> None:
     gradients = torch.ops.lsso_equilibrium.backward(torch.zeros_like(output), *arguments)
     for gradient in gradients:
         assert torch.count_nonzero(gradient) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize('shared', [False, True])
+def test_compact_correction_products_preserve_fp32_forward_and_vjp_under_amp(shared):
+    from lsso.ball.reference import _compact_matmul
+    torch.manual_seed(19)
+    shape = (2, 4, 4) if shared else (3, 2, 4, 4)
+    a = torch.randn(shape, device='cuda', requires_grad=True)
+    b = torch.randn(3, 2, 4, 5, device='cuda', requires_grad=True)
+    upstream = torch.randn_like(b)
+    oracle_a = a.detach().double().requires_grad_()
+    oracle_b = b.detach().double().requires_grad_()
+    expected = oracle_a @ oracle_b
+    expected_gradients = torch.autograd.grad((expected * upstream.double()).sum(), (oracle_a, oracle_b))
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.fp32_precision
+    try:
+        matmul.fp32_precision = 'tf32'
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            actual = _compact_matmul(a, b)
+        gradients = torch.autograd.grad((actual * upstream).sum(), (a, b))
+        assert actual.dtype == torch.float32
+        assert matmul.fp32_precision == 'tf32'
+        torch.testing.assert_close(actual.double(), expected, rtol=2e-6, atol=2e-6)
+        for gradient, oracle in zip(gradients, expected_gradients):
+            torch.testing.assert_close(gradient.double(), oracle, rtol=2e-6, atol=2e-6)
+    finally:
+        matmul.fp32_precision = previous
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize('static', [False, True])
+@pytest.mark.parametrize('scale', [0.0, 0.2])
+def test_core_correction_simplified_vjp_matches_fp64(static, scale):
+    from lsso.ball.reference import _FP32CoreCorrection
+    torch.manual_seed(61)
+    shape = (2, 4, 4) if static else (3, 2, 4, 4)
+    raw = torch.randn(shape, device='cuda') * scale
+    generator = accretive_generator(raw).detach().requires_grad_()
+    state = None if static else torch.randn(3, 2, 4, 5, device='cuda', requires_grad=True)
+    g64 = generator.detach().double().requires_grad_()
+    z64 = torch.eye(4, device='cuda', dtype=torch.float64) if static else state.detach().double().requires_grad_()
+    identity = torch.eye(4, device='cuda', dtype=torch.float64)
+    expected = torch.linalg.solve(identity + g64, (identity - g64) @ z64)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        actual = _FP32CoreCorrection.apply(generator, state)
+    upstream = torch.randn_like(actual)
+    arguments = (generator,) if static else (generator, state)
+    oracle_arguments = (g64,) if static else (g64, z64)
+    gradients = torch.autograd.grad((actual * upstream).sum(), arguments)
+    expected_gradients = torch.autograd.grad((expected * upstream.double()).sum(), oracle_arguments)
+    torch.testing.assert_close(actual.double(), expected, rtol=3e-6, atol=2e-6)
+    for gradient, oracle in zip(gradients, expected_gradients):
+        torch.testing.assert_close(gradient.double(), oracle, rtol=3e-6, atol=2e-6)
+    if scale == 0:
+        assert actual.count_nonzero() == 0
+        assert gradients[0].norm() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_static_correction_reuses_one_head_factorization_in_backward(monkeypatch):
+    from lsso.ball.reference import _FP32CoreCorrection
+    factor = torch.linalg.lu_factor_ex
+    calls = []
+    def observed(system, **kwargs):
+        calls.append(system.shape)
+        return factor(system, **kwargs)
+    monkeypatch.setattr(torch.linalg, 'lu_factor_ex', observed)
+    generator = torch.eye(4, device='cuda')[None].repeat(2, 1, 1).requires_grad_()
+    correction = _FP32CoreCorrection.apply(generator, None)
+    correction.sum().backward()
+    assert calls == [torch.Size([2, 4, 4])]
+    assert generator.grad.norm() > 0
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_all_core_modes_match_reference_without_rotation(mode: CoreMode, rank: int) -> None:
+    """Shared Static factors and solve-free Zero preserve outputs and VJPs."""
+    _require_native_cuda()
+    torch.manual_seed(913)
+    layer = LSSO(LSSOConfig(64, 2, rank=rank, core_mode=mode)).cuda()
+    with torch.no_grad():
+        if layer.core_base_raw is not None:
+            layer.core_base_raw.normal_(0, 0.12)
+        if layer.core_drive_weight is not None:
+            layer.core_drive_weight.normal_(0, 0.1)
+    oracle = copy.deepcopy(layer).double()
+    x = torch.randn(3, 73, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    xr = x.detach().double().requires_grad_()
+    mask = torch.rand(3, 73, device="cuda") > 0.2
+    mask[2] = False
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        actual = layer(x, valid_mask=mask, implementation="cuda")
+    expected = oracle(xr, valid_mask=mask, implementation="reference")
+    upstream = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad((actual * upstream).sum(), (x, *layer.parameters()))
+    oracle_grads = torch.autograd.grad((expected * upstream.double()).sum(), (xr, *oracle.parameters()))
+    _assert_mixed_close(actual, expected, limit=0.015)
+    for got, want in zip(actual_grads, oracle_grads):
+        _assert_mixed_close(got, want, limit=0.035)

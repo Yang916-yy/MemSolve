@@ -612,3 +612,53 @@ def test_biased_linear_fused_store_handles_strides_and_tails(dtype) -> None:
     expected_grad = torch.autograd.grad(expected, inputs, upstream)
     for actual, reference in zip(actual_grad, expected_grad):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('static', [False, True])
+@pytest.mark.parametrize('scale', [0.0, 1e-6, 0.3])
+def test_base_correction_matches_resolvent_forward_and_all_gradients(static, scale):
+    torch.manual_seed(619)
+    dtype = torch.float64
+    frame = qr_soft_frame(torch.randn(3, 2, 9, 4, dtype=dtype)).detach().requires_grad_()
+    content = torch.randn(3, 2, 9, 5, dtype=dtype, requires_grad=True)
+    # Treat Z independently to check every argument's derivative.
+    state = torch.randn(3, 2, 4, 5, dtype=dtype, requires_grad=True)
+    raw = (scale * torch.randn((2, 4, 4) if static else (3, 2, 4, 4), dtype=dtype)).requires_grad_()
+    generator = accretive_generator(raw)
+    eta = torch.tensor([0.9, -0.2], dtype=dtype, requires_grad=True)
+    actual = accretive_equilibrium_mix(frame, generator, state, content, eta)
+    expanded = generator[None].expand(3, -1, -1, -1) if static else generator
+    equilibrium = torch.linalg.solve(torch.eye(4, dtype=dtype) + expanded, state)
+    e = eta[None, :, None, None]
+    expected = e * content + frame @ (2 * equilibrium - (1 + e) * state)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    upstream = torch.randn_like(actual)
+    variables = (frame, state, content, raw, eta)
+    actual_grads = torch.autograd.grad((actual * upstream).sum(), variables, retain_graph=True)
+    expected_grads = torch.autograd.grad((expected * upstream).sum(), variables)
+    for a, b in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(a, b, rtol=1e-11, atol=1e-11)
+    if scale == 0:
+        assert actual_grads[3].norm() > 0  # zero correction must not mean zero core gradient
+
+
+def test_static_core_solve_is_shared_and_not_cached_across_updates(monkeypatch):
+    calls = []
+    solve = torch.linalg.solve
+    def observed(system, rhs):
+        calls.append((system.shape, rhs.shape))
+        return solve(system, rhs)
+    monkeypatch.setattr(torch.linalg, 'solve', observed)
+    torch.manual_seed(19)
+    frame = qr_soft_frame(torch.randn(7, 2, 9, 4, dtype=torch.float64))
+    content = torch.randn(7, 2, 9, 5, dtype=torch.float64)
+    state = frame.mT @ content
+    raw = torch.zeros(2, 4, 4, dtype=torch.float64, requires_grad=True)
+    eta = torch.full((2,), .9, dtype=torch.float64)
+    first = accretive_equilibrium_mix(frame, accretive_generator(raw), state, content, eta)
+    gradient, = torch.autograd.grad(first.square().sum(), raw)
+    with torch.no_grad():
+        raw.add_(gradient, alpha=-.01)
+    second = accretive_equilibrium_mix(frame, accretive_generator(raw), state, content, eta)
+    assert calls == [(torch.Size([2, 4, 4]), torch.Size([2, 4, 4]))] * 2
+    assert not torch.allclose(first, second)

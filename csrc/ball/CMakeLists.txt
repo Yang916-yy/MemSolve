@@ -1,10 +1,10 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.25)
 
 project(lsso_equilibrium_cuda LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -34,7 +34,7 @@ string(REGEX REPLACE "^([0-9]+)([0-9])$" "\\1.\\2" _lsso_torch_cuda_arch "${LSSO
 set(ENV{TORCH_CUDA_ARCH_LIST} "${_lsso_torch_cuda_arch}")
 
 if(NOT DEFINED CUDAToolkit_ROOT)
-    message(FATAL_ERROR "Set CUDAToolkit_ROOT to the CUDA 12.8 toolkit root.")
+    message(FATAL_ERROR "Set CUDAToolkit_ROOT to the CUDA 13.2 toolkit root.")
 endif()
 
 file(REAL_PATH "${CUDAToolkit_ROOT}" _lsso_cuda_toolkit_root)
@@ -49,26 +49,26 @@ if(NOT _lsso_cuda_compiler_root STREQUAL _lsso_cuda_toolkit_root)
     )
 endif()
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8 OR CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.2 OR CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.3)
     message(FATAL_ERROR
-        "LSSO CUDA builds require CUDA 12.8 exactly; found "
+        "LSSO CUDA builds require CUDA 13.2 exactly; found "
         "${CMAKE_CUDA_COMPILER_VERSION}."
     )
 endif()
 
-find_package(CUDAToolkit 12.8 EXACT REQUIRED)
-set(CUDA_TOOLKIT_ROOT_DIR ${_lsso_cuda_toolkit_root} CACHE PATH CUDA_12_8_root FORCE)
-set(CUDA_NVCC_EXECUTABLE ${CMAKE_CUDA_COMPILER} CACHE FILEPATH CUDA_12_8_nvcc FORCE)
+find_package(CUDAToolkit 13.2 EXACT REQUIRED)
+set(CUDA_TOOLKIT_ROOT_DIR ${_lsso_cuda_toolkit_root} CACHE PATH CUDA_13_2_root FORCE)
+set(CUDA_NVCC_EXECUTABLE ${CMAKE_CUDA_COMPILER} CACHE FILEPATH CUDA_13_2_nvcc FORCE)
 # PyTorch configures its own CUDA flags from TORCH_CUDA_ARCH_LIST above. The
 # target-level CUDA_ARCHITECTURES property below remains the source of truth.
 unset(CMAKE_CUDA_ARCHITECTURES CACHE)
 unset(CMAKE_CUDA_ARCHITECTURES)
 find_package(Torch REQUIRED CONFIG)
-find_package(mathdx 25.12.1 EXACT REQUIRED CONFIG COMPONENTS cublasdx cusolverdx)
+find_package(mathdx 26.06.1 EXACT REQUIRED CONFIG COMPONENTS cublasdx cusolverdx)
 
 if(NOT TARGET mathdx::cusolverdx_fatbin)
     message(FATAL_ERROR
-        "MathDx cuSolverDx fatbin support requires CUDA 12.8 and was not found."
+        "MathDx cuSolverDx fatbin support requires CUDA 13.2 and was not found."
     )
 endif()
 

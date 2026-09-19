@@ -82,7 +82,6 @@ class LSSODeiT3Backbone(LSSODeiT3):
         rank: int | None = None,
         out_indices: Sequence[int] | None = None,
         core_mode: CoreMode | str = CoreMode.DYNAMIC,
-        rank_rotary: bool = True,
         bias: bool = True,
         implementation: str = "cuda",
         checkpoint: str | Path | None = None,
@@ -115,7 +114,6 @@ class LSSODeiT3Backbone(LSSODeiT3):
         }
         self._pretrained_operator_contract = {
             "core_mode": resolved_mode.value,
-            "rank_rotary": rank_rotary,
             "bias": bias,
             "implementation": implementation,
         }
@@ -129,7 +127,6 @@ class LSSODeiT3Backbone(LSSODeiT3):
             rank=resolved_rank,
             mlp_ratio=4.0,
             core_mode=resolved_mode,
-            rank_rotary=rank_rotary,
             bias=bias,
             implementation=implementation,
             drop_path_rate=spec.drop_path_rate,
@@ -255,7 +252,6 @@ class LSSODeiT3Backbone(LSSODeiT3):
         patch_mask: torch.Tensor,
         *,
         needs_mask: bool,
-        rank_rotary: bool,
     ) -> VisionTokenLayout:
         batch = patch_mask.shape[0]
         flat_mask = patch_mask.flatten(1)
@@ -266,21 +262,7 @@ class LSSODeiT3Backbone(LSSODeiT3):
             ),
             dim=1,
         )
-        if rank_rotary:
-            order = flat_mask.to(dtype=torch.float32).cumsum(dim=1) - 1.0
-            count = flat_mask.sum(dim=1, keepdim=True).to(dtype=torch.float32)
-            positions = order - 0.5 * (count - 1.0)
-            positions = torch.where(flat_mask, positions, torch.zeros_like(positions))
-            position_ids: torch.Tensor | None = torch.cat(
-                (
-                    torch.zeros(batch, 1, dtype=torch.float32, device=patch_mask.device),
-                    positions,
-                ),
-                dim=1,
-            )
-        else:
-            position_ids = None
-        return VisionTokenLayout(token_mask if needs_mask else None, position_ids)
+        return VisionTokenLayout(token_mask if needs_mask else None)
 
     @staticmethod
     def _scale_mask(mask: torch.Tensor, index: int) -> torch.Tensor:
@@ -316,17 +298,14 @@ class LSSODeiT3Backbone(LSSODeiT3):
         if valid_mask is not None:
             pixel_mask = valid_mask.to(device=x.device)
             safe_x = torch.where(pixel_mask[:, None], x, torch.zeros_like(x))
-        rank_rotary = self.encoder.blocks[0].attn.mixer.config.rank_rotary
         layout = self._token_layout(
             patch_mask,
             needs_mask=valid_mask is not None,
-            rank_rotary=rank_rotary,
         )
         maps = self.forward_intermediates(
             safe_x,
             indices=self.out_indices,
             valid_mask=layout.valid_mask,
-            position_ids=layout.position_ids,
             norm=False,
         )
         operations = (self.fpn1, self.fpn2, self.fpn3, self.fpn4)

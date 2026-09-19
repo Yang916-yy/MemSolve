@@ -1,21 +1,12 @@
 # Core Contract
 
-The operator accepts x[B,N,D], an optional boolean valid_mask[B,N], and
-optional position_ids[N] or position_ids[B,N]. It returns y[B,N,D]. Batch size
+The operator accepts x[B,N,D] and an optional boolean valid_mask[B,N]. It returns y[B,N,D]. Batch size
 B and sequence length N must be positive. The reference accepts `float16`,
 `bfloat16`, `float32`, and `float64`; the native CUDA implementation accepts
 only `float16` and `bfloat16` public inputs. Outputs match the input dtype. A
 sequence may be entirely masked; its output is zero.
 
-With Rank-Rotary enabled, position IDs must use an integer dtype, `float32`,
-or `float64`. Integer coordinates are differenced before conversion to the
-calculation dtype. `float64` coordinates are centered in FP64 before the
-relative coordinates are converted to the calculation dtype; `float32`
-coordinates use the calculation dtype directly. `float16` and `bfloat16`
-position IDs are rejected because their coordinate precision can be lost before
-the relative phase is formed.
-
-For each head, let A be the relation coordinates after optional Rank-Rotary and
+For each head, let A be the relation coordinates after
 normalization by sqrt(n_valid), and let C be the masked content coordinates.
 The QR soft frame and shared compact state are
 
@@ -61,10 +52,35 @@ Equivalently, M = 2 (I + K)^-1 - I and
 Y = eta C + P (M - eta I) P^T C.
 ~~~
 
+The reference computes this as a Zero base plus a learned correction:
+
+~~~
+Delta = solve(I + K, (I - K) Z)
+Y = eta (C - P Z) + P Delta.
+~~~
+
+The identity `solve(I + K, I - K) = 2 (I + K)^-1 - I` proves
+equivalence. The final readout combines the two frame products as
+`eta C + P (Delta - eta Z)` so it does not materialize two token-sized
+products. ZERO has `Delta = 0` (equivalently `K = I`, not `K = 0`).
+For STATIC, compute `M = solve(I + K, I - K)` once per head and apply
+`Delta = M Z` across the batch. The solve remains in the autograd graph;
+there is no detached or cross-forward cache. Dynamic correction RHS products,
+static correction products and their VJPs use IEEE FP32 on CUDA, while FP64
+diagnostics retain ordinary differentiable FP64 operations. For incoming
+correction gradient `G`, the CUDA reference uses the equivalent VJP
+`V = solve((I + K)^T, G)`, `dZ = 2 V - G`, and
+`dK = -V (Delta + Z)^T`, avoiding redundant differentiation through both
+occurrences of K. The backward solve reuses the forward LU factors.
+Static broadcasts its shared correction matrix over the batch; its matrix
+gradient accumulates contributions from all samples. This algebraic rewrite preserves the operator; removal of rotation changes
+the checkpoint contract. Native CUDA retains its equivalent
+fused equilibrium/tape form and is checked against this reference.
+
 At R = 0, L = I, Omega = 0, U = Z / 2, and M = 0. DYNAMIC and STATIC both
 start at this compact point; DYNAMIC additionally starts with W_drive = 0.
-The direct solve preserves the nonzero initialization gradient without a
-zero-value correction branch.
+The correction is zero at initialization but has a nonzero core derivative;
+the implementation does not skip or detach it when its value is zero.
 
 In exact arithmetic, the QR frame, accretive generator, and eta
 parameterization make the frozen token mixer contractive. The fixed one-ULP
@@ -75,24 +91,23 @@ logistic identities, so its tail gradient remains nonzero when a direct FP32
 inactive branch. Like every finite-precision exponential, this does not claim
 meaningful tail gradients for astronomically extreme raw coordinates.
 
-Rank-Rotary acts only on rank-space relation phases. It is an internal spectral
-coordinate choice, not an absolute token-position representation.
+The operator contains no feature rotation or position-coordinate interface.
+External absolute or spatial position embeddings belong to the surrounding model.
 
 The frame, compact-state storage, accretive factor Gram `F F^T`, and solve
 calculations use FP32 unless the input is FP64. CUDA evaluates the factor Gram
 with IEEE FP32 FMA; its small size makes avoiding a second factor quantization
 worthwhile. Ordinary projections and eligible compact contractions use BF16
 multiplicands with FP32 accumulation. Packed activations and the pre-output
-boundary use BF16. Rank-Rotary stores bounded sin/cos in FP16 after FP32
-trigonometry, then rotates in FP32. Sensitive eta and solve state stay FP32.
+boundary use BF16. Sensitive eta and solve state stay FP32.
 FP16 and BF16 public inputs are accepted by CUDA; the result matches the input
 dtype. FP32/FP64 inputs remain available on the reference path. Invalid tokens
 are zeroed before every compact statistic.
 
 ## Serialized and numerical boundaries
 
-The current model `_extra_state` contract is version **12**. This is separate
-from native CUDA ABI **8** and the ImageNet runner envelope format **5**.
+The current model `_extra_state` contract is version **13**. This is separate
+from native CUDA ABI **9** and the ImageNet runner envelope format **5**.
 Loading requires every saved operator-contract field to match, including model
 geometry and ablations. Missing or mismatched contracts fail even under
 `strict=False`; older weights need explicit validation before migration.
@@ -106,3 +121,11 @@ bitwise-identical training. See [CUDA implementation details](CUDA_CONTRACT.md).
 The contraction statement freezes the input-conditioned frame and generator.
 It does not bound the complete input Jacobian, which also differentiates those
 quantities. Implementation benchmarks do not establish downstream accuracy.
+
+## Explicit reference ablations
+
+`skew_coupling=False` sets Omega to zero in K = L L^T + Omega while
+retaining the accretive factor. `scalar_complement=False` fixes eta to zero
+with no learned complement update. Both flags are recorded in the model
+checkpoint contract and require `implementation="reference"`. The native
+default continues to require both flags enabled.

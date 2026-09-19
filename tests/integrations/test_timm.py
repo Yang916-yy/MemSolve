@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 is supported by the package.
+    import tomli as tomllib
 from pathlib import Path
 
 import pytest
@@ -59,35 +62,20 @@ def test_timm_factory_rejects_empty_depth_before_framework_import() -> None:
             rank=4,
             mlp_ratio=2.0,
             core_mode=CoreMode.DYNAMIC,
-            rank_rotary=True,
+
             bias=True,
         )
 
 
-def test_timm_adapter_keeps_cls_rank_phase_at_zero() -> None:
-    positions = _TimmLSSOMixer._vision_position_ids(5, torch.device("cpu"))
-    expected = torch.tensor([0.0, -1.5, -0.5, 0.5, 1.5])
-    torch.testing.assert_close(positions, expected)
-    centered = LSSO._center_positions(
-        positions,
-        torch.ones(2, 5, dtype=torch.bool),
-        dtype=torch.float32,
-        all_valid=True,
-    )
-    torch.testing.assert_close(centered, expected.expand(2, -1))
-
-
-@pytest.mark.parametrize("rank_rotary", [False, True])
 def test_timm_adapter_forwards_the_requested_implementation(
     monkeypatch: pytest.MonkeyPatch,
-    rank_rotary: bool,
 ) -> None:
     adapter = _TimmLSSOMixer(
         16,
         2,
         rank=4,
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=rank_rotary,
+
         implementation="cuda",
         qkv_bias=True,
         qk_norm=False,
@@ -102,12 +90,10 @@ def test_timm_adapter_forwards_the_requested_implementation(
     def fake_forward(
         x: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
         *,
         implementation: str,
     ) -> torch.Tensor:
         captured["valid_mask"] = valid_mask
-        captured["position_ids"] = position_ids
         captured["implementation"] = implementation
         return x
 
@@ -116,12 +102,6 @@ def test_timm_adapter_forwards_the_requested_implementation(
     torch.testing.assert_close(adapter(x), x)
     assert captured["valid_mask"] is None
     assert captured["implementation"] == "cuda"
-    positions = captured["position_ids"]
-    if rank_rotary:
-        assert isinstance(positions, torch.Tensor)
-        assert positions.shape == (5,)
-    else:
-        assert positions is None
 
 
 def test_timm_factory_rejects_unknown_implementation_before_framework_import() -> None:
@@ -136,7 +116,7 @@ def test_timm_factory_rejects_unknown_implementation_before_framework_import() -
             rank=4,
             mlp_ratio=2.0,
             core_mode=CoreMode.DYNAMIC,
-            rank_rotary=True,
+
             bias=True,
             implementation="automatic",
         )
@@ -148,7 +128,7 @@ def test_timm_cuda_adapter_does_not_fall_back_to_reference() -> None:
         2,
         rank=16,
         core_mode=CoreMode.DYNAMIC,
-        rank_rotary=True,
+
         implementation="cuda",
         qkv_bias=False,
         qk_norm=False,
@@ -182,7 +162,6 @@ def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
         "rank": 16,
         "mlp_ratio": 2.0,
         "core_mode": CoreMode.DYNAMIC,
-        "rank_rotary": True,
         "bias": True,
         "drop_path_rate": 0.0,
     }
@@ -195,8 +174,9 @@ def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
 
     fast_x = torch.randn(2, 3, 32, 32, device="cuda", requires_grad=True)
     reference_x = fast_x.detach().clone().requires_grad_()
-    fast_output = fast(fast_x)
-    reference_output = reference(reference_x)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        fast_output = fast(fast_x)
+        reference_output = reference(reference_x)
     upstream = torch.randn_like(fast_output)
     fast_gradients = torch.autograd.grad(
         (fast_output * upstream).sum(),

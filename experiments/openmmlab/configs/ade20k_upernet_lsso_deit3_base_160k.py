@@ -15,7 +15,6 @@ model = dict(
         out_indices=(3, 5, 7, 11),
         implementation="cuda",
         core_mode="dynamic",
-        rank_rotary=True,
     ),
     decode_head=dict(in_channels=[768, 768, 768, 768], channels=512),
     auxiliary_head=dict(in_channels=768),

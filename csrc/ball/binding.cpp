@@ -7,7 +7,7 @@
 namespace lsso_equilibrium {
 namespace {
 
-constexpr int64_t kNativeContractVersion = 8;
+constexpr int64_t kNativeContractVersion = 9;
 
 bool requires_grad(const c10::optional<at::Tensor>& value) {
     return value.has_value() && value->requires_grad();
@@ -18,12 +18,11 @@ at::Tensor forward_inference_autograd(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts) {
     const bool input_requires_grad =
         projected.requires_grad() || core_base_raw.requires_grad() ||
         core_drive_weight.requires_grad() || eta_raw.requires_grad() ||
-        requires_grad(centered_positions) || requires_grad(valid_counts);
+        requires_grad(valid_counts);
     TORCH_CHECK(
         !at::GradMode::is_enabled() || !input_requires_grad,
         "lsso_equilibrium::forward_inference is an inference-only entry point "
@@ -36,7 +35,6 @@ at::Tensor forward_inference_autograd(
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts
     );
 }
@@ -46,12 +44,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_autograd(
     const at::Tensor& core_base_raw,
     const at::Tensor& core_drive_weight,
     const at::Tensor& eta_raw,
-    const c10::optional<at::Tensor>& centered_positions,
     const c10::optional<at::Tensor>& valid_counts) {
     const bool input_requires_grad =
         projected.requires_grad() || core_base_raw.requires_grad() ||
         core_drive_weight.requires_grad() || eta_raw.requires_grad() ||
-        requires_grad(centered_positions) || requires_grad(valid_counts);
+        requires_grad(valid_counts);
     TORCH_CHECK(
         !at::GradMode::is_enabled() || !input_requires_grad,
         "lsso_equilibrium::forward_train is a private tape-producing entry point "
@@ -64,7 +61,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_train_autograd(
         core_base_raw,
         core_drive_weight,
         eta_raw,
-        centered_positions,
         valid_counts
     );
 }
@@ -83,15 +79,15 @@ TORCH_LIBRARY(lsso_equilibrium, module) {
     );
     module.def(
         "forward_inference(Tensor projected, Tensor core_base_raw, Tensor core_drive_weight, "
-        "Tensor eta_raw, Tensor? centered_positions=None, Tensor? valid_counts=None) -> Tensor");
+        "Tensor eta_raw, Tensor? valid_counts=None) -> Tensor");
     module.def(
         "forward_train(Tensor projected, Tensor core_base_raw, Tensor core_drive_weight, "
-        "Tensor eta_raw, Tensor? centered_positions=None, Tensor? valid_counts=None) "
+        "Tensor eta_raw, Tensor? valid_counts=None) "
         "-> (Tensor, Tensor, Tensor)");
     module.def(
         "backward(Tensor grad_output, Tensor projected, Tensor core_base_raw, "
         "Tensor core_drive_weight, Tensor eta_raw, Tensor tape, Tensor pivots, "
-        "Tensor? centered_positions=None, Tensor? valid_counts=None) "
+        "Tensor? valid_counts=None) "
         "-> (Tensor, Tensor, Tensor, Tensor)");
 }
 

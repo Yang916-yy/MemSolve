@@ -18,10 +18,10 @@ and nn.Module behavior. Framework adapters may not implement operator math.
 
 | Owner | Responsibility |
 | --- | --- |
-| `lsso/ball/config.py` | Public geometry, DYNAMIC/STATIC/ZERO and Rank-Rotary validation |
+| `lsso/ball/config.py` | Public geometry, DYNAMIC/STATIC/ZERO validation |
 | `lsso/ball/reference.py` | Canonical math, FP64 oracle, mixed-precision projections and their VJPs; lazy Triton biased GEMM |
-| `lsso/ball/model.py` | Parameters, masks/positions, model checkpoint contract 12 |
-| `lsso/ball/cuda.py` | Strict native loading, ABI 8 validation and autograd adapter |
+| `lsso/ball/model.py` | Parameters, validity masks, model checkpoint contract 13 |
+| `lsso/ball/cuda.py` | Strict native loading, ABI 9 validation and autograd adapter |
 | `csrc/ball/` | Precompiled per-SM MathDx mixer and native forward/backward storage |
 | `integrations/timm.py` | Shared DeiT III encoder |
 | `integrations/openmmlab.py` | Dense-task framework registration, feature maps and padded-image plumbing |

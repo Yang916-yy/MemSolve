@@ -14,14 +14,15 @@ class CoreMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class LSSOConfig:
-    """Configuration for the one LSSO operator and its two ablations."""
+    """Configuration for the one LSSO operator and its explicit ablations."""
 
     dim: int
     num_heads: int
     rank: int = 16
     core_mode: CoreMode = CoreMode.DYNAMIC
-    rank_rotary: bool = True
     bias: bool = False
+    skew_coupling: bool = True
+    scalar_complement: bool = True
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -43,22 +44,18 @@ class LSSOConfig:
             ) from error
         object.__setattr__(self, "core_mode", core_mode)
 
-        if not isinstance(self.rank_rotary, bool):
-            raise TypeError(
-                f"rank_rotary must be a bool, got {type(self.rank_rotary).__name__}"
-            )
         if not isinstance(self.bias, bool):
             raise TypeError(f"bias must be a bool, got {type(self.bias).__name__}")
+
+        for name in ("skew_coupling", "scalar_complement"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
 
         if self.dim <= 0 or self.num_heads <= 0 or self.rank <= 0:
             raise ValueError("dim, num_heads, and rank must be positive")
         if self.dim % self.num_heads:
             raise ValueError(
                 f"dim={self.dim} must be divisible by num_heads={self.num_heads}"
-            )
-        if self.rank_rotary and self.rank % 2:
-            raise ValueError(
-                f"Rank-Rotary requires an even rank, got rank={self.rank}"
             )
 
     @property

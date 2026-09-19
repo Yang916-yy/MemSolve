@@ -18,7 +18,10 @@ import random
 import subprocess
 import sys
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 is supported by the package.
+    import tomli as tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -125,6 +128,7 @@ DEFAULT_SPLIT_SEED = 2026
 FROZEN_DNA_MIXERS = frozenset({"nystromformer", "rebased"})
 MixerName = Literal[
     "mha",
+    "mha_rope",
     "lsso",
     "linear_transformer",
     "performer",
@@ -137,8 +141,11 @@ MixerName = Literal[
 class MaskedMultiheadAttention(nn.Module):
     """Bidirectional MHA baseline with the same valid-token contract as LSSO."""
 
-    def __init__(self, dim: int, num_heads: int, *, bias: bool) -> None:
+    def __init__(self, dim: int, num_heads: int, *, bias: bool, rope: bool = False) -> None:
         super().__init__()
+        self.rope = rope
+        if rope and (dim // num_heads) % 2:
+            raise ValueError("RoPE requires even head dimension")
         self.attention = nn.MultiheadAttention(
             dim,
             num_heads,
@@ -155,15 +162,45 @@ class MaskedMultiheadAttention(nn.Module):
         if bool(nonempty.any()):
             active_x = x[nonempty]
             active_mask = valid_mask[nonempty]
-            active, _weights = self.attention(
-                active_x,
-                active_x,
-                active_x,
-                key_padding_mask=~active_mask,
-                need_weights=False,
-            )
+            if self.rope:
+                active = self._rotary_attention(active_x, active_mask)
+            else:
+                active, _weights = self.attention(
+                    active_x,
+                    active_x,
+                    active_x,
+                    key_padding_mask=~active_mask,
+                    need_weights=False,
+                )
             result[nonempty] = active.to(dtype=result.dtype)
         return torch.where(valid_mask[:, :, None], result, torch.zeros_like(result))
+
+    def _rotary_attention(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """RoFormer adjacent-pair Q/K rotation, base 10000; V is unchanged.
+
+        See https://github.com/ZhuiyiTechnology/roformer . The existing MHA
+        projections preserve the baseline's parameter names and initialization.
+        Learned absolute embeddings remain in the shared encoder.
+        """
+        batch, length, dim = x.shape
+        heads = self.attention.num_heads
+        width = dim // heads
+        qkv = F.linear(x, self.attention.in_proj_weight, self.attention.in_proj_bias)
+        q, k, v = (t.reshape(batch, length, heads, width).transpose(1, 2)
+                   for t in qkv.chunk(3, dim=-1))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+            frequency = 10000.0 ** (-torch.arange(0, width, 2, device=x.device, dtype=dtype) / width)
+            angles = torch.arange(length, device=x.device, dtype=dtype)[:, None] * frequency
+            cosine, sine = angles.cos(), angles.sin()
+            def rotate(t: torch.Tensor) -> torch.Tensor:
+                even, odd = t.to(dtype)[..., 0::2], t.to(dtype)[..., 1::2]
+                return torch.stack((even*cosine - odd*sine, even*sine + odd*cosine), dim=-1).flatten(-2).to(t.dtype)
+            q, k = rotate(q), rotate(k)
+        attended = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=valid_mask[:, None, None, :], dropout_p=0.0,
+        )
+        return self.attention.out_proj(attended.transpose(1, 2).reshape(batch, length, dim))
 
 
 def _orthogonal_random_matrix(rows: int, columns: int) -> torch.Tensor:
@@ -487,11 +524,12 @@ class SequenceBlock(nn.Module):
         rank: int,
         mixer: MixerName,
         core_mode: CoreMode,
-        rank_rotary: bool,
         implementation: Literal["reference", "cuda"],
         mlp_ratio: float,
         dropout: float,
         bias: bool,
+        skew_coupling: bool = True,
+        scalar_complement: bool = True,
     ) -> None:
         super().__init__()
         self.mixer_kind = mixer
@@ -504,12 +542,13 @@ class SequenceBlock(nn.Module):
                     num_heads=num_heads,
                     rank=rank,
                     core_mode=core_mode,
-                    rank_rotary=rank_rotary,
                     bias=bias,
+                    skew_coupling=skew_coupling,
+                    scalar_complement=scalar_complement,
                 )
             )
-        elif mixer == "mha":
-            self.mixer = MaskedMultiheadAttention(dim, num_heads, bias=bias)
+        elif mixer in ("mha", "mha_rope"):
+            self.mixer = MaskedMultiheadAttention(dim, num_heads, bias=bias, rope=mixer == "mha_rope")
         elif mixer == "performer":
             self.mixer = MaskedPerformerAttention(dim, num_heads, bias=bias)
         elif mixer == "linear_transformer":
@@ -558,9 +597,8 @@ class SequenceBlock(nn.Module):
 class SequenceEncoder(nn.Module):
     """Learned absolute coordinate features plus current mixer blocks.
 
-    Rank-Rotary remains an internal rank-space coordinate choice.  The learned
-    position embedding is deliberately shared by MHA and LSSO and is the model
-    level absolute-position signal.
+    Learned position embeddings are shared by MHA and LSSO. LSSO itself
+    has no position-dependent feature rotation.
     """
 
     def __init__(
@@ -576,12 +614,13 @@ class SequenceEncoder(nn.Module):
         rank: int,
         mixer: MixerName,
         core_mode: CoreMode,
-        rank_rotary: bool,
         implementation: Literal["reference", "cuda"],
         mlp_ratio: float,
         dropout: float,
         bias: bool,
         grid_shape: tuple[int, int] | None = None,
+        skew_coupling: bool = True,
+        scalar_complement: bool = True,
     ) -> None:
         super().__init__()
         if max_length <= 0:
@@ -625,7 +664,8 @@ class SequenceEncoder(nn.Module):
                 rank=rank,
                 mixer=mixer,
                 core_mode=core_mode,
-                rank_rotary=rank_rotary,
+                skew_coupling=skew_coupling,
+                scalar_complement=scalar_complement,
                 implementation=implementation,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
@@ -777,6 +817,7 @@ class TrainingConfig:
     amp: bool
     # A non-formal diagnostic cap. The scheduler horizon remains ``epochs``.
     pilot_epochs: int = 0
+    pacing_file: Path | None = None
 
 
 _SEQUENCE_CHECKPOINT_FORMAT = 2
@@ -844,6 +885,7 @@ def _make_parser() -> argparse.ArgumentParser:
         "--mixer",
         choices=(
             "mha",
+            "mha_rope",
             "lsso",
             "linear_transformer",
             "performer",
@@ -855,7 +897,8 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--implementation", choices=("reference", "cuda"), default="cuda")
     parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="dynamic")
-    parser.add_argument("--rank-rotary", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--skew-coupling", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--scalar-complement", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rank", type=int)
     parser.add_argument("--dim", type=int)
     parser.add_argument("--depth", type=int)
@@ -880,6 +923,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-stop-accuracy-delta", type=float, default=0.0)
     parser.add_argument("--early-stop-loss-relative-delta", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pacing-file", type=Path, help="Runtime JSON with delay_seconds/pause for cooperative scheduling.")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--eval-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -1038,8 +1082,6 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive")
     if args.dim % args.heads:
         raise ValueError("dim must be divisible by heads")
-    if args.rank_rotary and args.rank % 2:
-        raise ValueError("rank must be even when Rank-Rotary is enabled")
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("dropout must be in [0, 1)")
     if args.mlp_ratio <= 0.0:
@@ -1072,8 +1114,8 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
     if not 0.0 <= args.early_stop_loss_relative_delta < 1.0:
         raise ValueError("early_stop_loss_relative_delta must be in [0, 1)")
     if args.implementation == "cuda" and args.mixer == "lsso":
-        if args.core_mode != CoreMode.DYNAMIC.value or not args.rank_rotary:
-            raise ValueError("CUDA requires DYNAMIC + Rank-Rotary LSSO")
+        if not args.skew_coupling or not args.scalar_complement:
+            raise ValueError("CUDA requires skew_coupling and scalar_complement; structural ablations use reference")
         if args.rank not in (16, 32, 48, 64):
             raise ValueError("CUDA supports LSSO rank in {16, 32, 48, 64}")
 
@@ -1134,12 +1176,13 @@ def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
         rank=args.rank,
         mixer=args.mixer,
         core_mode=CoreMode(args.core_mode),
-        rank_rotary=args.rank_rotary,
         implementation=implementation,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         bias=args.bias,
         grid_shape=grid_shape,
+        skew_coupling=args.skew_coupling,
+        scalar_complement=args.scalar_complement,
     )
     if bundle.paired:
         if args.pooling != "mean":
@@ -1387,10 +1430,6 @@ def _build_run_payload(
     inactive_data_arguments = _inactive_data_argument_names(args)
     if args.suite == "lra" and args.task == "pathfinder":
         position_encoding = "factorized-grid-absolute"
-        if args.mixer == "lsso" and args.rank_rotary:
-            position_encoding += "-plus-flat-rank-rotary"
-    elif args.mixer == "lsso" and args.rank_rotary:
-        position_encoding = "learned-absolute-plus-rank-rotary"
     else:
         position_encoding = "learned-absolute"
     return {
@@ -1421,13 +1460,15 @@ def _build_run_payload(
             "dropout": args.dropout,
             "bias": args.bias,
             "core_mode": args.core_mode,
-            "rank_rotary": args.rank_rotary,
+            "skew_coupling": args.skew_coupling,
+            "scalar_complement": args.scalar_complement,
             "pooling": args.pooling,
             "implementation": (
                 args.implementation
                 if args.mixer == "lsso"
                 else {
                     "mha": "torch-sdpa",
+                    "mha_rope": "torch-sdpa-roformer-qk-adjacent-pairs-base10000",
                     "linear_transformer": "linear-transformer-elu-plus-one-adapted-fp32-core",
                     "performer": "performer-pytorch-1.1.4-adapted-fp32-core",
                     "nystromformer": "nystrom-attention-0.0.14-adapted-no-conv",
@@ -1436,6 +1477,8 @@ def _build_run_payload(
                 }[args.mixer]
             ),
             "position_encoding": position_encoding,
+            **({"attention_rotation": "rope-qk", "rope_base": 10000.0,
+                "rope_dimensions": args.dim // args.heads} if args.mixer == "mha_rope" else {}),
             "position_initialization": "normal-0.02"
             if not (args.suite == "lra" and args.task == "pathfinder")
             else "factorized-normal-0.02",
@@ -1577,6 +1620,28 @@ def train(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_examples = 0
+                if config.pacing_file is not None:
+                    torch.cuda.synchronize(device) if device.type == "cuda" else None
+                    while True:
+                        pacing = json.loads(config.pacing_file.read_text())
+                        delay = float(pacing.get("delay_seconds", 0.0))
+                        if not math.isfinite(delay) or delay < 0:
+                            raise ValueError("pacing delay_seconds must be finite and nonnegative")
+                        if not pacing.get("pause", False):
+                            if delay:
+                                time.sleep(delay)
+                            break
+                        time.sleep(1.0)
+            if batch_index % 25 == 0:
+                progress = {"state": "training", "epoch": epoch + 1,
+                            "step": batch_index + 1, "steps_per_epoch": batches_per_epoch,
+                            "elapsed_seconds": time.perf_counter() - started,
+                            "updated": time.time()}
+                temp = output / "status.tmp"
+                temp.write_text(json.dumps(progress))
+                temp.replace(output / "status.json")
+        (output / "status.json").write_text(json.dumps(
+            {"state": "validation", "epoch": epoch + 1, "updated": time.time()}))
         validation = evaluate(
             model,
             validation_loader,
@@ -1677,6 +1742,8 @@ def train(
     state["final_target"] = target_name
     state["final_result"] = result
     _atomic_save(state, last_path)
+    (output / "status.json").write_text(json.dumps(
+        {"state": "completed", "updated": time.time(), "result": result}))
     print(json.dumps({target_name: result}, sort_keys=True), flush=True)
     return result
 
@@ -1732,6 +1799,7 @@ def main(argv: list[str] | None = None) -> None:
         max_eval_batches=args.max_eval_batches,
         amp=not args.no_amp and device.type == "cuda",
         pilot_epochs=args.pilot_epochs,
+        pacing_file=args.pacing_file,
     )
     train(
         model,

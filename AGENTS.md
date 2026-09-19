@@ -61,7 +61,8 @@ informed.
 
 ## CUDA Boundary
 
-- CUDA implements only the complete default `LSSOConfig`.
+- CUDA supports DYNAMIC, STATIC and ZERO with default skew and complement
+  settings at ranks 16, 32, 48 and 64; see `docs/CUDA_CONTRACT.md`.
 - Unsupported variants, layouts, dtypes, or devices must fail explicitly.
 - CUDA must not silently fall back or preserve an old ABI.
 - Every CUDA forward result and gradient must be checked against `reference.py`.

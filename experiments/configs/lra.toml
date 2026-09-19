@@ -8,4 +8,3 @@ cache_root = "data/sequence_cache"
 mixer = "lsso"
 implementation = "cuda"
 core_mode = "dynamic"
-rank_rotary = true

@@ -41,11 +41,6 @@ def parse_args() -> argparse.Namespace:
         default="float16",
     )
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--vision-position-ids",
-        action="store_true",
-        help="Use the ImageNet CLS/patch Rank-Rotary coordinates for LSSO.",
-    )
     return parser.parse_args()
 
 
@@ -65,20 +60,17 @@ class _BenchmarkMixer(nn.Module):
         *,
         operator: str,
         implementation: str,
-        position_ids: torch.Tensor | None,
     ) -> None:
         super().__init__()
         self.mixer = mixer
         self.operator = operator
         self.implementation = implementation
-        self.register_buffer("position_ids", position_ids, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.operator == "lsso":
             assert isinstance(self.mixer, LSSO)
             return self.mixer(
                 x,
-                position_ids=self.position_ids,
                 implementation=self.implementation,
             )
         assert isinstance(self.mixer, nn.MultiheadAttention)
@@ -96,8 +88,6 @@ def main() -> None:
         raise ValueError("grad_accum must be positive")
     if args.steps % args.grad_accum:
         raise ValueError("steps must be divisible by grad_accum")
-    if args.vision_position_ids and args.operator != "lsso":
-        raise ValueError("--vision-position-ids is valid only for LSSO")
 
     device = torch.device("cuda", torch.cuda.current_device())
     dtype = _dtype(args.dtype)
@@ -119,21 +109,10 @@ def main() -> None:
             bias=True,
             batch_first=True,
         ).to(device)
-    position_ids: torch.Tensor | None = None
-    if args.vision_position_ids:
-        patch_positions = torch.arange(
-            args.length - 1,
-            device=device,
-            dtype=torch.float32,
-        )
-        patch_positions -= 0.5 * float(args.length - 2)
-        position_ids = torch.cat((torch.zeros(1, device=device), patch_positions))
-
     layer = _BenchmarkMixer(
         mixer,
         operator=args.operator,
         implementation=args.implementation,
-        position_ids=position_ids,
     )
     if args.mode == "forward":
         layer.eval()
@@ -210,13 +189,7 @@ def main() -> None:
     properties = torch.cuda.get_device_properties(device)
     implementation = args.implementation if args.operator == "lsso" else "torch_mha"
     rank = str(args.rank) if args.operator == "lsso" else "na"
-    position = (
-        "vision_rank_rotary"
-        if args.vision_position_ids
-        else "rank_rotary"
-        if args.operator == "lsso"
-        else "none"
-    )
+    position = "none"
     print(
         f"device={properties.name} sm={properties.major}.{properties.minor} "
         f"torch={torch.__version__} cuda={torch.version.cuda} "

@@ -22,7 +22,10 @@ import subprocess
 import tarfile
 import tempfile
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 is supported by the package.
+    import tomli as tomllib
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -466,7 +469,7 @@ def _validate_run(
     )
     _require_keys(
         operator,
-        ("core_mode", "rank_rotary", "bias", "implementation"),
+        ("core_mode", "bias", "implementation"),
         "[operator]",
     )
     _require_keys(
@@ -522,8 +525,6 @@ def _validate_run(
 
     if operator["core_mode"] != "dynamic":
         raise ValueError("the ImageNet recipe requires the DYNAMIC LSSO core")
-    if operator["rank_rotary"] is not True:
-        raise ValueError("the ImageNet recipe requires Rank-Rotary")
     if operator["bias"] is not True:
         raise ValueError("the DeiT III scaffold requires qkv/projection bias")
     if operator["implementation"] not in {"cuda", "reference"}:
@@ -1776,7 +1777,6 @@ def build_model(run: ImageNetRun) -> nn.Module:
         rank=int(model["rank"]),
         mlp_ratio=float(model["mlp_ratio"]),
         core_mode=str(run.operator["core_mode"]),
-        rank_rotary=bool(run.operator["rank_rotary"]),
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
         drop_path_rate=float(model["drop_path_rate"]),

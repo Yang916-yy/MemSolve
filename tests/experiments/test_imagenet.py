@@ -238,7 +238,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "image_size": 224,
         "patch_size": 16,
         "num_classes": 1000,
-        "mlp_ratio": 4.0,
+        "mlp_ratio": 4.125,
         "layer_scale_init_value": 1.0e-4,
         "norm_eps": 1.0e-6,
         "embed_dim": 384,
@@ -1174,3 +1174,52 @@ def test_vit3_transforms_and_soft_targets(tmp_path):
     torch.testing.assert_close(targets.sum(1), torch.ones(2))
     assert (targets > 0).all()  # smoothing, not binary multi-label targets
     assert torch.isfinite(loss(torch.zeros(2, 1000), targets))
+
+
+def test_graph_step_rejects_gradient_accumulation():
+    with pytest.raises(ValueError, match="grad_accum=1"):
+        imagenet.ImageNetGraphStep(torch.nn.Linear(2, 2), torch.nn.CrossEntropyLoss(), grad_accum=2)
+
+
+@pytest.mark.cuda
+def test_graph_step_preserves_warmup_rng_updates_inputs_and_reuses_gradients():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(916)
+    eager = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.GELU(), torch.nn.Dropout(0.2), torch.nn.Linear(16, 5)).cuda()
+    graphed = copy.deepcopy(eager)
+    criterion = torch.nn.CrossEntropyLoss()
+    engine = imagenet.ImageNetGraphStep(graphed, criterion)
+    optimizers = [torch.optim.AdamW(m.parameters(), lr=1e-3, fused=True) for m in (eager, graphed)]
+    for step in range(3):
+        images = torch.randn(16, 8, device="cuda") + step * .1
+        targets = (torch.arange(16, device="cuda") + step) % 5
+        rng = torch.cuda.get_rng_state()
+        eager.zero_grad(set_to_none=True)
+        with imagenet._autocast():
+            expected_logits = eager(images)
+            expected_loss = criterion(expected_logits, targets)
+        expected_loss.backward()
+        expected_rng = torch.cuda.get_rng_state()
+        torch.cuda.set_rng_state(rng)
+        graphed.zero_grad(set_to_none=True)
+        before = [p.detach().clone() for p in graphed.parameters()]
+        logits, loss = engine(images, targets)
+        torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        torch.testing.assert_close(torch.cuda.get_rng_state(), expected_rng, rtol=0, atol=0)
+        for a, b, old in zip(graphed.parameters(), eager.parameters(), before):
+            torch.testing.assert_close(a, old, rtol=0, atol=0)
+            torch.testing.assert_close(a.grad, b.grad, rtol=0, atol=0)
+        for model, optimizer in zip((eager, graphed), optimizers):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+            optimizer.param_groups[0]['lr'] = .001 / (step + 1)
+            optimizer.step()
+        for a, b in zip(graphed.parameters(), eager.parameters()):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        graphed.eval()
+        with torch.no_grad():
+            graphed(images)
+        graphed.train()
+    with pytest.raises(ValueError, match="shape/dtype/device"):
+        engine(images[:8], targets[:8])

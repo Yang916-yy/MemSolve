@@ -1609,7 +1609,7 @@ def test_no_frame_graph_replay_updates_inputs_and_parameters(mode, length, monke
                     assert got is None
                 else:
                     torch.testing.assert_close(got, want, rtol=0, atol=0)
-        # Private compact autograd state must also survive a retained outer graph.
+        # Saved compact state must also survive a retained outer graph.
         output = cuda.fast_mix(*arguments)
         first = torch.autograd.grad(output, arguments, upstream, allow_unused=True, retain_graph=True)
         second = torch.autograd.grad(output, arguments, upstream, allow_unused=True)
@@ -1653,3 +1653,79 @@ def test_identity_core_uses_the_same_zero_base_without_native_frame(mode, monkey
     with torch.no_grad():
         inference = cuda.fast_mix(*arguments, counts)
     torch.testing.assert_close(inference, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("columns", [7, 65])
+def test_compact_mathdx_reuses_pivoted_lu_for_both_solve_directions(rank, columns):
+    _require_native_cuda()
+    torch.manual_seed(870 + rank + columns)
+    matrix = (torch.eye(rank, device="cuda") + 0.03 * torch.randn(2, 3, rank, rank, device="cuda")).roll(1, dims=-2)
+    rhs = torch.randn(2, 3, rank, columns, device="cuda")
+    with torch.no_grad():
+        lu, pivots, info = torch.ops.lsso_equilibrium.compact_lu(matrix)
+        assert torch.count_nonzero(info) == 0
+        assert torch.any(pivots != torch.arange(1, rank + 1, device="cuda"))
+        before_lu, before_pivots = lu.clone(), pivots.clone()
+        for transpose in (False, True):
+            actual = torch.ops.lsso_equilibrium.compact_getrs(lu, pivots, rhs, transpose)
+            expected = torch.linalg.solve(matrix.double().mT if transpose else matrix.double(), rhs.double())
+            _assert_mixed_close(actual, expected, limit=2e-5)
+        torch.testing.assert_close(lu, before_lu, rtol=0, atol=0)
+        torch.testing.assert_close(pivots, before_pivots, rtol=0, atol=0)
+
+
+def test_compact_native_status_and_autograd_boundary():
+    _require_native_cuda()
+    matrix = torch.eye(16, device="cuda").requires_grad_()
+    with pytest.raises(RuntimeError, match="explicit autograd owner"):
+        torch.ops.lsso_equilibrium.compact_lu(matrix)
+    with torch.no_grad():
+        _, _, info = torch.ops.lsso_equilibrium.compact_lu(torch.zeros_like(matrix))
+        assert info.item() > 0
+        lu, pivots, _ = torch.ops.lsso_equilibrium.compact_lu(matrix)
+        with pytest.raises(RuntimeError, match="batch/rank mismatch"):
+            torch.ops.lsso_equilibrium.compact_getrs(lu, pivots, torch.zeros(15, 5, device="cuda"))
+        with pytest.raises(RuntimeError, match="CUDA int32"):
+            torch.ops.lsso_equilibrium.compact_getrs(lu, pivots.long(), torch.zeros(16, 5, device="cuda"))
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("rank", [16, 48])
+def test_compact_analytic_vjp_matches_independent_fp64_autograd(mode, rank):
+    _require_native_cuda()
+    torch.manual_seed(916 + rank)
+    batch, heads, dim = 3, 2, 17
+    relation = torch.randn(batch, heads, rank + 3, rank, device="cuda") / rank**0.5
+    gram = relation.mT @ relation
+    cross = torch.randn(batch, heads, rank, dim, device="cuda")
+    base = torch.randn(heads, rank, rank if mode != 2 else 0, device="cuda") * 0.2
+    drive = torch.randn(heads, dim, rank if mode == 0 else 0, device="cuda") * 0.05
+    raw = torch.tensor([0.0, -9.5], device="cuda")
+    counts = torch.tensor([3.0, 11.0, 67.0], device="cuda")
+    leaves = [x.double().requires_grad_() for x in (gram, cross, base, drive, raw)]
+    g, q, b, w, e = leaves
+    identity = torch.eye(rank, device="cuda", dtype=torch.float64)
+    factor = torch.linalg.cholesky(identity + g)
+    state = torch.linalg.solve_triangular(factor, q, upper=False)
+    eta = bounded_complement(e)
+    if mode == 2:
+        correction = torch.zeros_like(state)
+    else:
+        coordinates = b if mode == 1 else b + state @ w / counts.double().sqrt()[:, None, None, None]
+        generator = accretive_generator(coordinates)
+        correction = torch.linalg.solve(identity + generator, identity - generator) @ state if mode == 1 else torch.linalg.solve(identity + generator, (identity - generator) @ state)
+    coefficient = torch.linalg.solve_triangular(factor.mT, correction - eta[None, :, None, None] * state, upper=True)
+    upstream = torch.randn_like(coefficient).float()
+    eta_upstream = torch.randn_like(eta).float()
+    expected = torch.autograd.grad((coefficient, eta), leaves, (upstream.double(), eta_upstream.double()), allow_unused=True)
+    from lsso.ball.reference import _ieee_fp32_matmul
+    with torch.no_grad(), _ieee_fp32_matmul(gram.device):
+        got, got_eta, tape = cuda._no_frame_compact(gram, cross, base, drive, raw, counts, mode)
+        actual = cuda._no_frame_compact_backward(got, got_eta, tape, upstream, eta_upstream, mode)
+    _assert_mixed_close(got, coefficient, limit=2e-5)
+    for value, oracle in zip(actual, expected):
+        if oracle is None:
+            assert value is None
+        else:
+            _assert_mixed_close(value, oracle, limit=1e-4)

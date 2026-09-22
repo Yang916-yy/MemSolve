@@ -10,7 +10,7 @@ import torch
 
 _LOAD_LOCK = Lock()
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
-_NATIVE_CONTRACT_VERSION = 10
+_NATIVE_CONTRACT_VERSION = 11
 _RUNTIME_PACKAGE = "lsso_cuda_runtime"
 _LOADED_ARCHITECTURE: int | None = None
 
@@ -415,55 +415,7 @@ def _no_frame_kernels():
             da, (n[:, None] < N) & (r[None, :] < R),
         )
 
-    @jit
-    def _solve_kernel(
-        A, B, X, R: tl.constexpr, D: tl.constexpr, BR: tl.constexpr, BD: tl.constexpr
-    ):
-        s = tl.program_id(0)
-        r = tl.arange(0, BR)
-        c = tl.arange(0, BR)
-        d = tl.program_id(1) * BD + tl.arange(0, BD)
-        a = tl.load(
-            A + (s * R + r[:, None]) * R + c[None, :],
-            (r[:, None] < R) & (c[None, :] < R),
-            0,
-        )
-        b = tl.load(
-            B + (s * R + r[:, None]) * D + d[None, :],
-            (r[:, None] < R) & (d[None, :] < D),
-            0,
-        )
-        for k in range(R):
-            col = tl.sum(tl.where(c[None, :] == k, a, 0.0), 1)
-            scores = tl.where((r >= k) & (r < R), tl.abs(col), -1.0)
-            pivot = tl.argmax(scores, 0)
-            ak = tl.sum(tl.where(r[:, None] == k, a, 0.0), 0)
-            ap = tl.sum(tl.where(r[:, None] == pivot, a, 0.0), 0)
-            bk = tl.sum(tl.where(r[:, None] == k, b, 0.0), 0)
-            bp = tl.sum(tl.where(r[:, None] == pivot, b, 0.0), 0)
-            a = tl.where(
-                r[:, None] == k,
-                ap[None, :],
-                tl.where(r[:, None] == pivot, ak[None, :], a),
-            )
-            b = tl.where(
-                r[:, None] == k,
-                bp[None, :],
-                tl.where(r[:, None] == pivot, bk[None, :], b),
-            )
-            diag = tl.sum(tl.where(c == k, ap, 0.0), 0)
-            ar = ap / diag
-            br = bp / diag
-            col = tl.sum(tl.where(c[None, :] == k, a, 0.0), 1)
-            a = tl.where(r[:, None] == k, ar[None, :], a - col[:, None] * ar[None, :])
-            b = tl.where(r[:, None] == k, br[None, :], b - col[:, None] * br[None, :])
-        tl.store(
-            X + (s * R + r[:, None]) * D + d[None, :],
-            b,
-            (r[:, None] < R) & (d[None, :] < D),
-        )
-
-    return _statistics, _readout, _token_backward, _solve_kernel
+    return _statistics, _readout, _token_backward
 
 
 def _no_frame_block_size(size: int) -> int:
@@ -508,74 +460,224 @@ def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None):
     return cross, eta_gradient.sum(1).view(batch, heads).sum(0)
 
 
-def _no_frame_solve(system, rhs):
-    rank, columns = rhs.shape[-2:]
-    system, rhs = system.contiguous(), rhs.contiguous()
-    result = torch.empty_like(rhs)
-    _no_frame_kernels()[3][(system.numel() // (rank * rank), (columns + 127) // 128)](
-        system,
-        rhs,
-        result,
-        rank,
-        columns,
-        _no_frame_block_size(rank),
-        min(128, _no_frame_block_size(columns)),
-        num_warps=4,
-        num_stages=1,
+@lru_cache(maxsize=1)
+def _compact_kernels():
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def prepare(BASE, UPDATE, COUNT, COORD, FACTOR, SIZE: tl.constexpr,
+                R: tl.constexpr, H: tl.constexpr, DYNAMIC: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        local = i % (R * R)
+        row, col = local // R, local % R
+        h = (i // (R * R)) % H
+        value = tl.load(BASE + h * R * R + local, i < SIZE, 0)
+        if DYNAMIC:
+            count = tl.load(COUNT + i // (H * R * R), i < SIZE, 1)
+            value += tl.load(UPDATE + i, i < SIZE, 0) / tl.sqrt(count)
+        shifted = value + 0.5413248546129181
+        diagonal = tl.where(shifted > 20.0, shifted, tl.log(1.0 + tl.exp(shifted)))
+        f = tl.where(row > col, value, tl.where(row == col, diagonal, 0.0))
+        tl.store(COORD + i, value, i < SIZE)
+        tl.store(FACTOR + i, f, i < SIZE)
+
+    @jit
+    def matrix(A, B, COORD, COUNT, OUT, AUX, SIZE: tl.constexpr,
+               R: tl.constexpr, H: tl.constexpr, OP: tl.constexpr,
+               DYNAMIC: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        local = i % (R * R)
+        row, col = local // R, local % R
+        offset = i - local
+        transposed = offset + col * R + row
+        a = tl.load(A + i, i < SIZE, 0)
+        if OP == 0:  # K=F F^T+Omega and both I +/- K in one pass.
+            t = tl.load(COORD + i, i < SIZE, 0)
+            tt = tl.load(COORD + transposed, i < SIZE, 0)
+            k = a + tl.where(row < col, t, tl.where(row > col, -tt, 0.0))
+            tl.store(OUT + i, (row == col).to(tl.float32) + k, i < SIZE)
+            tl.store(AUX + i, (row == col).to(tl.float32) - k, i < SIZE)
+        elif OP == 1:  # Cholesky VJP: half the symmetric copy of the lower triangle.
+            at = tl.load(A + transposed, i < SIZE, 0)
+            tl.store(OUT + i, 0.5 * tl.where(row >= col, a, at), i < SIZE)
+        else:  # Generator VJP plus sample normalization.
+            g = tl.load(B + i, i < SIZE, 0)
+            gt = tl.load(B + transposed, i < SIZE, 0)
+            coordinate = tl.load(COORD + i, i < SIZE, 0)
+            shifted = coordinate + 0.5413248546129181
+            sigmoid = 1.0 / (1.0 + tl.exp(-shifted))
+            d = tl.where(row > col, a, tl.where(row == col, a * sigmoid, g - gt))
+            tl.store(OUT + i, d, i < SIZE)
+            if DYNAMIC:
+                count = tl.load(COUNT + i // (H * R * R), i < SIZE, 1)
+                tl.store(AUX + i, d / tl.sqrt(count), i < SIZE)
+
+    @jit
+    def complement(RAW, ETA, DERIVATIVE, H: tl.constexpr, BLOCK: tl.constexpr):
+        h = tl.arange(0, BLOCK)
+        raw = tl.load(RAW + h, h < H, 0)
+        exponent = tl.exp(-2.0 * tl.abs(raw))
+        scale: tl.constexpr = 1.0 - 1.1920928955078125e-7
+        value = scale * tl.where(raw >= 0.0, 1.0 - exponent, exponent - 1.0) / (1.0 + exponent)
+        derivative = scale * 4.0 * exponent / ((1.0 + exponent) * (1.0 + exponent))
+        tl.store(ETA + h, value, h < H)
+        tl.store(DERIVATIVE + h, derivative, h < H)
+
+    @jit
+    def combine(DELTA, STATE, ETA, OUT, SIZE: tl.constexpr, H: tl.constexpr,
+                RD: tl.constexpr, ZERO: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        z = tl.load(STATE + i, i < SIZE, 0)
+        eta = tl.load(ETA + (i // RD) % H, i < SIZE, 0)
+        delta = 0.0 if ZERO else tl.load(DELTA + i, i < SIZE, 0)
+        tl.store(OUT + i, delta - eta * z, i < SIZE)
+
+    return prepare, matrix, complement, combine
+
+
+def _compact_prepare(base, update, counts):
+    coordinates = torch.empty_like(base if update is None else update)
+    core_factor = torch.empty_like(coordinates)
+    size = coordinates.numel()
+    _compact_kernels()[0][((size + 255) // 256,)](
+        base, update, counts, coordinates, core_factor, size, base.shape[-1],
+        base.shape[0], update is not None, 256, num_warps=4,
     )
-    return result
+    return coordinates, core_factor
+
+
+def _compact_matrix(a, coordinates=None, b=None, counts=None, *, heads=1, op=0):
+    output = torch.empty_like(a, memory_format=torch.contiguous_format)
+    auxiliary = torch.empty_like(output) if op == 0 or counts is not None else output
+    # GEMM outputs are contiguous; the Cholesky product is normalized here too.
+    a = a.contiguous()
+    _compact_kernels()[1][((a.numel() + 255) // 256,)](
+        a, b, coordinates, counts, output, auxiliary, a.numel(), a.shape[-1],
+        heads, op, counts is not None, 256, num_warps=4,
+    )
+    return output, auxiliary
+
+
+def _compact_complement(raw):
+    eta, derivative = torch.empty_like(raw), torch.empty_like(raw)
+    _compact_kernels()[2][(1,)](raw, eta, derivative, raw.numel(), _no_frame_block_size(raw.numel()), num_warps=4)
+    return eta, derivative
+
+
+def _compact_combine(correction, state, eta, mode):
+    output = torch.empty_like(state, memory_format=torch.contiguous_format)
+    state = state.contiguous()
+    if correction is not None:
+        correction = correction.contiguous()
+    _compact_kernels()[3][((state.numel() + 255) // 256,)](
+        correction, state, eta, output, state.numel(), state.shape[1],
+        state.shape[-2] * state.shape[-1], mode == 2, 256, num_warps=4,
+    )
+    return output
+
+
+def _compact_lu(system):
+    return torch.ops.lsso_equilibrium.compact_lu(system.contiguous())[:2]
+
+
+def _compact_getrs(lu, pivots, rhs, *, transpose=False):
+    return torch.ops.lsso_equilibrium.compact_getrs(
+        lu, pivots, rhs.contiguous(), transpose
+    )
 
 
 class _NoFrameSolve(torch.autograd.Function):
-    """General partial-pivot solve with an implicit, first-order FP32 VJP."""
+    """MathDx partial-pivot LU, reused by the implicit first-order VJP."""
 
     @staticmethod
     def forward(ctx, system, rhs):
-        result = _no_frame_solve(system, rhs)
-        ctx.save_for_backward(system, result)
+        lu, pivots = _compact_lu(system)
+        result = _compact_getrs(lu, pivots, rhs)
+        ctx.save_for_backward(lu, pivots, result)
         return result
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, gradient):
-        system, result = ctx.saved_tensors
-        adjoint = _no_frame_solve(system.mT, gradient)
+        lu, pivots, result = ctx.saved_tensors
+        adjoint = _compact_getrs(lu, pivots, gradient, transpose=True)
         return -(adjoint @ result.mT), adjoint
 
 
 def _no_frame_compact(gram, cross, base, drive, raw, counts, mode):
-    # QR-equivalent coordinates: R^T R=I+A^T A, Z=R^-T A^T C,
-    # V=R^-1(Delta-eta*Z), Y=eta*C+A*V. No token-sized P is stored.
-    # reference.py remains the owner of the generator and complement mapping.
-    from .reference import accretive_generator, bounded_complement
-
+    # reference.py owns these equations. This boundary records values, not an
+    # autograd graph: R^T R=I+A^T A, Z=R^-T A^T C, V=R^-1(Delta-eta Z).
     rank = gram.shape[-1]
     identity = torch.eye(rank, device=gram.device, dtype=gram.dtype)
     factor, _info = torch.linalg.cholesky_ex(gram + identity, check_errors=False)
     state = torch.linalg.solve_triangular(factor, cross, upper=False)
-    eta = bounded_complement(raw)
+    eta, eta_derivative = _compact_complement(raw)
+    coordinates = core_factor = lu = pivots = mapping = None
     if mode == 2:
-        correction = torch.zeros_like(state)
+        correction = None
     else:
-        coordinates = (
-            base
-            if mode == 1
-            else base + state @ drive / counts.sqrt().view(-1, 1, 1, 1)
-        )
-        generator = accretive_generator(coordinates)
+        coordinates, core_factor = _compact_prepare(base, None if mode == 1 else state @ drive, counts)
+        system, difference = _compact_matrix(core_factor @ core_factor.mT, coordinates)
+        lu, pivots = _compact_lu(system)
         if mode == 1:
-            mapping = _NoFrameSolve.apply(identity + generator, identity - generator)
+            mapping = _compact_getrs(lu, pivots, difference)
             correction = mapping @ state
         else:
-            correction = _NoFrameSolve.apply(
-                identity + generator, (identity - generator) @ state
-            )
+            correction = _compact_getrs(lu, pivots, difference @ state)
     coefficient = torch.linalg.solve_triangular(
-        factor.mT,
-        correction - eta[None, :, None, None] * state,
-        upper=True,
-    )
-    return coefficient, eta
+        factor.mT, _compact_combine(correction, state, eta, mode), upper=True,
+    ).contiguous()
+    tape = (factor, state, coordinates, lu, pivots, mapping if mode == 1 else correction, drive, eta_derivative, counts, core_factor)
+    return coefficient, eta, tape
+
+
+def _no_frame_compact_backward(coefficient, eta, tape, gradient, eta_gradient, mode):
+    factor, state, coordinates, lu, pivots, correction, drive, eta_derivative, counts, core_factor = tape
+    # V=L^-T(Delta-eta Z): E_delta=L^-1 E_v, E_L=-V E_delta^T.
+    delta_gradient = torch.linalg.solve_triangular(factor, gradient, upper=False)
+    factor_gradient = -(coefficient @ delta_gradient.mT)
+    state_gradient = -eta[None, :, None, None] * delta_gradient
+    eta_gradient = eta_gradient - (delta_gradient * state).sum((0, 2, 3))
+    base_gradient = drive_gradient = None
+    if mode != 2:
+        if mode == 1:
+            # Accumulate a single per-head map adjoint before solving.
+            map_gradient = (delta_gradient @ state.mT).sum(0)
+            adjoint = _compact_getrs(lu, pivots, map_gradient, transpose=True)
+            identity = torch.eye(state.shape[-2], device=state.device, dtype=state.dtype)
+            generator_gradient = -(adjoint @ (correction + identity).mT)
+            del map_gradient, identity
+            state_gradient = state_gradient + correction.mT @ delta_gradient
+        else:
+            # E_K=-U(Delta+Z)^T and E_Z=2U-E_delta. Keep the K(Z) chain below.
+            adjoint = _compact_getrs(lu, pivots, delta_gradient, transpose=True)
+            generator_gradient = -(adjoint @ (correction + state).mT)
+            state_gradient = state_gradient + 2 * adjoint - delta_gradient
+        core_gradient = (generator_gradient + generator_gradient.mT) @ core_factor
+        coordinate_gradient, scaled = _compact_matrix(
+            core_gradient, coordinates, generator_gradient,
+            counts if mode == 0 else None, heads=state.shape[1], op=2,
+        )
+        del core_gradient, generator_gradient, adjoint
+        if mode == 1:
+            base_gradient = coordinate_gradient
+        else:
+            base_gradient = coordinate_gradient.sum(0)
+            drive_gradient = (state.mT @ scaled).sum(0)
+            state_gradient = state_gradient + scaled @ drive.mT
+        del coordinate_gradient, scaled
+    # Z=L^-1 Q, followed by the Cholesky adjoint for G+I=L L^T.
+    cross_gradient = torch.linalg.solve_triangular(factor.mT, state_gradient, upper=True)
+    factor_gradient.sub_(cross_gradient @ state.mT)
+    product = factor.mT @ factor_gradient
+    del factor_gradient, state_gradient, delta_gradient
+    symmetric, _ = _compact_matrix(product, op=1)
+    del product
+    intermediate = torch.linalg.solve_triangular(factor.mT, symmetric, upper=True)
+    gram_gradient = torch.linalg.solve_triangular(factor.mT, intermediate.mT, upper=True).mT
+    raw_gradient = eta_gradient * eta_derivative
+    return gram_gradient, cross_gradient, base_gradient, drive_gradient, raw_gradient
 
 
 def _no_frame_forward(projected, base, drive, raw, counts, *, record):
@@ -599,16 +701,13 @@ def _no_frame_forward(projected, base, drive, raw, counts, *, record):
     # All compact operations remain FP32 regardless of the caller's AMP/TF32
     # policy. No process-wide precision setting is left changed.
     with (
-        torch.set_grad_enabled(record),
+        torch.no_grad(),
         torch.autocast(device_type="cuda", enabled=False),
         _ieee_fp32_matmul(projected.device),
     ):
-        leaves = [
-            value.detach().requires_grad_(record)
-            for value in (gram, cross, base, drive, raw)
-        ]
-        coefficient, eta = _no_frame_compact(*leaves, normalization, mode)
-        coefficient = coefficient.contiguous()
+        coefficient, eta, tape = _no_frame_compact(
+            gram, cross, base, drive, raw, normalization, mode
+        )
     output = torch.empty(
         (batch, length, heads * head_dim),
         device=projected.device,
@@ -631,7 +730,7 @@ def _no_frame_forward(projected, base, drive, raw, counts, *, record):
         num_warps=4,
         num_stages=1,
     )
-    return output, (coefficient, eta, *leaves)
+    return output, (coefficient, eta, *tape)
 
 
 class _NoFrameMix(torch.autograd.Function):
@@ -649,7 +748,7 @@ class _NoFrameMix(torch.autograd.Function):
     def backward(ctx, gradient):
         from .reference import _ieee_fp32_matmul
 
-        projected, counts, coefficient, eta, *leaves = ctx.saved_tensors
+        projected, counts, coefficient, eta, *tape = ctx.saved_tensors
         heads, rank = ctx.heads, ctx.rank
         batch, length, width = projected.shape
         head_dim = (width - heads * rank) // heads
@@ -661,25 +760,14 @@ class _NoFrameMix(torch.autograd.Function):
             gradient,
             counts,
         )
+        mode = 2 if tape[2] is None else (1 if tape[6].numel() == 0 else 0)
         with (
-            torch.enable_grad(),
+            torch.no_grad(),
             torch.autocast(device_type="cuda", enabled=False),
             _ieee_fp32_matmul(projected.device),
         ):
-            # Retain the private compact graph for repeated first-order VJPs
-            # when the public caller explicitly retains the outer graph.
-            (
-                gram_gradient,
-                cross_gradient,
-                base_gradient,
-                drive_gradient,
-                raw_gradient,
-            ) = torch.autograd.grad(
-                (coefficient, eta),
-                leaves,
-                grad_outputs=(coefficient_gradient, eta_gradient),
-                allow_unused=True,
-                retain_graph=True,
+            gram_gradient, cross_gradient, base_gradient, drive_gradient, raw_gradient = _no_frame_compact_backward(
+                coefficient, eta, tape, coefficient_gradient, eta_gradient, mode
             )
         projected_gradient = torch.empty_like(projected)
         # Bound live token adjoints independently of the statistics tile.

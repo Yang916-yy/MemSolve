@@ -7,7 +7,7 @@
 namespace lsso_equilibrium {
 namespace {
 
-constexpr int64_t kNativeContractVersion = 10;
+constexpr int64_t kNativeContractVersion = 11;
 
 bool requires_grad(const c10::optional<at::Tensor>& value) {
     return value.has_value() && value->requires_grad();
@@ -73,6 +73,8 @@ int64_t contract_version() {
 }  // namespace lsso_equilibrium
 
 TORCH_LIBRARY(lsso_equilibrium, module) {
+    module.def("compact_lu(Tensor a) -> (Tensor, Tensor, Tensor)");
+    module.def("compact_getrs(Tensor lu, Tensor pivots, Tensor rhs, bool transpose=False) -> Tensor");
     module.def(
         "contract_version() -> int",
         TORCH_FN(lsso_equilibrium::contract_version)
@@ -92,12 +94,16 @@ TORCH_LIBRARY(lsso_equilibrium, module) {
 }
 
 TORCH_LIBRARY_IMPL(lsso_equilibrium, CUDA, module) {
+    module.impl("compact_lu", TORCH_FN(lsso_equilibrium::compact_lu_cuda));
+    module.impl("compact_getrs", TORCH_FN(lsso_equilibrium::compact_getrs_cuda));
     module.impl("forward_inference", TORCH_FN(lsso_equilibrium::forward_inference_cuda));
     module.impl("forward_train", TORCH_FN(lsso_equilibrium::forward_train_cuda));
     module.impl("backward", TORCH_FN(lsso_equilibrium::backward_cuda));
 }
 
 TORCH_LIBRARY_IMPL(lsso_equilibrium, Autograd, module) {
+    module.impl("compact_lu", TORCH_FN(lsso_equilibrium::compact_lu_cuda));
+    module.impl("compact_getrs", TORCH_FN(lsso_equilibrium::compact_getrs_cuda));
     module.impl("forward_inference", TORCH_FN(lsso_equilibrium::forward_inference_autograd));
     module.impl("forward_train", TORCH_FN(lsso_equilibrium::forward_train_autograd));
 }

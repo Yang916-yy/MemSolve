@@ -1,7 +1,7 @@
 # CUDA Contract
 
 The CUDA runtime implements the unrotated operator in three core modes.
-The native RHS-tiled component uses contract version 10:
+The native RHS-tiled component uses contract version 11:
 
 - `core_mode=DYNAMIC`, `STATIC`, or `ZERO`;
 - `skew_coupling=True` and `scalar_complement=True`;
@@ -22,7 +22,7 @@ itself has different requirements. See NVIDIA
 [installed-package requirements](https://docs.nvidia.com/cuda/cublasdx/requirements_func.html).
 The projection runtime is Triton 3.8.0 supplied by this PyTorch environment.
 Use `LSSO_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh` for an A800.
-The current unrotated implementation uses native ABI 10 and checkpoint contract 13.
+The current unrotated implementation uses native ABI 11 and checkpoint contract 13.
 Historical rotated checkpoints and results retain their original contracts.
 
 ## Public And Native Boundaries
@@ -157,7 +157,7 @@ It uses the Triton runtime supplied by Linux CUDA PyTorch (tested with Triton
 The first call compiles a kernel; warm up on the capture stream before CUDA
 Graph capture. Token counts are runtime arguments, avoiding one compilation
 for every image resolution. This adds a JIT projection boundary; the native
-MathDx mixer remains a precompiled artifact with ABI 10. No new parameters,
+MathDx mixer remains a precompiled artifact with ABI 11. No new parameters,
 checkpoint version, precision guards, or fallback implementation are added.
 
 
@@ -166,7 +166,7 @@ checkpoint version, precision guards, or fallback implementation are added.
 `cuda.fast_mix()` always uses the common no-frame Triton/PyTorch implementation
 for training and inference. Dynamic, Static and Zero share this path for every
 supported rank and batch size, including ImageNet shapes. The model contract
-13 and native ABI 10 remain unchanged. Native materialized-frame entry points
+13 is unchanged; native ABI 11 adds compact LU factor/solve entry points. Native materialized-frame entry points
 remain available for explicit low-level comparisons; the public path never
 selects them as an optimization or fallback.
 
@@ -185,8 +185,9 @@ Y = eta C + A V
 Here A includes length/valid-count normalization. This is the same frame
 `P=A R^-1` as the reference, without constructing or saving token-sized P.
 Statistics and token VJPs read the existing BF16 packed projection in tiles;
-only compact factors/state, partial statistics and the compact autograd graph
-are retained. The three modes share the statistics, readout and input VJP.
+only compact factors/state and partial statistics are retained. The ordinary
+rank-space path records tensor values for an explicit first-order VJP, not
+a private autograd graph. The three modes share the statistics, readout and input VJP.
 Static's differentiable map is rebuilt per forward, never cached across updates.
 
 There are no rank-48, mode, batch-size or sequence-length performance heuristics.
@@ -218,8 +219,10 @@ scales from 0.001 to 64, raw core scales through 4, eta tails +/-9.5, all suppor
 ranks, and gapped/all-masked inputs. Finite fixture errors are not universal
 bounds for arbitrarily ill-conditioned inputs or vanishing residuals.
 
-The compact VJP uses a private first-order autograd graph; repeated VJPs with
-`retain_graph=True` are supported, higher-order differentiation is not. Warm up
+The rank-space compact VJP is analytic and reuses the saved LU factors.
+The smaller token-system branch retains its PyTorch autograd owner and uses
+the same LU-backed implicit core solve. Repeated VJPs with `retain_graph=True`
+are supported; higher-order differentiation is not. Warm up
 each shape and its backward on a side stream before CUDA Graph capture. Graph
 replay includes fresh input and parameter reads, all GPU kernels, and graph-pool
 storage. It avoids repeated Python/autograd scheduling but does not remove
@@ -372,7 +375,7 @@ verifies both its compiled SM and native contract version before launching
 kernels.
 
 The runtime packaging tool requires all seven files. A wheel built for this
-source must carry native contract 10; older released v0.6.3 wheels must not be
+source must carry native contract 11; older released v0.6.3 wheels must not be
 mixed with current source. Its generated
 metadata is checked before loading: LSSO version, native contract, exact Torch
 version, CUDA version, and PyTorch's C++ ABI must all match. Release packaging
@@ -466,7 +469,7 @@ The upstream reuse review found:
 - Cholesky, triangular solves and compact GEMMs already call PyTorch's mature
   implementations. Keep these until a fused replacement wins an end-to-end
   forward/backward comparison under the same numerical contract.
-- The hand-written general Gauss-Jordan solve repeats elimination in backward
+- At the start of this audit the hand-written Gauss-Jordan solve repeated elimination in backward
   and for each RHS tile. Upstream
   [LU factorization](https://docs.pytorch.org/docs/2.14/generated/torch.linalg.lu_factor_ex.html)
   and [adjoint LU solve](https://docs.pytorch.org/docs/2.14/generated/torch.linalg.lu_solve.html)
@@ -476,12 +479,12 @@ The upstream reuse review found:
   0.465 ms. The default PyTorch backend failed Graph capture at rank 32 on
   this installation. This experiment is not installed as a global backend
   switch or a new shape-based dispatcher.
-- The existing native cuSOLVERDx partial-pivot LU factor/solve components are
-  the next reusable building blocks for the compact no-frame system.
+- The existing native cuSOLVERDx partial-pivot LU factor/solve components were
+  selected as reusable building blocks for the compact no-frame system.
   [GETRS supports transposed solves](https://docs.nvidia.com/cuda/cusolverdx/get_started/getrs.html),
   so a dedicated compact boundary can retain the forward factors for backward.
-  Adapting that boundary requires its own ABI, Graph, gradient and latency
-  validation; the current public no-frame path still uses the general solver.
+  The ABI-11 implementation below now adopts this boundary after Graph,
+  gradient and latency validation.
 - [FLA solve_tril](https://github.com/fla-org/flash-linear-attention/blob/864a87f6ce5be8828bef81eb22baafd41937cdf2/fla/ops/utils/solve_tril.py)
   computes a unit-lower-triangular inverse. The LSSO core system is general
   dense and cannot use it directly. The QR-coordinate triangular factor is
@@ -508,3 +511,69 @@ replays followed by five groups of ten replays and report the median.
 The retained change passed 263 core/CUDA tests without relaxing tolerances.
 The sparse-mask cancellation TODO above remains open. Local probes and
 profiler artifacts remain outside the repository; no task results were added.
+
+## ABI 11: compact LU reuse, analytic VJP and local fusion
+
+The public rank-space no-frame implementation now uses cuSOLVERDx GETRF with
+partial pivoting and GETRS. Dynamic factors one system per sample/head;
+Static factors one per head and solves for its shared map. Every RHS panel
+and the backward transposed solve reuse those factors. Zero skips the core
+factor/solve entirely. The hand-written Triton Gauss-Jordan kernel was removed.
+The private `compact_lu` entry returns factors, one-based int32 pivots and
+GPU status; `compact_getrs` consumes them without mutation. Neither entry is
+a standalone differentiable operator. There is no CPU status poll, global
+PyTorch backend switch or new shape-based fallback. ABI 11 requires rebuilding
+the native artifact; model checkpoint contract 13 is unchanged.
+
+For `M=I+K`, the Dynamic correction obeys
+`Delta=M^-1 (I-K) Z`. Given its adjoint `E`, backward computes
+`U=M^-T E`, `dK=-U(Delta+Z)^T`, and the direct `dZ=2U-E`.
+The generator VJP then adds the Dynamic `K(Z)` contribution to `dZ`, before
+propagating through the triangular solve and Cholesky factor. Static first
+sums the map adjoint across samples, then performs one adjoint solve per head.
+The Cholesky VJP uses the symmetric copy of the lower triangle of `L^T dL`,
+scaled by one half, with two triangular solves. This avoids a private compact
+autograd graph in the ordinary rank-space path. The short token-space base
+continues to use its existing autograd owner and the LU-backed core solve.
+
+Local Triton kernels fuse coordinate normalization with generator-factor
+preparation, `I +/- K` assembly, the bounded-complement value/derivative,
+`Delta-eta Z`, the generator coordinate VJP, and the Cholesky VJP's triangular
+symmetrization. FP32 GEMMs and Cholesky/triangular solves remain library calls.
+Temporary adjoints are released after their last use; no saved factors are
+modified, including on repeated first-order backward calls. The token tile
+remains 32 and the numerical acceptance budgets are unchanged.
+
+An independent gradient test found that the installed PyTorch clamp boundary
+subgradient made the old reference return zero derivative at `eta_raw=0`.
+The smooth mapping's derivative is `1-eps` there. Explicit sign-conditioned
+exponent inputs now preserve that derivative without overflowing the inactive
+branch. This repairs a reference derivative, not the mathematical operator;
+nonzero eta initialization and the tail-safe mapping remain unchanged.
+
+On A800, Dynamic single-layer forward/backward Graph timings used B=512,
+N=197, BF16 activations, FP32 parameters, and the same 50-warmup/five-by-ten
+measurement method as above. Baseline is the preceding 32-token implementation.
+These measurements exclude the surrounding network, optimizer and DDP.
+
+| Shape | Before | After | Peak allocated before | Peak allocated after |
+|---|---:|---:|---:|---:|
+| T / rank 16 | 3.763 ms | 3.249 ms | 604.8 MiB | 583.8 MiB |
+| T / rank 32 | 6.660 ms | 5.530 ms | 720.4 MiB | 672.4 MiB |
+| T / rank 48 | 12.203 ms | 8.953 ms | 871.3 MiB | 789.3 MiB |
+| T / rank 64 | 17.198 ms | 14.271 ms | 1043.0 MiB | 924.0 MiB |
+| S / rank 16 | 6.317 ms | 5.661 ms | 1225.6 MiB | 1187.5 MiB |
+| S / rank 32 | 10.069 ms | 8.889 ms | 1377.8 MiB | 1294.6 MiB |
+| S / rank 48 | 16.008 ms | 13.256 ms | 1564.6 MiB | 1428.5 MiB |
+| S / rank 64 | 21.776 ms | 20.092 ms | 1772.4 MiB | 1582.1 MiB |
+| B / rank 16 | 13.913 ms | 12.919 ms | 2438.9 MiB | 2362.7 MiB |
+| B / rank 32 | 21.671 ms | 19.396 ms | 2727.0 MiB | 2560.8 MiB |
+| B / rank 48 | 33.630 ms | 28.095 ms | 3076.8 MiB | 2808.2 MiB |
+| B / rank 64 | 45.160 ms | 41.777 ms | 3485.7 MiB | 3103.2 MiB |
+
+The full suite passed 450 tests with 9 skips, including pivoted ordinary and
+transposed solves, singular-status reporting, independent FP64 compact VJPs,
+nonzero Dynamic state dependence, masks, Graph parameter updates, and retained
+backward. Native compilation and latency measurements cover SM80 only. The
+extremely sparse-mask cancellation TODO remains open. No formal task training
+or new accuracy results are implied by these operator measurements.

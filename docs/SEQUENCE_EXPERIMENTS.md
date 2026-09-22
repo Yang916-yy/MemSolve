@@ -1,6 +1,6 @@
 # Sequence Experiments
 
-> Current source uses model contract 13 and native ABI 10. External position
+> Current source uses model contract 13 and native ABI 11. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -13,7 +13,7 @@ selection, and the one-time held-out test evaluation.
 The default LSSO core is DYNAMIC. DYNAMIC, STATIC and ZERO support native
 CUDA; no-skew and no-complement require the reference backend. The shared
 encoder supplies learned absolute position embeddings initialized from
-`Normal(0, 0.02)`. Native ABI 10 accepts FP16 and BF16 inputs. Training recipes
+`Normal(0, 0.02)`. Native ABI 11 accepts FP16 and BF16 inputs. Training recipes
 still default to FP16; current model checkpoints use contract 13.
 
 Historical results below used earlier operator and numerical contracts,

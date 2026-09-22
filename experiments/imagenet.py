@@ -273,6 +273,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, help="Override the official seed.")
     parser.add_argument("--save-every", type=int, help="Checkpoint interval in epochs.")
+    parser.add_argument("--execution", choices=("eager", "graph", "compile-graph"),
+                        help="Training execution; Graph modes require grad_accum=1.")
     parser.add_argument("--print-freq", type=int, default=50)
     parser.add_argument("--eval", action="store_true", help="Evaluate --resume without training.")
     return parser.parse_args(argv)
@@ -362,6 +364,7 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         (args.val_workers, "val_workers"),
         (args.seed, "seed"),
         (args.save_every, "save_every"),
+        (args.execution, "execution"),
     ):
         if argument is not None:
             train[key] = argument
@@ -475,6 +478,8 @@ def _validate_run(
     if operator["implementation"] not in {"cuda", "reference"}:
         raise ValueError("operator.implementation must be 'cuda' or 'reference'")
 
+    if train.get("execution", "eager") not in {"eager", "graph", "compile-graph"}:
+        raise ValueError("unsupported training execution")
     _positive_int(train["epochs"], "epochs")
     _positive_int(train["batch_size"], "batch_size")
     effective_batch = _positive_int(train["effective_batch"], "effective_batch")
@@ -1906,6 +1911,113 @@ def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
         raise FloatingPointError(message)
 
 
+def prepare_training_model(model: nn.Module, state: DistributedState, execution: str) -> nn.Module:
+    """Compile surrounding vision blocks; retain the tested LSSO CUDA boundary."""
+    if execution not in {"eager", "graph", "compile-graph"}:
+        raise ValueError(f"unsupported training execution: {execution}")
+    if execution == "compile-graph":
+        from lsso import LSSO
+        for module in model.modules():
+            if isinstance(module, LSSO):
+                module.forward = torch.compiler.disable(module.forward)
+        # One outer graph captures all compiled segments and native LSSO calls.
+        # Disable Inductor's own graphs so graph pools and RNG have one owner.
+        model.compile(backend="inductor", fullgraph=False, dynamic=False,
+                      options={"triton.cudagraphs": False})
+    if state.enabled:
+        if execution == "eager":
+            return DistributedDataParallel(model, device_ids=[state.local_rank])
+        stream = torch.cuda.Stream(device=state.device)
+        stream.wait_stream(torch.cuda.current_stream(state.device))
+        with torch.cuda.stream(stream):
+            model = DistributedDataParallel(
+                model, device_ids=[state.local_rank], static_graph=True,
+                gradient_as_bucket_view=True,
+            )
+        torch.cuda.current_stream(state.device).wait_stream(stream)
+        model._lsso_graph_stream = stream
+    return model
+
+
+class ImageNetGraphStep:
+    """Fixed-shape whole-network forward/backward, including DDP collectives.
+
+    Optimizer, clipping, data augmentation and scheduling remain outside. Warmup
+    never updates weights and restores RNG/buffers before the first real replay.
+    This owner persists across epochs; checkpoint loading must happen before it.
+    """
+
+    def __init__(self, model: nn.Module, criterion: nn.Module, *, grad_accum: int = 1):
+        if grad_accum != 1:
+            raise ValueError("whole-network CUDA Graph requires grad_accum=1; use eager for accumulation")
+        self.model, self.criterion = model, criterion
+        self.graph = None
+        self.parameters = tuple(model.parameters())
+
+    def _capture(self, images: torch.Tensor, targets: torch.Tensor) -> None:
+        if not images.is_cuda or not targets.is_cuda:
+            raise ValueError("CUDA Graph requires CUDA images and targets")
+        self.images = images.clone()
+        self.targets = targets.clone()
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state(images.device)
+        buffers = [(b, b.clone()) for b in self.model.buffers()]
+        stream = getattr(self.model, "_lsso_graph_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=images.device)
+        stream.wait_stream(torch.cuda.current_stream(images.device))
+        def forward_backward():
+            with _autocast():
+                logits = self.model(self.images)
+                loss = self.criterion(logits, self.targets)
+            loss.backward()
+            return logits, loss
+        with torch.cuda.stream(stream):
+            # PyTorch requires >=11 eager DDP iterations before full capture.
+            for _ in range(11):
+                self.model.zero_grad(set_to_none=True)
+                forward_backward()
+        torch.cuda.current_stream(images.device).wait_stream(stream)
+        torch.cuda.synchronize(images.device)
+        self.model.zero_grad(set_to_none=True)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=stream):
+            self.logits, self.loss = forward_backward()
+        self.gradients = tuple(p.grad for p in self.parameters)
+        torch.cuda.current_stream(images.device).wait_stream(stream)
+        with torch.no_grad():
+            for buffer, original in buffers:
+                buffer.copy_(original)
+        torch.set_rng_state(cpu_rng)
+        torch.cuda.set_rng_state(cuda_rng, images.device)
+
+    def close(self) -> None:
+        # NCCL retains captured communicators until the graph is destroyed.
+        # Release the graph before destroy_process_group to avoid shutdown hangs.
+        if self.graph is not None:
+            torch.cuda.synchronize(self.images.device)
+            self.graph.reset()
+            self.graph = None
+            self.model.zero_grad(set_to_none=True)
+            self.gradients = ()
+            self.images = self.targets = self.logits = self.loss = None
+
+    def __call__(self, images: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.model.training:
+            raise RuntimeError("training graph cannot replay in evaluation mode")
+        if self.graph is None:
+            self._capture(images, targets)
+        for source, destination in ((images, self.images), (targets, self.targets)):
+            if source.shape != destination.shape or source.dtype != destination.dtype or source.device != destination.device:
+                raise ValueError("CUDA Graph input shape/dtype/device changed")
+            destination.copy_(source, non_blocking=True)
+        # Restores graph-owned gradients after epoch/evaluation zero_grad calls.
+        for parameter, gradient in zip(self.parameters, self.gradients):
+            parameter.grad = gradient
+        self.graph.replay()
+        return self.logits, self.loss
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -1920,6 +2032,7 @@ def train_epoch(
     run: ImageNetRun,
     batching_plan: BatchingPlan,
     print_freq: int,
+    graph_step: ImageNetGraphStep | None = None,
 ) -> tuple[float, float, float]:
     if hasattr(epoch_controller, "set_epoch"):
         epoch_controller.set_epoch(epoch)
@@ -1952,17 +2065,24 @@ def train_epoch(
             if not isinstance(model, DistributedDataParallel):
                 raise RuntimeError("distributed ImageNet training requires DistributedDataParallel")
             sync_context = model.no_sync()
-        with sync_context:
-            with _autocast():
-                logits = model(images)
-                data_loss = criterion(logits, targets)
-                loss = data_loss / batching_plan.grad_accum
+        if graph_step is not None:
+            if batching_plan.grad_accum != 1:
+                raise ValueError("whole-network Graph requires grad_accum=1")
+            logits, data_loss = graph_step(images, targets)
             _assert_finite_loss(data_loss, epoch=epoch, step=step)
-            loss.backward()
+        else:
+            with sync_context:
+                with _autocast():
+                    logits = model(images)
+                    data_loss = criterion(logits, targets)
+                    loss = data_loss / batching_plan.grad_accum
+                _assert_finite_loss(data_loss, epoch=epoch, step=step)
+                loss.backward()
         if update_boundary:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(run.train["clip_grad"]))
             optimizer.step()
-            model.zero_grad(set_to_none=True)
+            if graph_step is None:
+                model.zero_grad(set_to_none=True)
             # Match upstream zero-based update indexing, once per accumulated batch.
             scheduler.step_update(epoch * batching_plan.updates_per_epoch + optimizer_updates)
             optimizer_updates += 1
@@ -2121,6 +2241,7 @@ def _recipe_fidelity(
         "train_workers",
         "val_workers",
         "save_every",
+        "execution",
     }
     # A custom TOML can alter hyperparameters without creating CLI overrides.
     with DEFAULT_CONFIG.open("rb") as handle:
@@ -2270,7 +2391,12 @@ def _load_resume(
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     run = load_run(args)
+    execution = str(run.train.get("execution", "eager"))
+    if execution != "eager":
+        # Only this launch process inherits the Graph-compatible NCCL policy.
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
     state = initialize_distributed()
+    graph_step = None
     try:
         seed_everything(int(run.train["seed"]), state)
         torch.backends.cudnn.benchmark = True
@@ -2292,8 +2418,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         model = build_model(run)
         model.to(state.device)
         model_without_ddp = model
-        if state.enabled:
-            model = DistributedDataParallel(model, device_ids=[state.local_rank])
+        model = prepare_training_model(model, state, execution)
 
         optimizer, resolved_optimizer = build_optimizer(
             model_without_ddp,
@@ -2376,6 +2501,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             if state.is_main:
                 print(json.dumps({"event": "complete", "already_complete": True}), flush=True)
             return
+        graph_step = (
+            ImageNetGraphStep(model, criterion, grad_accum=batching_plan.grad_accum)
+            if execution != "eager" else None
+        )
         for epoch in range(start_epoch, int(run.train["epochs"])):
             epoch_started = time.perf_counter()
             train_loss, train_acc1, train_acc5 = train_epoch(
@@ -2391,6 +2520,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 run=run,
                 batching_plan=batching_plan,
                 print_freq=args.print_freq,
+                graph_step=graph_step,
             )
             val_loss, val_acc1, val_acc5 = evaluate(model, val_loader, state=state)
             record = {
@@ -2458,6 +2588,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         if state.is_main:
             print(json.dumps({"event": "complete", "best_val_acc1": best_acc1}), flush=True)
     finally:
+        if graph_step is not None:
+            graph_step.close()
         finalize_distributed(state)
 
 

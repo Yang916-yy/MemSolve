@@ -707,3 +707,10 @@ def test_no_frame_identity_matches_original_resolvent_and_its_differential(lengt
             assert right is None
         else:
             torch.testing.assert_close(left, right, atol=1e-11, rtol=1e-9)
+
+
+def test_bounded_complement_has_the_tanh_derivative_at_zero():
+    raw = torch.tensor([-1e-6, 0.0, 1e-6], dtype=torch.float64, requires_grad=True)
+    actual = torch.autograd.grad(bounded_complement(raw).sum(), raw)[0]
+    expected = (1 - torch.finfo(raw.dtype).eps) / raw.cosh().square()
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-15)

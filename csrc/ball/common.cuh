@@ -330,4 +330,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> backward_cuda(
     const at::Tensor& pivots,
     const c10::optional<at::Tensor>& valid_counts);
 
+std::tuple<at::Tensor,at::Tensor,at::Tensor> compact_lu_cuda(const at::Tensor& a);
+at::Tensor compact_getrs_cuda(const at::Tensor& lu,const at::Tensor& pivots,const at::Tensor& rhs,bool transpose);
+
 }  // namespace lsso_equilibrium

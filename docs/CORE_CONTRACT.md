@@ -109,7 +109,7 @@ are zeroed before every compact statistic.
 ## Serialized and numerical boundaries
 
 The current model `_extra_state` contract is version **13**. This is separate
-from native CUDA ABI **10** and the ImageNet runner envelope format **7**.
+from native CUDA ABI **11** and the ImageNet runner envelope format **7**.
 Loading requires every saved operator-contract field to match, including model
 geometry and ablations. Missing or mismatched contracts fail even under
 `strict=False`; older weights need explicit validation before migration.

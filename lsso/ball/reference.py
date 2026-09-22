@@ -535,10 +535,10 @@ def bounded_complement(raw: torch.Tensor) -> torch.Tensor:
     with torch.autocast(device_type=raw.device.type, enabled=False):
         value = raw.to(dtype=calc_dtype)
         interior_scale = 1.0 - torch.finfo(calc_dtype).eps
-        # Use the stable logistic identity for each sign. The clamps keep the
-        # inactive torch.where branch from evaluating an overflowing exponent.
-        positive_exponent = torch.exp(-2.0 * torch.clamp_min(value, 0.0))
-        negative_exponent = torch.exp(2.0 * torch.clamp_max(value, 0.0))
+        # Select safe exponent inputs explicitly. Clamp's boundary subgradient
+        # can be zero at raw=0, although this smooth map has derivative 1-eps.
+        positive_exponent = torch.exp(-2.0 * torch.where(value >= 0, value, 0.0))
+        negative_exponent = torch.exp(2.0 * torch.where(value < 0, value, 0.0))
         positive = (1.0 - positive_exponent) / (1.0 + positive_exponent)
         negative = (negative_exponent - 1.0) / (1.0 + negative_exponent)
         return interior_scale * torch.where(value >= 0.0, positive, negative)

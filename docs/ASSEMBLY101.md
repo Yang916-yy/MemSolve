@@ -1,6 +1,6 @@
 # Assembly101 data and evaluation protocol
 
-> Current source uses model contract 13 and native ABI 10. External position
+> Current source uses model contract 13 and native ABI 11. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 

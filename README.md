@@ -16,7 +16,7 @@ the surrounding model. DYNAMIC, STATIC and ZERO have native CUDA inference
 and an analytic first-order backward. On the measured RTX 5070 Ti long-sequence
 workloads, the complete mixer reaches up to 1.79x the forward speed and 2.30x
 the forward-backward speed of PyTorch MHA backed by Flash SDPA. Those historical measurements use an earlier operator (native contract 6);
-current ABI-10 changes have not rerun
+current ABI-11 changes have not rerun
 those formal panels. See [result provenance](results/README.md).
 
 Read the current paper: **[LSSO: Solving Contextual Adaptation with Certified
@@ -65,7 +65,7 @@ y = layer(x, implementation="cuda")
 ~~~
 
 The current source requires `torch==2.14.0+cu132`, CUDA `13.2`, native
-contract `10`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
+contract `11`, and Linux x86_64 for its native runtime. Released v0.6.3 wheels
 must not be mixed with this newer source contract; build matching native
 artifacts from this checkout:
 

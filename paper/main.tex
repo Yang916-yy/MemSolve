@@ -1417,7 +1417,7 @@ Pathfinder-32           & 1024 & $256/6/4$ & $0.1510$ & $3.2212$  & $4.7$ \\
 
 \subsection{Current implementation contract}
 
-The current backend uses native ABI 10 and model checkpoint contract 13.
+The current backend uses native ABI 11 and model checkpoint contract 13.
 It implements \textsc{Dynamic}, \textsc{Static}, and \textsc{Zero} with the
 same masking and compact-state definition as Section~\ref{sec:method}.
 All three modes support inference and first-order training.
@@ -1487,8 +1487,8 @@ Frame storage, factorization, the accretive factor Gram, solve state and
 parameter gradients remain FP32. In the no-frame schedule, transformed compact
 coefficients are stored in FP32 and decomposed into a leading BF16 word and a
 BF16 residual word for token products, avoiding a single BF16 rounding of the
-combined coefficient. Its compact VJP uses first-order autograd and an implicit
-solve derivative. The reference retains FP64 evaluation for
+combined coefficient. Its rank-space compact VJP is analytic, reusing cuSOLVERDx LU factors for
+transposed solves; the smaller token-system branch retains first-order autograd. The reference retains FP64 evaluation for
 output and gradient oracles. All three core modes are checked against this
 reference, including nonzero core parameters, gapped padding and fully
 masked samples. Kernel and integration tests define the numerical acceptance

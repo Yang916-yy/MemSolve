@@ -36,6 +36,12 @@ the global batch of the upstream README launch. Upstream scales its base LR
 | small | 384 | 12 | 6 | 32 | 0.1 |
 | base | 768 | 12 | 12 | 48 | 0.4 |
 
+The small model uses MLP ratio 4.125 (1584 hidden channels, aligned to 16)
+to target 20M parameters: 20,033,392 including the 1000-class head.
+Tiny and base retain ratio 4.0. This width adjustment is an LSSO architecture
+choice, not a change to the upstream training recipe. Earlier S/r32 speed
+measurements used ratio 4.0 and do not measure this adjusted model.
+
 DropPath increases linearly from zero to the listed maximum across blocks,
 as in plain ViT³. LSSO ranks are our model choices. The LSSO encoder uses residual 3×3 depthwise CPE before each block, replacing
 the learned absolute position table. CPE uses PyTorch/cuDNN, excludes CLS, and
@@ -68,6 +74,25 @@ currently reads the full 50,000-image validation set; reductions preserve the
 metric, at the cost of redundant validation work. Training and validation
 worker counts are independent (defaults 10 and 4).
 
+## Training execution
+
+The default `execution = "graph"` captures fixed-shape model forward and
+backward, including DDP gradient synchronization. Optimizer updates, gradient
+clipping, augmentation and scheduling remain outside the CUDA Graph.
+Capture warmup does not update parameters and restores RNG state and model
+buffers before the first training replay. The graph is reused across epochs
+and released before distributed shutdown.
+
+Use `--execution compile-graph` to additionally compile the surrounding vision
+blocks with TorchInductor. The native LSSO boundary remains outside compilation,
+and one outer CUDA Graph captures the compiled segments and LSSO calls.
+Inductor's own CUDA Graphs are disabled for this mode.
+
+Both Graph modes require CUDA, fixed input shapes and `grad_accum = 1`.
+Use `--execution eager` when a smaller physical batch requires gradient
+accumulation. The default two-GPU configuration uses batch 512 per GPU and
+therefore satisfies the Graph requirement.
+
 ## Launch and resume
 
 Use the current source checkout with its matching compiled native runtime;
@@ -97,7 +122,7 @@ upstream zero-based optimizer-update index, including the first warmup update.
 Workers are recreated each epoch to support epoch-boundary RNG replay.
 
 The ImageNet checkpoint envelope is now **7**, LSSO model contract **13**, and
-native ABI **10**. Old ImageNet training states cannot resume under this recipe.
+native ABI **11**. Old ImageNet training states cannot resume under this recipe.
 Historical classification results remain labeled with their original DeiT III
 training protocol and source version; this migration produces no new accuracy
 results and does not relabel those measurements.

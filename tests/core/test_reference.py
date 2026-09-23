@@ -1,47 +1,13 @@
-from __future__ import annotations
-
-import math
-
 import pytest
 import torch
-import torch.nn.functional as functional
-
-from lsso.ball.reference import (
-    accretive_equilibrium_mix,
-    accretive_generator,
-    bounded_complement,
-    compact_equilibrium_diagnostics,
-    qr_soft_frame,
-    tensor_core_linear,
+from ridgon.ball.reference import (
     tensor_core_matmul,
+    tensor_core_linear,
+    ridge_query_readout,
+    head_rms_norm,
 )
 
-
 pytestmark = pytest.mark.core
-
-
-def test_qr_soft_frame_preserves_gram_identity() -> None:
-    torch.manual_seed(0)
-    relation = torch.randn(3, 9, 5, dtype=torch.float64)
-    frame = qr_soft_frame(relation)
-
-    rank_eye = torch.eye(5, dtype=torch.float64)
-    expected = relation @ torch.linalg.solve(
-        rank_eye + relation.mT @ relation,
-        relation.mT,
-    )
-    torch.testing.assert_close(frame @ frame.mT, expected)
-    assert torch.all(torch.linalg.matrix_norm(frame, ord=2) <= 1.0 + 2e-12)
-
-
-def test_qr_soft_frame_has_normal_range_gradients() -> None:
-    torch.manual_seed(1)
-    relation = torch.randn(2, 11, 4, dtype=torch.float32, requires_grad=True)
-    frame = qr_soft_frame(relation)
-    frame.square().mean().backward()
-
-    assert torch.isfinite(frame).all()
-    assert relation.grad is not None and torch.isfinite(relation.grad).all()
 
 
 def test_tensor_core_matmul_keeps_fp64_as_the_autograd_oracle() -> None:
@@ -76,12 +42,17 @@ def test_tensor_core_matmul_cuda_has_fp32_output_and_vjp() -> None:
     gradients = torch.autograd.grad((output * upstream).sum(), (left, right))
 
     left_batches = left.detach().to(dtype=torch.bfloat16).reshape(-1, 4, 5)
-    right_batches = right.detach().to(dtype=torch.bfloat16).expand(
-        2,
-        -1,
-        -1,
-        -1,
-    ).reshape(-1, 5, 6)
+    right_batches = (
+        right.detach()
+        .to(dtype=torch.bfloat16)
+        .expand(
+            2,
+            -1,
+            -1,
+            -1,
+        )
+        .reshape(-1, 5, 6)
+    )
     expected = torch.bmm(
         left_batches,
         right_batches,
@@ -93,16 +64,22 @@ def test_tensor_core_matmul_cuda_has_fp32_output_and_vjp() -> None:
         right_batches.mT,
         out_dtype=torch.float32,
     ).reshape_as(left)
-    expected_right_gradient = torch.bmm(
-        left_batches.mT,
-        upstream_batches,
-        out_dtype=torch.float32,
-    ).reshape(2, 3, 5, 6).sum(dim=0)
+    expected_right_gradient = (
+        torch.bmm(
+            left_batches.mT,
+            upstream_batches,
+            out_dtype=torch.float32,
+        )
+        .reshape(2, 3, 5, 6)
+        .sum(dim=0)
+    )
 
     assert output.dtype is torch.float32
     torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
     torch.testing.assert_close(gradients[0], expected_left_gradient, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(gradients[1], expected_right_gradient, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        gradients[1], expected_right_gradient, rtol=0.0, atol=0.0
+    )
 
 
 @pytest.mark.cuda
@@ -130,16 +107,23 @@ def test_tensor_core_linear_cuda_uses_flattened_bf16_vjp(
     value_bf16 = value.detach().to(dtype=torch.bfloat16).reshape(-1, 5)
     weight_bf16 = weight.detach().to(dtype=torch.bfloat16)
     gradient_bf16 = upstream.to(dtype=torch.bfloat16).reshape(-1, 7)
-    expected = torch.mm(
-        value_bf16,
-        weight_bf16.mT,
-        out_dtype=torch.float32,
-    ).reshape_as(actual) + bias.detach()
-    expected_value_gradient = torch.mm(
-        gradient_bf16,
-        weight_bf16,
-        out_dtype=torch.float32,
-    ).reshape_as(value).to(dtype=input_dtype)
+    expected = (
+        torch.mm(
+            value_bf16,
+            weight_bf16.mT,
+            out_dtype=torch.float32,
+        ).reshape_as(actual)
+        + bias.detach()
+    )
+    expected_value_gradient = (
+        torch.mm(
+            gradient_bf16,
+            weight_bf16,
+            out_dtype=torch.float32,
+        )
+        .reshape_as(value)
+        .to(dtype=input_dtype)
+    )
     expected_weight_gradient = torch.mm(
         gradient_bf16.mT,
         value_bf16,
@@ -155,9 +139,7 @@ def test_tensor_core_linear_cuda_uses_flattened_bf16_vjp(
     torch.testing.assert_close(
         gradients[1], expected_weight_gradient, rtol=0.0, atol=0.0
     )
-    torch.testing.assert_close(
-        gradients[2], expected_bias_gradient, rtol=0.0, atol=0.0
-    )
+    torch.testing.assert_close(gradients[2], expected_bias_gradient, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.cuda
@@ -184,386 +166,73 @@ def test_tensor_core_linear_final_cast_preserves_fp32_input_vjp(
     assert gradients[0].dtype is torch.float32
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
     for actual_gradient, expected_gradient in zip(gradients, expected_gradients):
-        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-6, atol=1e-6)
-
-
-def test_accretive_generator_matches_its_parameterization() -> None:
-    torch.manual_seed(2)
-    raw = torch.randn(2, 4, 4, dtype=torch.float64)
-    generator = accretive_generator(raw)
-
-    offset = math.log(math.expm1(1.0))
-    diagonal = torch.diagonal(raw, dim1=-2, dim2=-1)
-    factor = torch.tril(raw, diagonal=-1) + torch.diag_embed(
-        torch.nn.functional.softplus(diagonal + offset)
-    )
-    upper = torch.triu(raw, diagonal=1)
-    expected = factor @ factor.mT + upper - upper.mT
-
-    torch.testing.assert_close(generator, expected)
-    symmetric = 0.5 * (generator + generator.mT)
-    assert torch.all(torch.linalg.eigvalsh(symmetric) > 0.0)
-
-
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_accretive_generator_cuda_forces_ieee_factor_gram_vjp() -> None:
-    """The compact factor is full FP32 even when the ambient policy is TF32."""
-
-    torch.manual_seed(22)
-    raw_seed = 4.0 * torch.randn(2, 3, 16, 16, device="cuda")
-    upstream = torch.randn_like(raw_seed)
-    actual_raw = raw_seed.detach().clone().requires_grad_()
-    expected_raw = raw_seed.detach().clone().requires_grad_()
-
-    matmul = torch.backends.cuda.matmul
-    previous = matmul.fp32_precision
-    try:
-        matmul.fp32_precision = "tf32"
-        actual = accretive_generator(actual_raw)
-        actual_gradient = torch.autograd.grad((actual * upstream).sum(), actual_raw)[0]
-        assert matmul.fp32_precision == "tf32"
-
-        matmul.fp32_precision = "ieee"
-        diagonal = torch.diagonal(expected_raw, dim1=-2, dim2=-1)
-        factor = torch.tril(expected_raw, diagonal=-1) + torch.diag_embed(
-            functional.softplus(diagonal + math.log(math.expm1(1.0)))
-        )
-        upper = torch.triu(expected_raw, diagonal=1)
-        expected = factor @ factor.mT + upper - upper.mT
-        expected_gradient = torch.autograd.grad(
-            (expected * upstream).sum(), expected_raw
-        )[0]
-    finally:
-        matmul.fp32_precision = previous
-
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(
-        actual_gradient,
-        expected_gradient,
-        rtol=5e-6,
-        atol=5e-6,
-    )
-
-
-def test_zero_raw_generator_is_identity() -> None:
-    raw = torch.zeros(3, 4, 4, dtype=torch.float64)
-    expected = torch.eye(4, dtype=torch.float64).expand_as(raw)
-    torch.testing.assert_close(accretive_generator(raw), expected)
-
-
-def test_shared_compact_state_preserves_dynamic_drive_algebra() -> None:
-    torch.manual_seed(3)
-    batch, heads, length, rank, head_dim = 2, 3, 7, 4, 6
-    relation = torch.randn(batch, heads, length, rank, dtype=torch.float64)
-    content = torch.randn(batch, heads, length, head_dim, dtype=torch.float64)
-    drive_weight = torch.randn(heads, head_dim, rank, dtype=torch.float64)
-    valid_count = torch.tensor([7.0, 5.0], dtype=torch.float64)
-    frame = qr_soft_frame(
-        relation / valid_count.sqrt().view(batch, 1, 1, 1)
-    )
-
-    compact_state = frame.mT @ content
-    legacy_drive = torch.einsum("bhnd,hdr->bhnr", content, drive_weight)
-    legacy = frame.mT @ legacy_drive
-    shared = torch.einsum("bhrd,hdk->bhrk", compact_state, drive_weight)
-    torch.testing.assert_close(shared, legacy)
-
-    normalized_legacy = legacy / valid_count.sqrt().view(batch, 1, 1, 1)
-    normalized_shared = shared / valid_count.sqrt().view(batch, 1, 1, 1)
-    torch.testing.assert_close(normalized_shared, normalized_legacy)
-
-
-def test_equilibrium_mix_satisfies_direct_solve_equation() -> None:
-    torch.manual_seed(4)
-    batch, heads, length, rank, head_dim = 2, 3, 8, 4, 5
-    frame = qr_soft_frame(
-        torch.randn(batch, heads, length, rank, dtype=torch.float64)
-    )
-    raw = torch.randn(batch, heads, rank, rank, dtype=torch.float64)
-    generator = accretive_generator(raw)
-    content = torch.randn(batch, heads, length, head_dim, dtype=torch.float64)
-    compact_state = frame.mT @ content
-    eta = bounded_complement(torch.tensor([-0.7, 0.2, 0.9], dtype=torch.float64))
-
-    output = accretive_equilibrium_mix(
-        frame,
-        generator,
-        compact_state,
-        content,
-        eta,
-    )
-
-    rank_eye = torch.eye(rank, dtype=torch.float64)
-    equilibrium = torch.linalg.solve(generator + rank_eye, compact_state)
-    torch.testing.assert_close(
-        (generator + rank_eye) @ equilibrium,
-        compact_state,
-    )
-    eta_batch = eta.view(1, heads, 1, 1)
-    expected = eta_batch * content + frame @ (
-        2.0 * equilibrium - (1.0 + eta_batch) * compact_state
-    )
-    torch.testing.assert_close(output, expected)
-
-
-@pytest.mark.parametrize("dynamic", [False, True])
-def test_equilibrium_mix_accepts_static_and_dynamic_generators(
-    dynamic: bool,
-) -> None:
-    torch.manual_seed(5)
-    batch, heads, length, rank, head_dim = 2, 3, 7, 4, 6
-    frame = qr_soft_frame(torch.randn(batch, heads, length, rank))
-    static_generator = accretive_generator(torch.randn(heads, rank, rank))
-    generator = (
-        static_generator.unsqueeze(0).expand(batch, -1, -1, -1).clone()
-        if dynamic
-        else static_generator
-    )
-    content = torch.randn(batch, heads, length, head_dim)
-    compact_state = frame.mT @ content
-    eta = bounded_complement(torch.linspace(-0.6, 0.9, heads))
-
-    output = accretive_equilibrium_mix(
-        frame,
-        generator,
-        compact_state,
-        content,
-        eta,
-    )
-    assert output.shape == content.shape
-    assert torch.isfinite(output).all()
-
-
-def test_zero_compact_core_uses_the_unscaled_complement_formula() -> None:
-    torch.manual_seed(6)
-    batch, heads, length, rank, head_dim = 2, 1, 7, 4, 3
-    frame = qr_soft_frame(
-        torch.randn(batch, heads, length, rank, dtype=torch.float64)
-    )
-    content = torch.randn(batch, heads, length, head_dim, dtype=torch.float64)
-    compact_state = frame.mT @ content
-    eta = torch.tensor([0.9], dtype=torch.float64)
-
-    output = accretive_equilibrium_mix(
-        frame,
-        None,
-        compact_state,
-        content,
-        eta,
-    )
-    expected = eta.view(1, heads, 1, 1) * (
-        content - frame @ compact_state
-    )
-    torch.testing.assert_close(output, expected)
-
-
-def test_direct_equilibrium_has_normal_range_gradients() -> None:
-    torch.manual_seed(7)
-    relation = torch.randn(2, 2, 8, 4, dtype=torch.float64, requires_grad=True)
-    raw = torch.randn(2, 2, 4, 4, dtype=torch.float64, requires_grad=True)
-    content = torch.randn(2, 2, 8, 5, dtype=torch.float64, requires_grad=True)
-    eta_raw = torch.tensor([-0.4, 0.6], dtype=torch.float64, requires_grad=True)
-
-    frame = qr_soft_frame(relation)
-    generator = accretive_generator(raw)
-    compact_state = frame.mT @ content
-    output = accretive_equilibrium_mix(
-        frame,
-        generator,
-        compact_state,
-        content,
-        bounded_complement(eta_raw),
-    )
-    gradients = torch.autograd.grad(
-        output.square().mean(),
-        (relation, raw, content, eta_raw),
-    )
-    assert all(
-        gradient is not None and torch.isfinite(gradient).all()
-        for gradient in gradients
-    )
-    assert torch.count_nonzero(gradients[1]) > 0
-
-
-def test_compact_diagnostics_match_dense_operator_and_certificate_bounds() -> None:
-    torch.manual_seed(70)
-    batch, heads, length, rank, head_dim = 2, 3, 9, 4, 5
-    frame = qr_soft_frame(
-        torch.randn(batch, heads, length, rank, dtype=torch.float64)
-    )
-    raw = torch.randn(batch, heads, rank, rank, dtype=torch.float64)
-    generator = accretive_generator(raw)
-    content = torch.randn(batch, heads, length, head_dim, dtype=torch.float64)
-    compact_state = frame.mT @ content
-    eta = bounded_complement(torch.linspace(-0.4, 0.7, heads, dtype=torch.float64))
-    adjoint_rhs = torch.randn_like(compact_state)
-
-    diagnostics = compact_equilibrium_diagnostics(
-        frame,
-        generator,
-        compact_state,
-        eta,
-        adjoint_rhs,
-    )
-
-    identity_r = torch.eye(rank, dtype=torch.float64)
-    identity_n = torch.eye(length, dtype=torch.float64)
-    system = identity_r + generator
-    reflected = 2.0 * torch.linalg.solve(system, identity_r) - identity_r
-    eta_batch = eta.view(1, heads, 1, 1)
-    dense = eta_batch * identity_n + frame @ (reflected - eta_batch * identity_r) @ frame.mT
-    expected_q = torch.linalg.matrix_norm(dense, ord=2)
-    torch.testing.assert_close(diagnostics["q"], expected_q, rtol=2e-11, atol=2e-12)
-
-    symmetric_system = 0.5 * (system + system.mT)
-    expected_mu = torch.linalg.eigvalsh(symmetric_system)[..., 0]
-    torch.testing.assert_close(diagnostics["mu"], expected_mu)
-    assert torch.all(diagnostics["q"] < 1.0)
-    assert torch.all(diagnostics["mu"] > 1.0)
-    assert torch.all(diagnostics["state_bound_usage"] <= 1.0 + 2e-12)
-    assert torch.all(diagnostics["adjoint_bound_usage"] <= 1.0 + 2e-12)
-
-
-def test_compact_diagnostics_reject_sequence_shorter_than_rank() -> None:
-    frame = qr_soft_frame(torch.randn(1, 1, 3, 4, dtype=torch.float64))
-    generator = accretive_generator(torch.randn(1, 4, 4, dtype=torch.float64))
-    compact_state = torch.randn(1, 1, 4, 2, dtype=torch.float64)
-    with pytest.raises(ValueError, match="N >= rank R"):
-        compact_equilibrium_diagnostics(
-            frame,
-            generator,
-            compact_state,
-            torch.tensor([0.5], dtype=torch.float64),
-            torch.randn_like(compact_state),
+        torch.testing.assert_close(
+            actual_gradient, expected_gradient, rtol=1e-6, atol=1e-6
         )
 
 
-def test_direct_equilibrium_passes_first_and_second_order_gradcheck() -> None:
-    torch.manual_seed(8)
-    frame = qr_soft_frame(torch.randn(1, 1, 5, 3, dtype=torch.float64))
-    content = torch.randn(1, 1, 5, 2, dtype=torch.float64)
-    compact_state = frame.mT @ content
-    eta = torch.tensor([0.35], dtype=torch.float64)
-    raw = torch.randn(1, 3, 3, dtype=torch.float64, requires_grad=True)
-
-    def mix(coordinates: torch.Tensor) -> torch.Tensor:
-        return accretive_equilibrium_mix(
-            frame,
-            accretive_generator(coordinates),
-            compact_state,
-            content,
-            eta,
-        )
-
-    assert torch.autograd.gradcheck(
-        mix,
-        (raw,),
-        eps=1e-6,
-        atol=2e-5,
-        rtol=2e-3,
-    )
-    assert torch.autograd.gradgradcheck(
-        mix,
-        (raw,),
-        eps=1e-6,
-        atol=3e-5,
-        rtol=3e-3,
-    )
 
 
-def test_bounded_complement_is_a_strict_interior_tanh() -> None:
-    raw = torch.tensor([-3.0, 0.0, 4.0], dtype=torch.float32)
-    actual = bounded_complement(raw)
-    expected = (1.0 - torch.finfo(torch.float32).eps) * raw.tanh()
-    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-7)
-    assert torch.all(actual.abs() < 1.0)
 
 
-def test_bounded_complement_retains_the_fp32_tanh_tail_gradient() -> None:
-    raw = torch.tensor([-9.5, 9.5], dtype=torch.float32, requires_grad=True)
-    complement = bounded_complement(raw)
-    complement.sum().backward()
-
-    assert torch.all(complement.abs() < 1.0)
-    assert raw.grad is not None
-    assert torch.all(torch.isfinite(raw.grad))
-    assert torch.all(raw.grad.abs() > 0.0)
-
-
-def test_reference_rejects_invalid_shapes() -> None:
-    with pytest.raises(ValueError, match="matrix dimensions"):
-        qr_soft_frame(torch.randn(4))
-    with pytest.raises(TypeError, match="floating-point"):
-        qr_soft_frame(torch.ones(4, 3, dtype=torch.int64))
-    with pytest.raises(ValueError, match="square"):
-        accretive_generator(torch.randn(4, 3))
-
-    frame = torch.randn(2, 3, 7, 4)
-    content = torch.randn(2, 3, 7, 5)
-    compact_state = frame.mT @ content
-    eta = torch.ones(3)
-    with pytest.raises(ValueError, match="dynamic generator"):
-        accretive_equilibrium_mix(
-            frame,
-            torch.randn(1, 3, 4, 4),
-            compact_state,
-            content,
-            eta,
-        )
-    with pytest.raises(ValueError, match="compact_state"):
-        accretive_equilibrium_mix(
-            frame,
-            torch.randn(3, 4, 4),
-            compact_state[..., :-1],
-            content,
-            eta,
-        )
-    with pytest.raises(ValueError, match="eta"):
-        accretive_equilibrium_mix(
-            frame,
-            torch.randn(3, 4, 4),
-            compact_state,
-            content,
-            torch.tensor(0.9),
-        )
 
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("amp_dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("with_bias", (False, True))
-def test_bf16_linear_retains_wide_range_and_fp32_accumulation(amp_dtype, with_bias) -> None:
+def test_bf16_linear_retains_wide_range_and_fp32_accumulation(
+    amp_dtype, with_bias
+) -> None:
     # Both products and their sum exceed FP16 range. Ambient FP16 AMP must
     # neither recast the operands nor truncate the FP32 accumulated result.
     value = torch.full((2, 16), 131072.0, device="cuda", requires_grad=True)
     weight = torch.full((3, 16), 2.0, device="cuda", requires_grad=True)
-    bias = torch.full((3,), 262144.0, device="cuda", requires_grad=True) if with_bias else None
+    bias = (
+        torch.full((3,), 262144.0, device="cuda", requires_grad=True)
+        if with_bias
+        else None
+    )
     previous = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     with torch.autocast("cuda", dtype=amp_dtype):
         output = tensor_core_linear(value, weight, bias)
     assert torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction == previous
     assert output.dtype == torch.float32
-    torch.testing.assert_close(output, torch.full_like(output, 4456448.0 if with_bias else 4194304.0), rtol=0, atol=0)
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, 4456448.0 if with_bias else 4194304.0),
+        rtol=0,
+        atol=0,
+    )
     output.sum().backward()
     torch.testing.assert_close(value.grad, torch.full_like(value, 6.0), rtol=0, atol=0)
-    torch.testing.assert_close(weight.grad, torch.full_like(weight, 262144.0), rtol=0, atol=0)
+    torch.testing.assert_close(
+        weight.grad, torch.full_like(weight, 262144.0), rtol=0, atol=0
+    )
 
     if bias is not None:
-        torch.testing.assert_close(bias.grad, torch.full_like(bias, 2.0), rtol=0, atol=0)
+        torch.testing.assert_close(
+            bias.grad, torch.full_like(bias, 2.0), rtol=0, atol=0
+        )
 
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_linear_direct_bf16_store_keeps_fp32_accumulation() -> None:
-    value = torch.full((2, 256), 32768.0, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    value = torch.full(
+        (2, 256), 32768.0, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
     weight = torch.ones(3, 256, device="cuda", requires_grad=True)
     output = tensor_core_linear(value, weight, output_dtype=torch.bfloat16)
     assert output.dtype == torch.bfloat16
-    torch.testing.assert_close(output, torch.full_like(output, 8388608.0), rtol=0, atol=0)
+    torch.testing.assert_close(
+        output, torch.full_like(output, 8388608.0), rtol=0, atol=0
+    )
     output.sum().backward()
     torch.testing.assert_close(value.grad, torch.full_like(value, 3.0), rtol=0, atol=0)
-    torch.testing.assert_close(weight.grad, torch.full_like(weight, 65536.0), rtol=0, atol=0)
+    torch.testing.assert_close(
+        weight.grad, torch.full_like(weight, 65536.0), rtol=0, atol=0
+    )
 
 
 @pytest.mark.cuda
@@ -572,7 +241,9 @@ def test_linear_fp16_output_does_not_round_through_bf16() -> None:
     value = torch.ones(1, 2, device="cuda", dtype=torch.bfloat16)
     weight = torch.tensor([[1.0, 1.0 / 512]], device="cuda")
     output = tensor_core_linear(value, weight, output_dtype=torch.float16)
-    torch.testing.assert_close(output, torch.full_like(output, 1.0 + 1.0 / 512), rtol=0, atol=0)
+    torch.testing.assert_close(
+        output, torch.full_like(output, 1.0 + 1.0 / 512), rtol=0, atol=0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -591,7 +262,9 @@ def test_biased_linear_fused_store_preserves_fp32_bias(dtype) -> None:
     with torch.no_grad():
         torch.testing.assert_close(
             tensor_core_linear(value, weight, bias, output_dtype=dtype),
-            output, rtol=0, atol=0,
+            output,
+            rtol=0,
+            atol=0,
         )
 
 
@@ -599,7 +272,9 @@ def test_biased_linear_fused_store_preserves_fp32_bias(dtype) -> None:
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_biased_linear_fused_store_handles_strides_and_tails(dtype) -> None:
     torch.manual_seed(123)
-    value = torch.randn(2, 67, 70, device="cuda", dtype=dtype)[..., ::2].requires_grad_()
+    value = torch.randn(2, 67, 70, device="cuda", dtype=dtype)[
+        ..., ::2
+    ].requires_grad_()
     weight = torch.randn(35, 51, device="cuda").T.requires_grad_()
     bias = torch.randn(102, device="cuda")[::2].requires_grad_()
     output = tensor_core_linear(value, weight, bias, output_dtype=dtype)
@@ -614,103 +289,112 @@ def test_biased_linear_fused_store_handles_strides_and_tails(dtype) -> None:
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize('static', [False, True])
-@pytest.mark.parametrize('scale', [0.0, 1e-6, 0.3])
-def test_base_correction_matches_resolvent_forward_and_all_gradients(static, scale):
-    torch.manual_seed(619)
-    dtype = torch.float64
-    frame = qr_soft_frame(torch.randn(3, 2, 9, 4, dtype=dtype)).detach().requires_grad_()
-    content = torch.randn(3, 2, 9, 5, dtype=dtype, requires_grad=True)
-    # Treat Z independently to check every argument's derivative.
-    state = torch.randn(3, 2, 4, 5, dtype=dtype, requires_grad=True)
-    raw = (scale * torch.randn((2, 4, 4) if static else (3, 2, 4, 4), dtype=dtype)).requires_grad_()
-    generator = accretive_generator(raw)
-    eta = torch.tensor([0.9, -0.2], dtype=dtype, requires_grad=True)
-    actual = accretive_equilibrium_mix(frame, generator, state, content, eta)
-    expanded = generator[None].expand(3, -1, -1, -1) if static else generator
-    equilibrium = torch.linalg.solve(torch.eye(4, dtype=dtype) + expanded, state)
-    e = eta[None, :, None, None]
-    expected = e * content + frame @ (2 * equilibrium - (1 + e) * state)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_biased_linear_covers_full_and_partial_tile_groups(dtype) -> None:
+    torch.manual_seed(127)
+    # Ten row tiles and three column tiles exercise full/partial groups.
+    # Dyadic inputs make the FP32 sum exact, so this detects omitted, repeated
+    # or misaddressed tiles without conflating GEMM reduction roundoff.
+    value = (torch.randint(-16, 17, (2, 577, 70), device="cuda").to(dtype) / 8)[..., ::2]
+    weight = (torch.randint(-16, 17, (35, 259), device="cuda").float() / 8).T
+    bias = (torch.randint(-16, 17, (518,), device="cuda").float() / 64)[::2]
+    output = tensor_core_linear(value, weight, bias, output_dtype=dtype)
+    expected = (value.double() @ weight.double().T + bias.double()).to(dtype)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length,rank", [(2, 4), (7, 4), (4, 4)])
+def test_direct_readout_equals_raw_coordinate_system_and_gradients(length, rank):
+    torch.manual_seed(9)
+    q = torch.randn(2, 2, length, rank, dtype=torch.float64, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn(2, 2, length, 5, dtype=torch.float64, requires_grad=True)
+    raw = (torch.randn(2, rank, rank, dtype=torch.float64) * 0.2).requires_grad_()
+    identity = torch.eye(rank, dtype=torch.float64)
+    ak, aq = k / length**0.5, q / length**0.5
+    r = torch.linalg.cholesky(identity + ak.mT @ ak).mT
+    # Independent ridge memory plus a statistic-conditioned query transform.
+    memory = torch.linalg.solve(identity + ak.mT @ ak, ak.mT @ v)
+    query = torch.linalg.solve(r.mT, aq.mT).mT @ raw @ r
+    expected = query @ memory
+    actual = ridge_query_readout(q, k, v, raw)
+    torch.testing.assert_close(actual, expected, rtol=1e-11, atol=1e-11)
+    e = torch.randn_like(actual)
+    da = torch.autograd.grad((actual * e).sum(), (q, k, v, raw), retain_graph=True)
+    de = torch.autograd.grad((expected * e).sum(), (q, k, v, raw))
+    for a, b in zip(da, de):
+        torch.testing.assert_close(a, b, rtol=1e-10, atol=1e-10)
+
+
+def test_independent_queries_do_not_change_other_rows_or_memory():
+    torch.manual_seed(12)
+    q = torch.randn(1, 1, 5, 3, dtype=torch.float64)
+    k = torch.randn_like(q)
+    v = torch.randn(1, 1, 5, 4, dtype=torch.float64)
+    raw = torch.randn(1, 3, 3, dtype=torch.float64) * 0.2
+    base = ridge_query_readout(q, k, v, raw)
+    q2 = q.clone()
+    q2[:, :, 0] += 2
+    changed = ridge_query_readout(q2, k, v, raw)
+    torch.testing.assert_close(changed[:, :, 1:], base[:, :, 1:], rtol=0, atol=0)
+    assert not torch.equal(changed[:, :, 0], base[:, :, 0])
+
+
+def test_query_key_value_and_core_gradcheck():
+    torch.manual_seed(8)
+    inputs = (
+        torch.randn(1, 1, 3, 2, dtype=torch.float64, requires_grad=True),
+        torch.randn(1, 1, 3, 2, dtype=torch.float64, requires_grad=True),
+        torch.randn(1, 1, 3, 2, dtype=torch.float64, requires_grad=True),
+        (torch.randn(1, 2, 2, dtype=torch.float64) * 0.1).requires_grad_(),
+    )
+    assert torch.autograd.gradcheck(ridge_query_readout, inputs, fast_mode=True)
+    assert torch.autograd.gradgradcheck(ridge_query_readout, inputs, fast_mode=True)
+
+
+def test_direct_map_accepts_singular_core_and_exact_query_scale_gauge():
+    torch.manual_seed(101)
+    q = torch.randn(2, 2, 9, 4, dtype=torch.float64)
+    k = torch.randn_like(q)
+    v = torch.randn(2, 2, 9, 6, dtype=torch.float64)
+    mapping = torch.randn(2, 4, 4, dtype=torch.float64)
+    mapping[:, -1] = 0  # A singular T is valid: only the SPD key Gram is solved.
+    expected = ridge_query_readout(q, k, v, mapping)
+    scale = mapping.norm(dim=(-2, -1), keepdim=True) / 2  # radius sqrt(4) = 2
+    actual = ridge_query_readout(q * scale, k, v, mapping / scale)
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
-    upstream = torch.randn_like(actual)
-    variables = (frame, state, content, raw, eta)
-    actual_grads = torch.autograd.grad((actual * upstream).sum(), variables, retain_graph=True)
-    expected_grads = torch.autograd.grad((expected * upstream).sum(), variables)
-    for a, b in zip(actual_grads, expected_grads):
-        torch.testing.assert_close(a, b, rtol=1e-11, atol=1e-11)
-    if scale == 0:
-        assert actual_grads[3].norm() > 0  # zero correction must not mean zero core gradient
+    assert torch.count_nonzero(ridge_query_readout(q, k, v, torch.zeros_like(mapping))) == 0
 
 
-def test_static_core_solve_is_shared_and_not_cached_across_updates(monkeypatch):
+def test_direct_core_updates_are_observed_without_a_core_solve(monkeypatch):
     calls = []
-    solve = torch.linalg.solve
-    def observed(system, rhs):
-        calls.append((system.shape, rhs.shape))
-        return solve(system, rhs)
-    monkeypatch.setattr(torch.linalg, 'solve', observed)
-    torch.manual_seed(19)
-    frame = qr_soft_frame(torch.randn(7, 2, 9, 4, dtype=torch.float64))
-    content = torch.randn(7, 2, 9, 5, dtype=torch.float64)
-    state = frame.mT @ content
-    raw = torch.zeros(2, 4, 4, dtype=torch.float64, requires_grad=True)
-    eta = torch.full((2,), .9, dtype=torch.float64)
-    first = accretive_equilibrium_mix(frame, accretive_generator(raw), state, content, eta)
-    gradient, = torch.autograd.grad(first.square().sum(), raw)
-    with torch.no_grad():
-        raw.add_(gradient, alpha=-.01)
-    second = accretive_equilibrium_mix(frame, accretive_generator(raw), state, content, eta)
-    assert calls == [(torch.Size([2, 4, 4]), torch.Size([2, 4, 4]))] * 2
-    assert not torch.allclose(first, second)
+    solve = torch.linalg.solve_ex
+
+    def capture(a, b, *args, **kwargs):
+        calls.append(tuple(a.shape))
+        return solve(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "solve_ex", capture)
+    q = torch.randn(5, 2, 7, 3, dtype=torch.float64)
+    k = torch.randn_like(q)
+    v = torch.randn(5, 2, 7, 4, dtype=torch.float64)
+    raw = torch.zeros(2, 3, 3, dtype=torch.float64)
+    first = ridge_query_readout(q, k, v, raw)
+    raw[:, 0, 1] = 0.4
+    second = ridge_query_readout(q, k, v, raw)
+    assert calls == []
+    assert not torch.equal(first, second)
 
 
-@pytest.mark.parametrize('length', [3, 9])
-@pytest.mark.parametrize('mode', ['dynamic', 'static', 'zero'])
-def test_no_frame_identity_matches_original_resolvent_and_its_differential(length, mode):
-    """Check algebra against the original readout, independent of CUDA precision."""
-    torch.manual_seed(123)
-    rank = 4
-    a = (torch.randn(2, 2, length, rank, dtype=torch.float64) / length**0.5).requires_grad_()
-    c = torch.randn(2, 2, length, 3, dtype=torch.float64, requires_grad=True)
-    base = (torch.randn(2, rank, rank, dtype=torch.float64) * .1).requires_grad_()
-    drive = (torch.randn(2, 3, rank, dtype=torch.float64) * .1).requires_grad_()
-    eta = torch.tensor([.1, -.2], dtype=torch.float64, requires_grad=True)
-    eye = torch.eye(rank, dtype=torch.float64)
-
-    def generator(z):
-        if mode == 'zero':
-            return eye
-        return accretive_generator(base if mode == 'static' else base + z @ drive / length**0.5)
-
-    p = qr_soft_frame(a)
-    z = p.mT @ c
-    k = generator(z)
-    e = eta[None, :, None, None]
-    original = 2 * p @ torch.linalg.solve(eye + k, z) - (1 + e) * (p @ z) + e * c
-    lower = torch.linalg.cholesky(eye + a.mT @ a)
-    z2 = torch.linalg.solve_triangular(lower, a.mT @ c, upper=False)
-    k2 = generator(z2)
-    delta = torch.linalg.solve(eye + k2, (eye - k2) @ z2)
-    v = torch.linalg.solve_triangular(lower.mT, delta - e * z2, upper=True)
-    no_frame = e * c + a @ v
-    torch.testing.assert_close(original, no_frame, atol=1e-12, rtol=1e-10)
-    # The common base is a regularized inverse, not an orthogonal complement.
-    token_eye = torch.eye(length, dtype=torch.float64)
-    base_inverse = torch.linalg.solve(token_eye + a @ a.mT, c)
-    torch.testing.assert_close(c - p @ z, base_inverse, atol=1e-12, rtol=1e-10)
-    upstream = torch.randn_like(original)
-    arguments = (a, c, base, drive, eta)
-    first = torch.autograd.grad(original, arguments, upstream, allow_unused=True, retain_graph=True)
-    second = torch.autograd.grad(no_frame, arguments, upstream, allow_unused=True)
-    for left, right in zip(first, second):
-        if left is None:
-            assert right is None
-        else:
-            torch.testing.assert_close(left, right, atol=1e-11, rtol=1e-9)
-
-
-def test_bounded_complement_has_the_tanh_derivative_at_zero():
-    raw = torch.tensor([-1e-6, 0.0, 1e-6], dtype=torch.float64, requires_grad=True)
-    actual = torch.autograd.grad(bounded_complement(raw).sum(), raw)[0]
-    expected = (1 - torch.finfo(raw.dtype).eps) / raw.cosh().square()
-    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-15)
+@pytest.mark.parametrize("scale", [1.0, 1e-3])
+def test_head_rmsnorm_does_not_mix_tokens_or_heads(scale):
+    x = (torch.randn(2, 7, 3, 5, dtype=torch.float64) * scale).requires_grad_()
+    w = torch.randn(5, dtype=torch.float64, requires_grad=True)
+    expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * w
+    torch.testing.assert_close(head_rms_norm(x, w), expected)
+    assert torch.autograd.gradcheck(head_rms_norm, (x, w), fast_mode=True)
+    probe = torch.randn_like(x)
+    gain_grad, = torch.autograd.grad(head_rms_norm(x, w), w, probe)
+    normalized = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(gain_grad, (normalized * probe).sum((0, 1, 2)))

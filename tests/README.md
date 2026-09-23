@@ -7,7 +7,7 @@ rather than a local experiment or benchmark.
 | Scope | Command | Covers |
 | --- | --- | --- |
 | `core` | `python -m pytest tests/core -m "not cuda"` | Operator mathematics, model/configuration behavior, and public API. |
-| `cuda` | `python -m pytest tests/cuda` | Native extension ABI, dispatch, and CUDA oracle comparisons. |
+| `cuda` | `python -m pytest tests/cuda` | CUDA device contract, dispatch, and CUDA oracle comparisons. |
 | `integrations` | `python -m pytest tests/integrations -m "not cuda"` | timm and OpenMMLab adapters. |
 | `experiments` | `python -m pytest tests/experiments -m "not cuda"` | Data protocols and training entrypoints. |
 | `repository` | `python -m pytest tests/repository` | Repository shape and ownership contract. |
@@ -29,11 +29,16 @@ python tools/check_repository.py
 git diff --check
 ```
 
-Read skip reasons with `-rs`. Missing timm/OpenMMLab packages or a missing native
-artifact must not be reported as successful full-model validation. Test other
+Read skip reasons with `-rs`. Missing timm/OpenMMLab packages  must not be reported as successful full-model validation. Test other
 SM targets on their own hardware. Benchmarks and exploratory probes belong
 outside the tracked test tree.
 
 Before the 2026-09-12 main publication, the full suite passed 342 tests with
 6 skips; only SM120 was executed. This is a dated verification record, not a
 promise that all optional stacks or architectures were exercised.
+
+The current model contract 19 / CUDA contract 17 has a known failing
+single-valid-token FP64 oracle check: the near-zero core gradient exceeds
+the unchanged absolute tolerance. See the range-audit TODO in
+[CUDA contract](../docs/CUDA_CONTRACT.md). This case also fails before the
+identity-plus-delta parameterization; it must not be reported as passing.

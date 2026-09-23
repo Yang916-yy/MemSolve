@@ -7,9 +7,8 @@ split_seed = 2026
 validation_fraction = 0.1
 
 [model]
-mixer = "lsso"
+mixer = "ridgon"
 implementation = "cuda"
-core_mode = "dynamic"
 dim = 128
 depth = 4
 heads = 4

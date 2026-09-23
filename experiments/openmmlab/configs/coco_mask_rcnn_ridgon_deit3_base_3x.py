@@ -1,4 +1,4 @@
-"""COCO 2017 Mask R-CNN + FPN 3x, LSSO DeiT III Small."""
+"""COCO 2017 Mask R-CNN + FPN 3x, Ridgon DeiT III Base."""
 
 _base_ = "./_base_/coco_mask_rcnn_fpn_3x.py"
 
@@ -9,12 +9,11 @@ custom_imports = dict(
 
 model = dict(
     backbone=dict(
-        type="LSSODeiT3Backbone",
-        variant="small",
-        rank=32,
+        type="RidgonViTBackbone",
+        variant="base",
+        rank=48,
         out_indices=(3, 5, 7, 11),
         implementation="cuda",
-        core_mode="dynamic",
     ),
-    neck=dict(in_channels=[384, 384, 384, 384]),
+    neck=dict(in_channels=[768, 768, 768, 768]),
 )

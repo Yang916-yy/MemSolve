@@ -1,4 +1,4 @@
-"""Controlled short Food-101 ablations using the shared LSSO vision adapter.
+"""Short Food-101 training using the shared Ridgon vision adapter.
 
 Train on the official training split; report the official test curve and the
 fixed final epoch, without test-based checkpoint selection or early stopping.
@@ -25,23 +25,16 @@ from experiments.imagenet import (
     IMAGENET_MEAN, IMAGENET_STD, _append_jsonl, _atomic_json,
     _atomic_torch_save, _no_weight_decay,
 )
-from integrations.timm import LSSODeiT3
+from integrations.timm import RidgonViT
 
 
-VARIANTS = ("dynamic", "static", "zero")
-
-
-def build_model(variant: str, *, seed: int = 0, implementation: str = "reference") -> nn.Module:
-    if variant not in VARIANTS:
-        raise ValueError(f"unknown variant: {variant}")
+def build_model(*, seed: int = 0, implementation: str = "reference") -> nn.Module:
     torch.manual_seed(seed)
-    # timm stores the learned 14 x 14 patch grid flattened in raster order.
-    # Every spatial site has its own vector; CLS has no position embedding.
-    return LSSODeiT3(
+    # Same no-CLS, no-LayerScale CPE scaffold as ImageNet.
+    return RidgonViT(
         image_size=224, patch_size=16, num_classes=101,
         embed_dim=384, depth=12, num_heads=6, rank=32,
-        core_mode=variant,
-        implementation=implementation, drop_path_rate=0.05,
+        implementation=implementation, drop_path_rate=0.1, mlp_ratio=4.0,
     )
 
 
@@ -110,7 +103,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--variant", choices=VARIANTS, required=True)
+
     p.add_argument("--implementation", choices=("reference", "cuda"), default="cuda")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--seed", type=int, default=0)
@@ -124,9 +117,9 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     if args.implementation == "cuda":
-        from lsso.ball import cuda
+        from ridgon.ball import cuda
         cuda.load()
-    model = build_model(args.variant, seed=args.seed, implementation=args.implementation).cuda()
+    model = build_model(seed=args.seed, implementation=args.implementation).cuda()
     # Reset stochastic-depth RNG identically after model construction.
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -142,8 +135,8 @@ def main() -> None:
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     contract = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "resume"}
-    contract.update(architecture="LSSO-S/16", dim=384, depth=12, heads=6, rank=32,
-                    position_encoding="learned-2d-full-grid-14x14-no-cls",
+    contract.update(ffn="swiglu", gate_width=1024, architecture="Ridgon-S/16", dim=384, depth=12, heads=6, rank=32,
+                    position_encoding="residual-cpe-3x3-token-ln-mean-no-cls",
                     precision="bf16-autocast-fp32-core", implementation=args.implementation,
                     pretrained=False, weight_decay=0.05, label_smoothing=0.1,
                     warmup_epochs=min(3, args.epochs), evaluation="official-test-curve-fixed-final-epoch",

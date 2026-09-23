@@ -1,6 +1,6 @@
 # Sequence Experiments
 
-> Current source uses model contract 13 and native ABI 11. External position
+> Current source uses model contract 19 and CUDA contract 17. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -10,11 +10,11 @@ for the current GenomicBenchmarks and Long Range Arena (LRA) experiments. It
 owns data preparation, the shared encoder shell, validation-based checkpoint
 selection, and the one-time held-out test evaluation.
 
-The default LSSO core is DYNAMIC. DYNAMIC, STATIC and ZERO support native
-CUDA; no-skew and no-complement require the reference backend. The shared
-encoder supplies learned absolute position embeddings initialized from
-`Normal(0, 0.02)`. Native ABI 11 accepts FP16 and BF16 inputs. Training recipes
-still default to FP16; current model checkpoints use contract 13.
+The current operator uses independent Q/K/V, a learned sample-independent
+core and direct normalized readout. It has no core-mode or complement switches.
+The shared encoder retains learned absolute position embeddings initialized
+from `Normal(0, 0.02)`. CUDA contract 17 accepts FP16 and BF16 inputs; sequence
+recipes still default to FP16. Current model checkpoints use contract 19.
 
 Historical results below used earlier operator and numerical contracts,
 including internal relation-feature preprocessing absent from current source.
@@ -242,7 +242,7 @@ The formal LRA panel excludes all exploratory artifacts. In particular:
 ## Reproducing the Panels
 
 Place the prepared datasets at explicit roots, load the published or locally
-built LSSO CUDA runtime, and run from a clean committed checkout. The formal
+built Ridgon CUDA runtime, and run from a clean committed checkout. The formal
 runner records the actual source fingerprints, so changing the shell variables
 below does not change dataset identity when the contents are the same.
 
@@ -267,7 +267,7 @@ for task in "${genomic_tasks[@]}"; do
   if [[ "$task" == dummy_mouse_enhancers_ensembl ]]; then
     batch_args=(--batch-size 64 --grad-accum 2)
   fi
-  for mixer in mha lsso; do
+  for mixer in mha ridgon; do
     for seed in 0 1 2; do
       python -m experiments.train_transformers \
         --config experiments/configs/genomic.toml \
@@ -283,9 +283,9 @@ for task in listops text retrieval pathfinder; do
   for seed in 0 1 2; do
     python -m experiments.train_transformers \
       --config experiments/configs/lra.toml \
-      --task "$task" --mixer lsso --seed "$seed" --formal \
+      --task "$task" --mixer ridgon --seed "$seed" --formal \
       --data-root "$LRA_DATA_ROOT" --cache-root "$SEQUENCE_CACHE" \
-      --output "$RUN_ROOT/lra/$task/lsso/s$seed"
+      --output "$RUN_ROOT/lra/$task/ridgon/s$seed"
   done
 done
 ~~~
@@ -315,26 +315,18 @@ loaded, while explicit command-line values such as `--task`, `--mixer`, and
 the paths above take precedence. Do not add `--pilot-epochs`, sample caps, or
 batch caps to a formal reproduction; the runner rejects these combinations.
 
-## Reproducing the Certificate Stress Test
+## Historical certificate stress test
 
-`experiments/certificate_diagnostics.py` measures the exact realized gain,
-monotonicity margin, solved-state ratio, and deterministic adjoint-probe ratio
-from trained LRA Text checkpoints. The default lengths are 1K, 2K, 4K, and 8K.
-The 8K result is an operator-level stress test, not a task-accuracy evaluation;
-the learned 4K absolute-position table is repeated rather than extrapolated.
+The recorded contraction certificates belong to the previous reflected
+operator. They do not certify the current independent-QKV normalized readout.
+Regenerating them requires their recorded source revision and checkpoints.
+The remaining `experiments/certificate_diagnostics.py` utility only summarizes
+existing raw CSV records:
 
-~~~bash
+```bash
 python -m experiments.certificate_diagnostics \
-  --checkpoint /path/to/text/lsso/s0/best.pt \
-  --checkpoint /path/to/text/lsso/s1/best.pt \
-  --checkpoint /path/to/text/lsso/s2/best.pt \
-  --output /path/outside/the/repository/certificate-length-depth
-~~~
-
-The command requires CUDA because it advances the trained encoder through its
-native mixer path. Diagnostics themselves use FP64 compact linear algebra and
-never construct an `N x N` token operator. The output directory contains raw
-observations, percentile summaries, complete protocol metadata, and the plot.
+  --input /path/to/raw.csv --output /path/to/summary.csv
+```
 
 ### MHA + RoPE + learned absolute embeddings control
 
@@ -343,6 +335,6 @@ initialization, and retains the encoder's learned absolute position embeddings.
 It applies standard RoFormer adjacent-pair rotation to Q and K only, across the
 full head dimension, with base 10000 and token indices starting at zero. V is
 unchanged. Source: https://github.com/ZhuiyiTechnology/roformer . This is a
-standard MHA RoPE control; LSSO does not use it.
+standard MHA RoPE control; Ridgon does not use it.
 Explicit rotation-matrix forward/input-gradient oracles cover padding and empty
 examples, and the position-zero case agrees with ordinary MHA.

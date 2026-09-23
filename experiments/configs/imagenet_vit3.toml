@@ -1,12 +1,11 @@
 # Plain ViT³ training, official commit e3477587d099e6b9e83e9e7c80b1b999e0989a20.
 # Selected global batch 1024 / LR .001, following upstream linear LR scaling.
-# The LSSO backbone is retained; ranks are LSSO choices, not ViT³ parameters.
-# Virtual Mixup groups retain the source default of 128; accumulation is local adaptation.
+# The Ridgon backbone is retained; ranks are Ridgon choices, not ViT³ parameters.
+# Mixup/CutMix operates on each complete physical per-GPU batch.
 [defaults]
 num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
-layer_scale_init_value = 1.0e-4
 norm_eps = 1.0e-6
 position_encoding = "cpe"
 epochs = 300
@@ -16,7 +15,7 @@ min_lr = 1.0e-5
 weight_decay = 0.05
 clip_grad = 5.0
 seed = 0
-train_workers = 10
+train_workers = 12
 val_workers = 4
 eval_crop_ratio = 0.875
 reprob = 0.25
@@ -31,7 +30,6 @@ execution = "graph"
 save_every = 1
 batch_size = 512
 effective_batch = 1024
-augmentation_group_size = 128
 lr = 0.001
 optimizer = "fused_adamw"
 augmentation = "rand_augment"
@@ -42,7 +40,6 @@ bce_loss = false
 label_smoothing = 0.1
 
 [operator]
-core_mode = "dynamic"
 bias = true
 implementation = "cuda"
 
@@ -56,8 +53,8 @@ drop_path_rate = 0.0
 input_size = 224
 
 [tiers.small]
-# 1584 hidden channels (16-aligned): 20,033,392 parameters including the head.
-mlp_ratio = 4.125
+# SwiGLU gate width 1024 (packed input projection 2048): 20,327,272 parameters with head.
+# Inherits mlp_ratio=4.0: gate width = (8/3) * embed_dim.
 embed_dim = 384
 depth = 12
 num_heads = 6

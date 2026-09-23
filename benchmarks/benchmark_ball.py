@@ -7,12 +7,12 @@ import time
 import torch
 import torch.nn as nn
 
-from lsso import LSSO, LSSOConfig
+from ridgon import Ridgon, RidgonConfig
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark a complete LSSO or MHA mixer block on one CUDA device."
+        description="Benchmark a complete Ridgon or MHA mixer block on one CUDA device."
     )
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--length", type=int, default=512)
@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Microbatches per parameter-gradient reset.",
     )
-    parser.add_argument("--operator", choices=("lsso", "mha"), default="lsso")
+    parser.add_argument("--operator", choices=("ridgon", "mha"), default="ridgon")
     parser.add_argument("--mode", choices=("forward", "train"), default="train")
     parser.add_argument(
         "--implementation",
@@ -52,11 +52,11 @@ def _dtype(name: str) -> torch.dtype:
 
 
 class _BenchmarkMixer(nn.Module):
-    """Present LSSO and MHA through one tensor-only benchmark surface."""
+    """Present Ridgon and MHA through one tensor-only benchmark surface."""
 
     def __init__(
         self,
-        mixer: LSSO | nn.MultiheadAttention,
+        mixer: Ridgon | nn.MultiheadAttention,
         *,
         operator: str,
         implementation: str,
@@ -67,8 +67,8 @@ class _BenchmarkMixer(nn.Module):
         self.implementation = implementation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.operator == "lsso":
-            assert isinstance(self.mixer, LSSO)
+        if self.operator == "ridgon":
+            assert isinstance(self.mixer, Ridgon)
             return self.mixer(
                 x,
                 implementation=self.implementation,
@@ -93,9 +93,9 @@ def main() -> None:
     dtype = _dtype(args.dtype)
     torch.backends.cuda.matmul.fp32_precision = "tf32" if args.tf32 else "ieee"
     torch.backends.cudnn.fp32_precision = "tf32" if args.tf32 else "ieee"
-    if args.operator == "lsso":
-        mixer: LSSO | nn.MultiheadAttention = LSSO(
-            LSSOConfig(
+    if args.operator == "ridgon":
+        mixer: Ridgon | nn.MultiheadAttention = Ridgon(
+            RidgonConfig(
                 dim=args.dim,
                 num_heads=args.heads,
                 rank=args.rank,
@@ -127,8 +127,8 @@ def main() -> None:
     )
     if args.mode == "train":
         x.requires_grad_(True)
-    if args.operator == "lsso" and args.implementation == "cuda":
-        from lsso.ball import cuda
+    if args.operator == "ridgon" and args.implementation == "cuda":
+        from ridgon.ball import cuda
 
         cuda.load(device=device)
 
@@ -187,8 +187,8 @@ def main() -> None:
         gpu_samples.append(start_event.elapsed_time(end_event) / args.steps)
 
     properties = torch.cuda.get_device_properties(device)
-    implementation = args.implementation if args.operator == "lsso" else "torch_mha"
-    rank = str(args.rank) if args.operator == "lsso" else "na"
+    implementation = args.implementation if args.operator == "ridgon" else "torch_mha"
+    rank = str(args.rank) if args.operator == "ridgon" else "na"
     position = "none"
     print(
         f"device={properties.name} sm={properties.major}.{properties.minor} "

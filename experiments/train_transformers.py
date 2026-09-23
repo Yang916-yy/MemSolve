@@ -1,7 +1,7 @@
 """Shared PyTorch sequence runner for GenomicBenchmarks and Long Range Arena.
 
-The runner intentionally owns no LSSO mathematics.  It uses the public
-``LSSO`` module for the current operator and a matched PyTorch MHA block for
+The runner intentionally owns no Ridgon mathematics.  It uses the public
+``Ridgon`` module for the current operator and a matched PyTorch MHA block for
 baselines, while data/tokenization contracts live in ``sequence_data.py``.
 """
 
@@ -30,8 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lsso import CoreMode, LSSO, LSSOConfig
-from lsso.ball import cuda as cuda_backend
+from ridgon import Ridgon, RidgonConfig
+from ridgon.ball import cuda as cuda_backend
 
 from experiments.sequence_data import (
     DatasetBundle,
@@ -129,7 +129,7 @@ FROZEN_DNA_MIXERS = frozenset({"nystromformer", "rebased"})
 MixerName = Literal[
     "mha",
     "mha_rope",
-    "lsso",
+    "ridgon",
     "linear_transformer",
     "performer",
     "nystromformer",
@@ -139,7 +139,7 @@ MixerName = Literal[
 
 
 class MaskedMultiheadAttention(nn.Module):
-    """Bidirectional MHA baseline with the same valid-token contract as LSSO."""
+    """Bidirectional MHA baseline with the same valid-token contract as Ridgon."""
 
     def __init__(self, dim: int, num_heads: int, *, bias: bool, rope: bool = False) -> None:
         super().__init__()
@@ -523,28 +523,22 @@ class SequenceBlock(nn.Module):
         num_heads: int,
         rank: int,
         mixer: MixerName,
-        core_mode: CoreMode,
         implementation: Literal["reference", "cuda"],
         mlp_ratio: float,
         dropout: float,
         bias: bool,
-        skew_coupling: bool = True,
-        scalar_complement: bool = True,
     ) -> None:
         super().__init__()
         self.mixer_kind = mixer
         self.implementation = implementation
         self.norm1 = nn.LayerNorm(dim)
-        if mixer == "lsso":
-            self.mixer: nn.Module = LSSO(
-                LSSOConfig(
+        if mixer == "ridgon":
+            self.mixer: nn.Module = Ridgon(
+                RidgonConfig(
                     dim=dim,
                     num_heads=num_heads,
                     rank=rank,
-                    core_mode=core_mode,
                     bias=bias,
-                    skew_coupling=skew_coupling,
-                    scalar_complement=scalar_complement,
                 )
             )
         elif mixer in ("mha", "mha_rope"):
@@ -575,11 +569,11 @@ class SequenceBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         normalized = self.norm1(x)
-        if self.mixer_kind == "lsso":
+        if self.mixer_kind == "ridgon":
             if normalized.device.type == "cuda" and torch.is_autocast_enabled():
                 amp_dtype = torch.get_autocast_dtype("cuda")
                 if self.implementation == "cuda" and amp_dtype not in (torch.float16, torch.bfloat16):
-                    raise TypeError("the CUDA LSSO sequence path supports FP16 or BF16 AMP")
+                    raise TypeError("the CUDA Ridgon sequence path supports FP16 or BF16 AMP")
                 normalized = normalized.to(dtype=amp_dtype)
             mixed = self.mixer(  # type: ignore[operator]
                 normalized,
@@ -597,7 +591,7 @@ class SequenceBlock(nn.Module):
 class SequenceEncoder(nn.Module):
     """Learned absolute coordinate features plus current mixer blocks.
 
-    Learned position embeddings are shared by MHA and LSSO. LSSO itself
+    Learned position embeddings are shared by MHA and Ridgon. Ridgon itself
     has no position-dependent feature rotation.
     """
 
@@ -613,14 +607,11 @@ class SequenceEncoder(nn.Module):
         num_heads: int,
         rank: int,
         mixer: MixerName,
-        core_mode: CoreMode,
         implementation: Literal["reference", "cuda"],
         mlp_ratio: float,
         dropout: float,
         bias: bool,
         grid_shape: tuple[int, int] | None = None,
-        skew_coupling: bool = True,
-        scalar_complement: bool = True,
     ) -> None:
         super().__init__()
         if max_length <= 0:
@@ -629,7 +620,7 @@ class SequenceEncoder(nn.Module):
             raise ValueError("depth must be positive")
         self.input_kind = input_kind
         self.max_length = max_length
-        self._cuda_lsso = mixer == "lsso" and implementation == "cuda"
+        self._cuda_ridgon = mixer == "ridgon" and implementation == "cuda"
         if input_kind == "tokens":
             if vocab_size is None or pad_token_id is None:
                 raise ValueError("token models require vocab_size and pad_token_id")
@@ -663,9 +654,6 @@ class SequenceEncoder(nn.Module):
                 num_heads=num_heads,
                 rank=rank,
                 mixer=mixer,
-                core_mode=core_mode,
-                skew_coupling=skew_coupling,
-                scalar_complement=scalar_complement,
                 implementation=implementation,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
@@ -714,8 +702,8 @@ class SequenceEncoder(nn.Module):
         )[None]
         if inputs.device.type == "cuda" and torch.is_autocast_enabled():
             amp_dtype = torch.get_autocast_dtype("cuda")
-            if self._cuda_lsso and amp_dtype not in (torch.float16, torch.bfloat16):
-                raise TypeError("the CUDA LSSO sequence path supports FP16 or BF16 AMP")
+            if self._cuda_ridgon and amp_dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("the CUDA Ridgon sequence path supports FP16 or BF16 AMP")
             x = x.to(dtype=amp_dtype)
         x = self.embedding_dropout(x)
         x = torch.where(valid_mask[:, :, None], x, torch.zeros_like(x))
@@ -886,19 +874,18 @@ def _make_parser() -> argparse.ArgumentParser:
         choices=(
             "mha",
             "mha_rope",
-            "lsso",
+            "ridgon",
             "linear_transformer",
             "performer",
             "nystromformer",
             "cosformer",
             "rebased",
         ),
-        default="lsso",
+        default="ridgon",
     )
     parser.add_argument("--implementation", choices=("reference", "cuda"), default="cuda")
-    parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="dynamic")
-    parser.add_argument("--skew-coupling", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--scalar-complement", action=argparse.BooleanOptionalAction, default=True)
+
+
     parser.add_argument("--rank", type=int)
     parser.add_argument("--dim", type=int)
     parser.add_argument("--depth", type=int)
@@ -1113,11 +1100,9 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
         raise ValueError("early_stop_accuracy_delta must be non-negative")
     if not 0.0 <= args.early_stop_loss_relative_delta < 1.0:
         raise ValueError("early_stop_loss_relative_delta must be in [0, 1)")
-    if args.implementation == "cuda" and args.mixer == "lsso":
-        if not args.skew_coupling or not args.scalar_complement:
-            raise ValueError("CUDA requires skew_coupling and scalar_complement; structural ablations use reference")
+    if args.implementation == "cuda" and args.mixer == "ridgon":
         if args.rank not in (16, 32, 48, 64):
-            raise ValueError("CUDA supports LSSO rank in {16, 32, 48, 64}")
+            raise ValueError("CUDA supports Ridgon rank in {16, 32, 48, 64}")
 
 
 def _validate_formal_data_source(args: argparse.Namespace) -> None:
@@ -1175,14 +1160,11 @@ def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
         num_heads=args.heads,
         rank=args.rank,
         mixer=args.mixer,
-        core_mode=CoreMode(args.core_mode),
         implementation=implementation,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         bias=args.bias,
         grid_shape=grid_shape,
-        skew_coupling=args.skew_coupling,
-        scalar_complement=args.scalar_complement,
     )
     if bundle.paired:
         if args.pooling != "mean":
@@ -1299,7 +1281,7 @@ def _runtime_metadata(device: torch.device, *, cuda_enabled: bool) -> dict[str, 
             }
         )
     if cuda_enabled:
-        metadata["lsso_cuda_contract"] = cuda_backend._NATIVE_CONTRACT_VERSION
+        metadata["ridgon_cuda_contract"] = cuda_backend._CUDA_CONTRACT_VERSION
     return metadata
 
 
@@ -1459,13 +1441,10 @@ def _build_run_payload(
             "mlp_ratio": args.mlp_ratio,
             "dropout": args.dropout,
             "bias": args.bias,
-            "core_mode": args.core_mode,
-            "skew_coupling": args.skew_coupling,
-            "scalar_complement": args.scalar_complement,
             "pooling": args.pooling,
             "implementation": (
                 args.implementation
-                if args.mixer == "lsso"
+                if args.mixer == "ridgon"
                 else {
                     "mha": "torch-sdpa",
                     "mha_rope": "torch-sdpa-roformer-qk-adjacent-pairs-base10000",
@@ -1752,9 +1731,9 @@ def main(argv: list[str] | None = None) -> None:
     args = resolve_args(parse_args(argv))
     _seed_all(args.seed)
     device = _choose_device(args.device)
-    if args.mixer == "lsso" and args.implementation == "cuda":
+    if args.mixer == "ridgon" and args.implementation == "cuda":
         if device.type != "cuda":
-            raise RuntimeError("LSSO CUDA implementation requires a CUDA device")
+            raise RuntimeError("Ridgon CUDA implementation requires a CUDA device")
         cuda_backend.load(device=device)
     if args.formal:
         revision = _source_revision()
@@ -1774,7 +1753,7 @@ def main(argv: list[str] | None = None) -> None:
         sizes,
         model,
         device,
-        cuda_enabled=args.mixer == "lsso" and args.implementation == "cuda",
+        cuda_enabled=args.mixer == "ridgon" and args.implementation == "cuda",
     )
     if args.prepare_only:
         print(json.dumps(run_payload, indent=2, sort_keys=True, default=str), flush=True)

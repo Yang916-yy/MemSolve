@@ -30,7 +30,6 @@ from experiments.imagenet import (
     _load_resume,
     _recipe_fidelity,
     _restore_resume_rng_state,
-    apply_virtual_group_mixup,
     build_loaders,
     build_optimizer,
     build_scheduler,
@@ -51,7 +50,7 @@ def test_direct_imagenet_launcher_imports_repository_modules() -> None:
     try:
         namespace = runpy.run_path(
             str(root / "experiments" / "train_imagenet.py"),
-            run_name="lsso_direct_launcher_test",
+            run_name="ridgon_direct_launcher_test",
         )
     finally:
         sys.path[:] = original_path
@@ -88,7 +87,6 @@ def _checkpoint_batching_plan() -> BatchingPlan:
         world_size=1,
         physical_batch_size=256,
         effective_batch_size=1024,
-        augmentation_group_size=128,
         grad_accum=4,
         samples_per_epoch=1_281_024,
         updates_per_epoch=1251,
@@ -117,6 +115,7 @@ def _data_contract(*, source_views: int = 1) -> dict[str, object]:
             "source_views": source_views,
             "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
             "validation_partition": "worker-stride-full-per-rank",
+            "worker_rng": "epoch-rank-worker-v1",
         },
     }
 
@@ -133,6 +132,14 @@ def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
 def _pixel_code_transform(image: object) -> torch.Tensor:
     pixel = image.getpixel((0, 0))  # type: ignore[union-attr]
     return torch.tensor(pixel, dtype=torch.int64)
+
+
+def _random_pixel_transform(image: object) -> torch.Tensor:
+    import numpy as np
+
+    pixel = image.getpixel((0, 0))
+    return torch.tensor((*pixel, random.random(), float(np.random.random()),
+                         float(torch.rand(()))), dtype=torch.float64)
 
 
 def _write_webdataset_root(
@@ -238,8 +245,11 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "image_size": 224,
         "patch_size": 16,
         "num_classes": 1000,
-        "mlp_ratio": 4.125,
-        "layer_scale_init_value": 1.0e-4,
+        "mlp_ratio": 4.0,
+        "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+        "layer_scale": False,
+        "class_token": False,
+        "pooling": "token_ln_mean",
         "norm_eps": 1.0e-6,
         "embed_dim": 384,
         "depth": 12,
@@ -259,11 +269,10 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
     assert (
         run.train["batch_size"],
         run.train["effective_batch"],
-        run.train["augmentation_group_size"],
-    ) == (512, 1024, 128)
-    assert (run.train["train_workers"], run.train["val_workers"]) == (10, 4)
+    ) == (512, 1024)
+    assert (run.train["train_workers"], run.train["val_workers"]) == (12, 4)
     assert run.operator == {
-        "core_mode": "dynamic",
+
         "bias": True,
         "implementation": "cuda",
     }
@@ -355,7 +364,6 @@ def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
         seed=17,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=3,
         physical_batch_size=4,
         microbatches_per_epoch=2,
@@ -376,7 +384,6 @@ def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
         seed=17,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=3,
         physical_batch_size=4,
         microbatches_per_epoch=2,
@@ -404,7 +411,6 @@ def test_webdataset_rank_partition_and_validation_are_explicit(
         seed=3,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=1,
         physical_batch_size=2,
         microbatches_per_epoch=2,
@@ -417,7 +423,6 @@ def test_webdataset_rank_partition_and_validation_are_explicit(
         seed=3,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=1,
         physical_batch_size=2,
         microbatches_per_epoch=2,
@@ -491,7 +496,6 @@ def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
         seed=29,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=3,
         physical_batch_size=4,
         microbatches_per_epoch=12,
@@ -529,48 +533,29 @@ def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
     )
 
 
-@pytest.mark.parametrize("groups_per_batch", (1, 2, 3, 4, 8))
-def test_repeated_augmentation_blocks_keep_physical_batches_source_unique(
-    groups_per_batch: int,
-) -> None:
+@pytest.mark.parametrize("batch_size", (1, 2, 3, 4, 8))
+def test_repeated_augmentation_blocks_keep_physical_batches_source_unique(batch_size) -> None:
     dataset = imagenet._ImageNetWebDataset(
         imagenet._WebDatasetSplit("train", (), (), 1),
-        transform=lambda _image: torch.zeros(1),
-        state=_cpu_state(),
-        seed=0,
-        num_classes=1,
-        training=True,
-        augmentation_group_size=1,
-        source_views=3,
-        physical_batch_size=groups_per_batch,
-        microbatches_per_epoch=17,
-        worker_count=1,
+        transform=lambda _image: torch.zeros(1), state=_cpu_state(), seed=0,
+        num_classes=1, training=True, source_views=3,
+        physical_batch_size=batch_size, microbatches_per_epoch=17, worker_count=1,
     )
-    remaining = groups_per_batch * 17
+    remaining = 17
     next_source = 0
-    emitted: list[int] = []
+    emitted = []
     while remaining:
         source_count, output_count = dataset._repeated_augmentation_block(remaining)
-        sources = list(range(next_source, next_source + source_count))
+        sources = [list(range(i * batch_size, (i + 1) * batch_size))
+                   for i in range(next_source, next_source + source_count)]
         next_source += source_count
-        block_emitted = 0
-        for _ in range(dataset.source_views):
-            for source in sources:
-                if block_emitted == output_count:
-                    break
-                emitted.append(source)
-                block_emitted += 1
-            if block_emitted == output_count:
-                break
+        emitted.extend((sources * dataset.source_views)[:output_count])
         remaining -= output_count
-
-    assert next_source == dataset._source_group_count(groups_per_batch * 17)
-    assert len(emitted) == groups_per_batch * 17
-    assert max(Counter(emitted).values()) <= dataset.source_views
-    assert all(
-        len(set(emitted[offset : offset + groups_per_batch])) == groups_per_batch
-        for offset in range(0, len(emitted), groups_per_batch)
-    )
+    assert next_source == dataset._source_batch_count(17)
+    assert len(emitted) == 17
+    assert all(len(set(batch)) == batch_size for batch in emitted)
+    counts = Counter(sample for batch in emitted for sample in batch)
+    assert max(counts.values()) <= dataset.source_views
 
 
 def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
@@ -592,7 +577,6 @@ def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
         seed=41,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=1,
         physical_batch_size=4,
         microbatches_per_epoch=3,
@@ -618,7 +602,6 @@ def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
         seed=41,
         num_classes=3,
         training=True,
-        augmentation_group_size=2,
         source_views=1,
         physical_batch_size=4,
         microbatches_per_epoch=4,
@@ -628,7 +611,55 @@ def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
         next(iter(DataLoader(short, batch_size=4, num_workers=0, drop_last=True)))
 
 
-def test_webdataset_loaders_recreate_workers_and_keep_independent_generators(
+def test_webdataset_persistent_workers_observe_epochs_and_replay_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("webdataset")
+    root = _write_webdataset_root(tmp_path, monkeypatch, train_shards=4)
+    split = imagenet.load_imagenet_webdataset_manifest(root).train
+
+    def make_loader():
+        dataset = imagenet._ImageNetWebDataset(
+            split, transform=_random_pixel_transform, state=_cpu_state(),
+            seed=29, num_classes=3, training=True,
+            physical_batch_size=4, microbatches_per_epoch=4, worker_count=2,
+        )
+        loader = DataLoader(dataset, batch_size=4, drop_last=True,
+                            **imagenet._loader_kwargs(
+                                workers=2, generator=torch.Generator().manual_seed(97)))
+        return dataset, loader
+
+    dataset, loader = make_loader()
+    resumed = None
+    try:
+        assert loader.persistent_workers
+        dataset.set_epoch(0)
+        first = list(loader)
+        pids = [worker.pid for worker in loader._iterator._workers]
+        dataset.set_epoch(1)
+        second = list(loader)
+        assert pids == [worker.pid for worker in loader._iterator._workers]
+        assert len(first) == len(second) == 4
+        assert not torch.equal(torch.cat([x for x, _ in first]),
+                               torch.cat([x for x, _ in second]))
+        # Fresh dataset/workers starting directly at epoch 1 must replay both
+        # the sample order and all three augmentation RNG streams exactly.
+        restored_dataset, resumed = make_loader()
+        restored_dataset.set_epoch(1)
+        replay = list(resumed)
+        for (x, y), (rx, ry) in zip(second, replay, strict=True):
+            assert torch.equal(x, rx) and torch.equal(y, ry)
+        dataset.set_epoch(0)
+        repeated = list(loader)
+        for (x, y), (rx, ry) in zip(first, repeated, strict=True):
+            assert torch.equal(x, rx) and torch.equal(y, ry)
+    finally:
+        for current in (loader, resumed):
+            if current is not None and current._iterator is not None:
+                current._iterator._shutdown_workers()
+
+
+def test_webdataset_zero_worker_loaders_keep_independent_generators(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -638,7 +669,6 @@ def test_webdataset_loaders_recreate_workers_and_keep_independent_generators(
         world_size=1,
         physical_batch_size=4,
         effective_batch_size=8,
-        augmentation_group_size=2,
         grad_accum=2,
         samples_per_epoch=8,
         updates_per_epoch=1,
@@ -706,14 +736,13 @@ def test_base_and_tiny_pretraining_recipes(tmp_path: Path, tier: str, expected: 
     assert run.train["optimizer"] == "fused_adamw"
 
 
-@pytest.mark.parametrize("world_size,batch,accum", [(1, 512, 2), (2, 512, 1), (8, 128, 1)])
+@pytest.mark.parametrize("world_size,batch,accum", [(1, 512, 2), (2, 512, 1), (8, 128, 1), (2, 64, 8)])
 def test_batching_plan_preserves_selected_global_batch(tmp_path, world_size, batch, accum):
     run = load_run(_args(tmp_path, "--batch-size", str(batch)))
     plan = resolve_batching_plan(run, _cpu_state(world_size=world_size),
                                 dataset_size=1_281_167, requested_grad_accum=None)
     assert plan.effective_batch_size == 1024
     assert plan.grad_accum == accum
-    assert plan.augmentation_group_size == 128
     assert plan.updates_per_epoch == 1251
     assert plan.samples_per_epoch == 1_281_024
 
@@ -721,7 +750,7 @@ def test_batching_plan_preserves_selected_global_batch(tmp_path, world_size, bat
 def test_batching_plan_rejects_non_equivalent_physical_schedules(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="physical batch_size"):
         resolve_batching_plan(
-            load_run(_args(tmp_path, "--batch-size", "64")),
+            load_run(_args(tmp_path, "--batch-size", "96")),
             _cpu_state(),
             dataset_size=1_281_167,
             requested_grad_accum=None,
@@ -779,34 +808,37 @@ def test_recipe_fidelity_marks_diagnostic_duration(tmp_path):
                                resolved_optimizer="torch.adamw.fused") == expected
 
 
-def test_virtual_group_mixup_never_crosses_group_boundaries() -> None:
+def test_train_epoch_mixup_receives_complete_physical_batch(tmp_path, monkeypatch) -> None:
     class RecordingMixup:
-        def __init__(self) -> None:
-            self.calls: list[list[int]] = []
+        def __init__(self):
+            self.calls = []
 
-        def __call__(
-            self,
-            images: torch.Tensor,
-            targets: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        def __call__(self, images, targets):
             self.calls.append(targets.tolist())
-            images.add_(1.0)
-            return images, targets.to(dtype=torch.float32).unsqueeze(1)
+            # Pair across the former 128-sample boundary.
+            return images, targets.flip(0)
 
+    class Scheduler:
+        def step_update(self, index):
+            assert index == 0
+
+    torch.manual_seed(8)
+    batch_size = 256
+    dataset = TensorDataset(torch.randn(batch_size, 2), torch.arange(batch_size))
+    model = torch.nn.Linear(2, batch_size)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     mixup = RecordingMixup()
-    images = torch.zeros(8, 1)
-    targets = torch.arange(8)
-    mixed_images, mixed_targets = apply_virtual_group_mixup(
-        images,
-        targets,
-        mixup,
-        group_size=4,
-    )
-    assert mixup.calls == [[0, 1, 2, 3], [4, 5, 6, 7]]
-    torch.testing.assert_close(mixed_images, torch.ones_like(images))
-    torch.testing.assert_close(mixed_targets[:, 0], targets.to(torch.float32))
-    with pytest.raises(ValueError, match="divisible"):
-        apply_virtual_group_mixup(torch.zeros(7, 1), torch.arange(7), mixup, 4)
+    run = ImageNetRun(config_path=tmp_path / "test.toml", tier="test", phase="test",
+                      model={}, operator={}, train={"bce_loss": False, "clip_grad": 5.0},
+                      overrides=())
+    plan = BatchingPlan(world_size=1, physical_batch_size=batch_size,
+                        effective_batch_size=batch_size, grad_accum=1,
+                        samples_per_epoch=batch_size, updates_per_epoch=1)
+    monkeypatch.setattr(imagenet, "_autocast", lambda: nullcontext())
+    train_epoch(model, DataLoader(dataset, batch_size=batch_size), SequentialSampler(dataset),
+                torch.nn.CrossEntropyLoss(), optimizer, mixup, Scheduler(),
+                epoch=0, state=_cpu_state(), run=run, batching_plan=plan, print_freq=0)
+    assert mixup.calls == [list(range(batch_size))]
 
 
 def test_gradient_accumulation_matches_one_effective_batch(
@@ -850,7 +882,6 @@ def test_gradient_accumulation_matches_one_effective_batch(
         world_size=1,
         physical_batch_size=2,
         effective_batch_size=4,
-        augmentation_group_size=2,
         grad_accum=2,
         samples_per_epoch=4,
         updates_per_epoch=1,
@@ -874,18 +905,18 @@ def test_gradient_accumulation_matches_one_effective_batch(
     assert scheduler.updates == 1
 
 
-def test_checkpoint_model_state_preserves_lsso_contract_entries() -> None:
-    from lsso import LSSO, LSSOConfig
+def test_checkpoint_model_state_preserves_ridgon_contract_entries() -> None:
+    from ridgon import Ridgon, RidgonConfig
 
-    source = LSSO(LSSOConfig(16, 2, rank=4))
+    source = Ridgon(RidgonConfig(16, 2, rank=4))
     restored = _checkpoint_model_state({"model": source.state_dict()})
     assert isinstance(restored["_extra_state"], dict)
 
-    target = LSSO(LSSOConfig(16, 2, rank=4))
+    target = Ridgon(RidgonConfig(16, 2, rank=4))
     target.load_state_dict(restored, strict=True)
-    torch.testing.assert_close(target.core_base_raw, source.core_base_raw)
+    torch.testing.assert_close(target.core_delta, source.core_delta)
 
-    with pytest.raises(ValueError, match="LSSO _extra_state"):
+    with pytest.raises(ValueError, match="Ridgon _extra_state"):
         _checkpoint_model_state({"model": {"unexpected": {}}})
 
 
@@ -969,7 +1000,6 @@ def test_checkpoint_round_trip_has_no_ema(
         world_size=1,
         physical_batch_size=512,
         effective_batch_size=2048,
-        augmentation_group_size=256,
         grad_accum=4,
         samples_per_epoch=1_280_000,
         updates_per_epoch=625,
@@ -1149,6 +1179,22 @@ def test_adamw_parameters_and_weight_decay_exclusions(tmp_path):
         assert group["lr"] == .001
         for parameter in group["params"]:
             assert group["weight_decay"] == (0 if parameter is model.bias else .05)
+
+
+
+def test_imagenet_optimizer_uses_plain_fused_adamw_with_delta_weight_decay(tmp_path):
+    from ridgon import Ridgon, RidgonConfig
+    model = Ridgon(RidgonConfig(16, 2, rank=4))
+    optimizer, _ = build_optimizer(model, load_run(_args(tmp_path)))
+    assert type(optimizer) is torch.optim.AdamW
+    assert optimizer.defaults["fused"] is True
+    assert not optimizer._optimizer_step_pre_hooks
+    assert not optimizer._optimizer_step_post_hooks
+    delta_groups = [group for group in optimizer.param_groups
+                    if any(p is model.core_delta for p in group["params"])]
+    assert len(delta_groups) == 1
+    assert delta_groups[0]["weight_decay"] == .05
+    assert torch.count_nonzero(model.core_delta) == 0
 
 
 

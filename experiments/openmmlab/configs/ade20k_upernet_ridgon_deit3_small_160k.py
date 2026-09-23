@@ -1,4 +1,4 @@
-"""ADE20K UperNet 160k, LSSO DeiT III Small."""
+"""ADE20K UperNet 160k, Ridgon DeiT III Small."""
 
 _base_ = "./_base_/ade20k_upernet_160k.py"
 
@@ -9,12 +9,11 @@ custom_imports = dict(
 
 model = dict(
     backbone=dict(
-        type="LSSODeiT3Backbone",
+        type="RidgonViTBackbone",
         variant="small",
         rank=32,
         out_indices=(3, 5, 7, 11),
         implementation="cuda",
-        core_mode="dynamic",
     ),
     decode_head=dict(
         in_channels=[384, 384, 384, 384],

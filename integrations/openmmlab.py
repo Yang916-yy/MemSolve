@@ -1,7 +1,7 @@
-"""Thin OpenMMLab adapters for the DeiT III LSSO vision backbone.
+"""Thin OpenMMLab adapters for the ViT³-style Ridgon vision backbone.
 
 This module owns framework registration and padded-image plumbing only. The
-operator remains entirely in :mod:`lsso.ball`, while the DeiT III encoder is
+operator remains entirely in :mod:`ridgon.ball`, while the ViT³-style encoder is
 owned by :mod:`integrations.timm`.
 """
 
@@ -19,12 +19,11 @@ from experiments.imagenet import (
     validate_checkpoint_contract,
 )
 from integrations.timm import (
-    LSSODeiT3,
+    RidgonViT,
     VisionTokenLayout,
-    deit3_default_rank,
-    deit3_spec,
+    vision_default_rank,
+    vision_spec,
 )
-from lsso import CoreMode
 
 
 def _validate_out_indices(
@@ -43,7 +42,7 @@ def _validate_out_indices(
 
 
 def _variant_out_indices(variant: str) -> tuple[int, ...]:
-    spec = deit3_spec(variant)
+    spec = vision_spec(variant)
     if spec.depth == 12:
         return (3, 5, 7, 11)
     return (7, 11, 15, 23)
@@ -66,12 +65,12 @@ def _checkpoint_state(payload: dict[str, Any]) -> dict[str, torch.Tensor | objec
     }
 
 
-class LSSODeiT3Backbone(LSSODeiT3):
-    """DeiT III LSSO features for Mask R-CNN/FPN and UperNet.
+class RidgonViTBackbone(RidgonViT):
+    """ViT³-style Ridgon features for Mask R-CNN/FPN and UperNet.
 
     Four intermediate plain-ViT maps are converted to strides 4, 8, 16, and
     32 with the same simple feature pyramid used by the XCiT downstream code.
-    A pixel-validity mask becomes the LSSO token mask before every global mix.
+    A pixel-validity mask becomes the Ridgon token mask before every global mix.
     """
 
     def __init__(
@@ -81,19 +80,18 @@ class LSSODeiT3Backbone(LSSODeiT3):
         image_size: int = 224,
         rank: int | None = None,
         out_indices: Sequence[int] | None = None,
-        core_mode: CoreMode | str = CoreMode.DYNAMIC,
         bias: bool = True,
         implementation: str = "cuda",
         checkpoint: str | Path | None = None,
     ) -> None:
-        spec = deit3_spec(variant)
+        spec = vision_spec(variant)
         if implementation not in ("reference", "cuda"):
             raise ValueError(
                 "implementation must be 'reference' or 'cuda', "
                 f"got {implementation!r}"
             )
-        resolved_rank = deit3_default_rank(variant) if rank is None else rank
-        resolved_mode = CoreMode(core_mode)
+        resolved_rank = vision_default_rank(variant) if rank is None else rank
+
         self.variant = variant
         self.out_indices = _validate_out_indices(
             _variant_out_indices(variant) if out_indices is None else out_indices,
@@ -104,7 +102,12 @@ class LSSODeiT3Backbone(LSSODeiT3):
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "layer_scale_init_value": 1e-4,
+            "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+            "layer_scale": False,
+            "class_token": False,
+            "pooling": "token_ln_mean",
+            "position_encoding": "cpe",
+            "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": spec.embed_dim,
             "depth": spec.depth,
@@ -113,7 +116,6 @@ class LSSODeiT3Backbone(LSSODeiT3):
             "drop_path_rate": spec.drop_path_rate,
         }
         self._pretrained_operator_contract = {
-            "core_mode": resolved_mode.value,
             "bias": bias,
             "implementation": implementation,
         }
@@ -126,11 +128,9 @@ class LSSODeiT3Backbone(LSSODeiT3):
             num_heads=spec.num_heads,
             rank=resolved_rank,
             mlp_ratio=4.0,
-            core_mode=resolved_mode,
             bias=bias,
             implementation=implementation,
             drop_path_rate=spec.drop_path_rate,
-            layer_scale_init_value=1e-4,
             dynamic_img_size=True,
             dynamic_img_pad=True,
         )
@@ -243,7 +243,7 @@ class LSSODeiT3Backbone(LSSODeiT3):
         ).squeeze(1).to(dtype=torch.bool)
         if pooled.shape[-2:] != (grid_height, grid_width):
             raise RuntimeError(
-                "patch validity grid does not match the DeiT III patch embedding"
+                "patch validity grid does not match the ViT³-style patch embedding"
             )
         return pooled
 
@@ -253,16 +253,7 @@ class LSSODeiT3Backbone(LSSODeiT3):
         *,
         needs_mask: bool,
     ) -> VisionTokenLayout:
-        batch = patch_mask.shape[0]
-        flat_mask = patch_mask.flatten(1)
-        token_mask = torch.cat(
-            (
-                torch.ones(batch, 1, dtype=torch.bool, device=patch_mask.device),
-                flat_mask,
-            ),
-            dim=1,
-        )
-        return VisionTokenLayout(token_mask if needs_mask else None)
+        return VisionTokenLayout(patch_mask.flatten(1) if needs_mask else None)
 
     @staticmethod
     def _scale_mask(mask: torch.Tensor, index: int) -> torch.Tensor:
@@ -363,7 +354,7 @@ def _pixel_valid_mask(
 class _MaskAwareMixin:
     """Thread OpenMMLab's per-image shape metadata into the token mixer."""
 
-    _lsso_valid_mask: torch.Tensor | None = None
+    _ridgon_valid_mask: torch.Tensor | None = None
 
     def forward(
         self,
@@ -371,14 +362,14 @@ class _MaskAwareMixin:
         data_samples: Sequence[Any] | None = None,
         mode: str = "tensor",
     ) -> Any:
-        self._lsso_valid_mask = _pixel_valid_mask(inputs, data_samples)
+        self._ridgon_valid_mask = _pixel_valid_mask(inputs, data_samples)
         try:
             return super().forward(inputs, data_samples, mode)
         finally:
-            self._lsso_valid_mask = None
+            self._ridgon_valid_mask = None
 
     def extract_feat(self, batch_inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        features = self.backbone(batch_inputs, valid_mask=self._lsso_valid_mask)
+        features = self.backbone(batch_inputs, valid_mask=self._ridgon_valid_mask)
         if self.with_neck:
             features = self.neck(features)
         return features
@@ -401,25 +392,25 @@ def _register_openmmlab() -> None:
         MMSEG_MODELS = None  # type: ignore[assignment]
 
     if MMDET_MODELS is not None:
-        MMDET_MODELS.register_module(module=LSSODeiT3Backbone, force=True)
+        MMDET_MODELS.register_module(module=RidgonViTBackbone, force=True)
         if MaskRCNN is not None:
-            class LSSOMaskRCNN(_MaskAwareMixin, MaskRCNN):
+            class RidgonMaskRCNN(_MaskAwareMixin, MaskRCNN):
                 pass
 
-            MMDET_MODELS.register_module(module=LSSOMaskRCNN, force=True)
-            globals()["LSSOMaskRCNN"] = LSSOMaskRCNN
+            MMDET_MODELS.register_module(module=RidgonMaskRCNN, force=True)
+            globals()["RidgonMaskRCNN"] = RidgonMaskRCNN
 
     if MMSEG_MODELS is not None:
-        MMSEG_MODELS.register_module(module=LSSODeiT3Backbone, force=True)
+        MMSEG_MODELS.register_module(module=RidgonViTBackbone, force=True)
         if EncoderDecoder is not None:
-            class LSSOEncoderDecoder(_MaskAwareMixin, EncoderDecoder):
+            class RidgonEncoderDecoder(_MaskAwareMixin, EncoderDecoder):
                 pass
 
-            MMSEG_MODELS.register_module(module=LSSOEncoderDecoder, force=True)
-            globals()["LSSOEncoderDecoder"] = LSSOEncoderDecoder
+            MMSEG_MODELS.register_module(module=RidgonEncoderDecoder, force=True)
+            globals()["RidgonEncoderDecoder"] = RidgonEncoderDecoder
 
 
 _register_openmmlab()
 
 
-__all__ = ["LSSODeiT3Backbone"]
+__all__ = ["RidgonViTBackbone"]

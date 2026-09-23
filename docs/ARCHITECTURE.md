@@ -1,39 +1,26 @@
 # Architecture
 
-Dependencies point inward:
-
-~~~
-experiments / integrations / benchmarks
-                    |
-                 lsso.ball
-                    |
-          PyTorch reference or strict CUDA op
-~~~
-
-config.py owns the two supported ablation axes, reference.py owns the QR frame,
-accretive generator, and equilibrium mathematics, and model.py owns parameters
-and nn.Module behavior. Framework adapters may not implement operator math.
-
-## Execution and state ownership
+Dependencies point inward: experiments and framework integrations call the
+single Ridgon model, which calls either the mathematical reference or the
+explicit CUDA implementation.
 
 | Owner | Responsibility |
 | --- | --- |
-| `lsso/ball/config.py` | Public geometry, DYNAMIC/STATIC/ZERO validation |
-| `lsso/ball/reference.py` | Canonical math, FP64 oracle, mixed-precision projections and their VJPs; lazy Triton biased GEMM |
-| `lsso/ball/model.py` | Parameters, validity masks, model checkpoint contract 13 |
-| `lsso/ball/cuda.py` | Native loading/ABI 11 validation, unified no-frame Triton kernels and first-order autograd adapters |
-| `csrc/ball/` | Precompiled per-SM MathDx mixer and native forward/backward storage |
-| `integrations/timm.py` | Shared vision encoder with masked CPE and CLS pooling |
-| `integrations/openmmlab.py` | Dense-task framework registration, feature maps and padded-image plumbing |
+| `ridgon/ball/config.py` | Dimensions, heads, rank and projection bias |
+| `ridgon/ball/reference.py` | Q/K/V memory equations, FP64 oracle and precision boundaries |
+| `ridgon/ball/model.py` | Independent packed projections, identity-plus-delta shared query map, shared RMS channel weights, masks, checkpoint contract 19 |
+| `ridgon/ball/cuda.py` | CUDA contract 17 validation, token tiling, compact analytic VJP, FLA-derived grouped RMSNorm |
+| `integrations/timm.py` | ViT³-style vision encoder, packed SwiGLU, CPE, token-LN mean pooling and AMP boundaries |
+| `integrations/openmmlab.py` | Dense framework registration and padded-image plumbing |
 
-The CUDA execution path combines a Python projection boundary with a
-common no-frame Triton/PyTorch mixer. The compact LU factor/solve calls reuse precompiled cuSOLVERDx kernels.
-The materialized-frame native mixer remains an explicit low-level comparison
-implementation, outside public dispatch.
-Native artifact loading does not compile CUDA source; projections and the
-no-frame token kernels separately JIT-compile through Triton on first use.
-CPU reference imports remain independent of Triton. Unsupported native
-contracts fail explicitly rather than selecting another operator.
+There is one public operator and no mode selector. The learned core is
+sample-independent, while the key Gram and key/value memory remain
+input-dependent. The operator has no projection-local convolution or internal
+position mechanism. CPE and pooling are unchanged in this refactor.
 
-Consult [the core contract](CORE_CONTRACT.md), [CUDA contract](CUDA_CONTRACT.md),
-and [downstream protocol](DOWNSTREAM_PROTOCOLS.md) for their respective boundaries.
+No custom native library is built or loaded. Token and normalization kernels separately
+JIT-compile through Triton on first use. CPU reference import needs no Triton.
+The shared-core LU implementation and its build/package tools have been removed.
+
+See [mathematics](CORE_CONTRACT.md), [CUDA](CUDA_CONTRACT.md) and
+[ImageNet training](IMAGENET_VIT3.md).

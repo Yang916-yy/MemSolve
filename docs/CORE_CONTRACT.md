@@ -1,146 +1,172 @@
-# Core Contract
+# Q/K/V ridge memory and learned query readout
 
-The operator accepts x[B,N,D] and an optional boolean valid_mask[B,N]. It returns y[B,N,D]. Batch size
-B and sequence length N must be positive. The reference accepts `float16`,
-`bfloat16`, `float32`, and `float64`; the native CUDA implementation accepts
-only `float16` and `bfloat16` public inputs. Outputs match the input dtype. A
-sequence may be entirely masked; its output is zero.
+Model contract **19**, source version **0.11.0**. Independent Q/K/V projections,
+a shared query map T = I + Delta, and per-head RMSNorm define one operator.
+There is no input-conditioned core generator, reflected readout, internal value
+skip, projection-local convolution, rotation, or mode selector.
 
-For each head, let A be the relation coordinates after
-normalization by sqrt(n_valid), and let C be the masked content coordinates.
-The QR soft frame and shared compact state are
+## Definition
 
-~~~
-P = qr_soft_frame(A)
-Z = P^T C.
-~~~
+For one head, n valid tokens, key/query rank r and value width d:
 
-For DYNAMIC mode, the compact coordinates are generated from that same state:
+```text
+Q = X Wq + bq                 [n,r]
+K = X Wk + bk                 [n,r]
+V = X Wv + bv                 [n,d]
+Ak = K / sqrt(n), Aq = Q / sqrt(n)
+R^T R = I + Ak^T Ak           upper Cholesky, positive diagonal
+Pk = Ak R^-1, Pq = Aq R^-1
+Z = Pk^T V
+T = I + core_delta           [r,r], shared across samples
+O = Pq T Z
+Y = concat_h[RMSNorm_h(O)] Wo + bo
+```
 
-~~~
-R = R0 + Z W_drive / sqrt(n_valid).
-~~~
+One packed projection stores independent Q/K/V in the layout
+`[Q_all_heads, K_all_heads, V_all_heads]`. `core_delta` has shape `[H,r,r]`
+and initializes to zero. Forward forms only the compact T = I + Delta.
+There is no norm constraint, normalized raw proxy or inverse of T.
+Each token/head RMSNorm has epsilon `1e-6` and a learned channel gain gamma
+of shape `[d]`, shared across heads and initialized to ones, without a bias.
+This follows the **full-model** defaults in
+[FLA GatedDeltaNetConfig](https://github.com/fla-org/flash-linear-attention/blob/main/fla/models/gated_deltanet/configuration_gated_deltanet.py),
+which [GatedDeltaNetBlock](https://github.com/fla-org/flash-linear-attention/blob/main/fla/models/gated_deltanet/modeling_gated_deltanet.py)
+passes to the mixer. The standalone layer constructor defaults to `1e-5`,
+but that value is overridden when constructing the full model. Gain shape and
+initialization follow [FLA RMSNorm](https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/layernorm.py).
+Sources inspected 2026-09-23. Only affine parameters are shared; normalization
+statistics remain independent for each token and head. Gradients of gamma
+sum over tokens, batches and heads. This is an upstream convention, not a
+claim of optimality or improved accuracy. Contract 16 had per-head gains;
+contract 17 adopted the standalone epsilon `1e-5`. Contract 18 corrects that
+to the full-model epsilon `1e-6`, retaining shared gains. Contract 19 replaces
+the constrained T parameter with an unconstrained identity-centered Delta.
+Older contracts are rejected rather than silently converted.
+The encoder owns CPE, residual connections, MLPs and pooling.
 
-STATIC uses R = R0. ZERO owns no compact coordinates and applies the zero
-compact-core branch directly:
+## Key initialization
 
-~~~
-Y = eta (C - P Z).
-~~~
+Since source 0.8.1, K projection entries are initialized independently from
+Normal(0, 1/dim), where the second argument denotes variance; K bias is zero.
+For unit-variance normalized inputs, this sets the expected mean eigenvalue of
+K^T K/n to one, keeping the initialization scale independent of model width.
+This is a statistical initialization criterion, not an accuracy guarantee.
 
-For DYNAMIC and STATIC, define
+`Ridgon.init_weights()` owns this rule and only initializes the K slice. It runs
+on direct construction and after timm's depth-first initialization of child
+Linear modules. Q/V and the output projection keep their existing initializer
+(default Linear outside vision; timm std=0.02 and zero bias in the vision
+factory). T, RMSNorm gains, CPE and LayerScale are not changed by this method.
+No key rescaling or normalization is added to the forward pass.
 
-~~~
-L = tril(R, -1) + Diag(softplus(diag(R) + softplus_inverse(1)))
-Omega = triu(R, 1) - triu(R, 1)^T
-K = L L^T + Omega
-U = solve(I + K, Z).
-~~~
+Loading a checkpoint restores its saved K; it does not reinitialize that tensor.
+The K-only initialization change in source 0.8.1 retained model contract 15.
+Source 0.9.0 uses model contract 16 because the T initialization and optimizer
+constraint radius both change; older contracts are rejected on load.
 
-The symmetric part of I + K is I + L L^T, so the equilibrium is unique. The
-per-head complement and token output before the output projection are
+## Exact memory interpretation
 
-~~~
-eps_d = finfo(calculation_dtype).eps
-eta = (1 - eps_d) tanh(eta_raw)
-Y = eta C + P [2 U - (1 + eta) Z].
-~~~
+Define the ridge memory and the adjusted query by
 
-Equivalently, M = 2 (I + K)^-1 - I and
+```text
+Mstar = argmin_M 0.5 ||V-Ak M||_F^2 + 0.5 ||M||_F^2
+      = (I+Ak^T Ak)^-1 Ak^T V
+Qeff = Aq R^-1 T R
+O = Qeff Mstar
+```
 
-~~~
-Y = eta C + P (M - eta I) P^T C.
-~~~
+This equals the operator above, including gradients through R. Qeff and Mstar
+are explanatory variables, not additional runtime computations. The memory is
+the exact global ridge solution; T changes its query readout in the coordinates
+set by the input's key statistics. Arbitrary T is not claimed to be the inverse
+Hessian of that ridge objective. Intention already studies global ridge/query
+readout; DeltaNet supplies the online error-correction connection and MesaNet
+the regression/TTT connection. This operator is not an exact bidirectional
+expansion of DeltaNet's ordered recurrence.
 
-The reference computes this as a Zero base plus a learned correction:
+R, Z and the memory remain input-dependent even though T is shared. For finite
+inputs, I+Ak^T Ak is positive definite in exact arithmetic. Singular T is valid
+because it is never inverted. T has no fixed spectral or Frobenius bound.
+Positive definiteness of the ridge system does not establish a contraction
+of the normalized mixer or network.
 
-~~~
-Delta = solve(I + K, (I - K) Z)
-Y = eta (C - P Z) + P Delta.
-~~~
+## Identity-centered parameterization and training
 
-The identity `solve(I + K, I - K) = 2 (I + K)^-1 - I` proves
-equivalence. The final readout combines the two frame products as
-`eta C + P (Delta - eta Z)` so it does not materialize two token-sized
-products. ZERO has `Delta = 0` (equivalently `K = I`, not `K = 0`).
-For STATIC, compute `M = solve(I + K, I - K)` once per head and apply
-`Delta = M Z` across the batch. The solve remains in the autograd graph;
-there is no detached or cross-forward cache. Dynamic correction RHS products,
-static correction products and their VJPs use IEEE FP32 on CUDA, while FP64
-diagnostics retain ordinary differentiable FP64 operations. For incoming
-correction gradient `G`, the CUDA reference uses the equivalent VJP
-`V = solve((I + K)^T, G)`, `dZ = 2 V - G`, and
-`dK = -V (Delta + Z)^T`, avoiding redundant differentiation through both
-occurrences of K. The backward solve reuses the forward LU factors.
-Static broadcasts its shared correction matrix over the batch; its matrix
-gradient accumulates contributions from all samples. This algebraic rewrite preserves the operator; removal of rotation changes
-the checkpoint contract. Native CUDA forms the learned correction as `2U-Z` and shares the final
-`correction-eta Z` coefficient with Zero, whose correction is exactly zero.
-Its Static schedule can apply a once-per-head solved map instead of repeated
-RHS solves; all schedules are checked against this reference.
+Delta initializes to zero, so T starts at I and the initial readout is exactly
+Aq (I+Ak^T Ak)^-1 Ak^T V. More generally,
 
-At R = 0, L = I, Omega = 0, U = Z / 2, and M = 0. DYNAMIC and STATIC both
-start at this compact point; DYNAMIC additionally starts with W_drive = 0.
-The correction is zero at initialization but has a nonzero core derivative;
-the implementation does not skip or detach it when its value is zero.
+```text
+O = O_ridge + Pq Delta Pk^T V
+O_ridge = Aq (I+Ak^T Ak)^-1 Ak^T V
+```
 
-In exact arithmetic, the QR frame, accretive generator, and eta
-parameterization make the frozen token mixer contractive. The fixed one-ULP
-interior scale keeps the realized FP32 and FP64 complement strictly inside the
-unit interval. The reference evaluates `tanh` through sign-specific stable
-logistic identities, so its tail gradient remains nonzero when a direct FP32
-`tanh` forward would round to `+/-1`, without overflowing in the opposite
-inactive branch. Like every finite-precision exponential, this does not claim
-meaningful tail gradients for astronomically extreme raw coordinates.
+This is an algebraic decomposition, not two runtime readouts. The reference
+and CUDA primitives both receive the effective T and evaluate the same compact
+products as before. Since dT/dDelta is the identity, dLoss/dDelta = dLoss/dT.
+The parameter count and identity initial function are unchanged from contract 18.
 
-The operator contains no feature rotation or position-coordinate interface.
-External absolute or spatial position embeddings belong to the surrounding model.
+Use ordinary [PyTorch AdamW](https://docs.pytorch.org/docs/2.14/generated/torch.optim.AdamW.html)
+without model-specific hooks. Delta belongs to the regular weight-decay group;
+the ImageNet launcher uses fused AdamW with weight decay 0.05. If u is Adam's
+bias-corrected adaptive gradient update, the effective map changes as
 
-The frame, compact-state storage, accretive factor Gram `F F^T`, and solve
-calculations use FP32 unless the input is FP64. CUDA evaluates the factor Gram
-with IEEE FP32 FMA; its small size makes avoiding a second factor quantization
-worthwhile. Ordinary projections and eligible compact contractions use BF16
-multiplicands with FP32 accumulation. Packed activations and the pre-output
-boundary use BF16. Sensitive eta and solve state stay FP32.
-FP16 and BF16 public inputs are accepted by CUDA; the result matches the input
-dtype. FP32/FP64 inputs remain available on the reference path. Invalid tokens
-are zeroed before every compact statistic.
+```text
+Delta_next = (1 - lr * wd) Delta - lr * u
+T_next = I + (1 - lr * wd) (T - I) - lr * u
+```
 
-## Serialized and numerical boundaries
+Thus decoupled weight decay pulls T toward I, not zero. This is an identity
+prior in the update; it is not an assertion that AdamW exactly optimizes an
+L2-regularized objective or that learned Delta necessarily improves accuracy.
+There is no gradient projection, step retraction, moment transport or custom
+optimizer state. Standard optimizer state_dict handles resume and AMP skips.
 
-The current model `_extra_state` contract is version **13**. This is separate
-from native CUDA ABI **11** and the ImageNet runner envelope format **7**.
-Loading requires every saved operator-contract field to match, including model
-geometry and ablations. Missing or mismatched contracts fail even under
-`strict=False`; older weights need explicit validation before migration.
+Any real T is representable as I + Delta. Q -> s Q, T -> T/s remains an exact
+scale freedom of the unregularized forward function. This parameterization
+does not remove that freedom; it prioritizes ordinary optimization and an
+identity-centered decay rule over a sphere constraint. No L2 normalization is
+added to Q, K or V. The new optimization trajectory differs from contract 18,
+so old training checkpoints are rejected.
 
-Biased low-precision CUDA projections add FP32 bias to an FP32 accumulator
-before a single FP16/BF16 store. They use a lazily compiled Triton GEMM;
-parameter gradients retain the existing FP32 reduction boundaries. Summation
-order can change rounding, so algebraic equivalence is not a promise of
-bitwise-identical training. See [CUDA implementation details](CUDA_CONTRACT.md).
+## Equivalent implementation without P
 
-The contraction statement freezes the input-conditioned frame and generator.
-It does not bound the complete input Jacobian, which also differentiates those
-quantities. Implementation benchmarks do not establish downstream accuracy.
+```text
+G = K^T K / n
+Bkv = K^T V / sqrt(n)
+F F^T = I + G                 F = R^T
+Z = solve_triangular(F, Bkv)
+M = solve_triangular(F^T, T Z)
+O = Q M / sqrt(n)
+```
 
-## Explicit reference ablations
+Only key-statistic Cholesky and triangular solves remain. No J, L, Omega,
+shared-core LU or inverse-map adjoint is evaluated. This algorithm covers
+N<r, N=r and N>r and never materializes token-sized P.
 
-`skew_coupling=False` sets Omega to zero in K = L L^T + Omega while
-retaining the accretive factor. `scalar_complement=False` fixes eta to zero
-with no learned complement update. Both flags are recorded in the model
-checkpoint contract and require `implementation="reference"`. The native
-default continues to require both flags enabled.
+For upstream E at O, token adjoints are
 
+```text
+dM = Q^T E / sqrt(n)
+dQ = E M^T / sqrt(n)
+dK = K (dG+dG^T) / n + V dBkv^T / sqrt(n)
+dV = K dBkv / sqrt(n)
+```
 
-The default CUDA path uniformly uses a no-frame implementation of these same
-identities: `R^T R=I+A^T A`, `Z=R^-T A^T C`, and
-`Y=eta C + A R^-1(correction-eta Z)`. It shares compact and token code across
-core modes. For `N<=r`, the base is computed as `eta (I+A A^T)^-1 C` to avoid
-subtractive cancellation. This changes scheduling and rounding, not the model.
-See `CUDA_CONTRACT.md` for the primal/dual dimension choice and the fixed mixed-precision policy.
+The compact adjoint differentiates both triangular solves and Cholesky.
+If dU is the gradient at U=T Z, dT=sum_samples(dU Z^T) and dZ=T^T dU.
+The reference and CUDA operator return ordinary derivatives with respect to T;
+the model passes them unchanged to Delta through the identity addition.
 
-The frame is soft: `PP^T = A(I+A^T A)^-1 A^T`, so the common base is
-`eta (I+A A^T)^-1 C`, not an orthogonal projection onto a null space.
-Dynamic, Static and Zero all share this base. With `K=I`, the correction
-vanishes in any mode; the trainable core derivatives need not vanish.
+## Masking and precision
+
+Boolean [B,N] masks exclude rows before/after biased projection. Counts clamp
+to one for entirely masked samples. Invalid outputs are zeroed after output
+projection; excluded NaNs cannot enter neighboring rows. Position operations
+must separately honor masks.
+
+FP64 is the mathematical oracle. Production projections use BF16 operands and
+FP32 accumulation. Statistics, factors, compact products, raw readout, RMS
+reductions and optimizer updates use FP32. Normalized outputs round to BF16
+before Wo. Parameters remain FP32; public output dtype follows input dtype.
+Old model contracts are rejected, including under strict=False. Historical
+paper/results retain their recorded operators, not this contract.

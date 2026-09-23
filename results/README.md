@@ -1,5 +1,12 @@
 # Published Results
 
+> The current source is Ridgon, model contract 19 / CUDA contract 17.
+> The earlier model was named LSSO; archived names and measurements are unchanged.
+> All measurements in this directory retain their original operator and source
+> contracts. None is a trained result or contraction certificate for the new
+> independent-QKV architecture.
+
+
 This directory contains the compact, machine-readable evidence behind the
 results reported in the README and paper. It publishes final per-seed test
 metrics and enough provenance to identify the code, data, model shell, and
@@ -27,8 +34,8 @@ comparison values in the paper remain attributed to their original sources.
 ## Historical evidence versus current source
 
 The published CUDA metadata records native contract **6**. Current source uses
-native ABI **11** and model contract **13**, including a revised mixed-precision
-policy, biased projection fusion and removal of internal feature rotation. These source updates do not rewrite the
+CUDA contract **17** and model contract **19**, with an identity-plus-delta
+query map and no custom native extension. These source updates do not rewrite the
 CSV measurements or establish new task results. Consult each panel's metadata
 for its actual runtime and protocol; do not label historical tables as current
 source benchmarks.

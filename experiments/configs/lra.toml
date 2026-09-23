@@ -5,6 +5,5 @@ data_root = "data/lra"
 cache_root = "data/sequence_cache"
 
 [model]
-mixer = "lsso"
+mixer = "ridgon"
 implementation = "cuda"
-core_mode = "dynamic"

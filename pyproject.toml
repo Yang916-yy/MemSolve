@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lsso-operator"
-version = "0.6.3"
-description = "Solved contextual adaptation with certified global mixing and native CUDA."
+name = "ridgon-operator"
+version = "0.11.0"
+description = "Compact key/value memory with independent queries, learned query readout and Triton CUDA."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = "Apache-2.0"
@@ -46,16 +46,16 @@ openmmlab = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["lsso*"]
+include = ["ridgon*"]
 
 [tool.setuptools.package-data]
-lsso = ["py.typed"]
+ridgon = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "core: reference mathematics, model, configuration, and public API contracts",
-    "cuda: CUDA runtime, numerical, or native-extension contract",
+    "cuda: CUDA runtime, numerical, or device contract",
     "integration: framework adapter contract",
     "experiment: data and training-entrypoint contract",
     "repository: repository-layout contract",

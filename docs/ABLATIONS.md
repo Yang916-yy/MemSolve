@@ -1,25 +1,18 @@
-# Ablations
+# Research scope after the Q/K/V refactor
 
-The public configuration exposes compact-core, skew-coupling, and scalar-complement ablations.
+The current operator is independent Q/K/V, a learned sample-independent
+identity-plus-delta query map T, ridge memory readout and per-head RMS normalization.
+It exposes no Dynamic/Static/Zero, skew or complement switches.
 
-| Ablation | Configuration | Compact-core behavior |
-| --- | --- | --- |
-| sample-conditioned coordinates | core_mode=DYNAMIC | R = R0 + Z W_drive / sqrt(n_valid) |
-| sample-independent coordinates | core_mode=STATIC | R = R0 |
-| zero compact core | core_mode=ZERO | M = 0, with no compact parameters |
-| remove skew coupling | skew_coupling=False | K = L L^T, with Omega = 0 |
-| remove scalar complement | scalar_complement=False | eta = 0, fixed during training |
+The input-conditioned core generator and projection-local Q/K/V convolutions
+are intentionally absent. Their mathematical role and empirical benefit can
+be studied after this base structure is established. V names the value tensor;
+T names the shared query map, so K remains unambiguously the key tensor.
 
-ZERO changes only the compact core. It retains the relation frame P, content C,
-learned complement eta, and the same token lift. The no-skew ablation retains
-the lower-triangular accretive factor and removes only Omega. The no-complement
-ablation fixes eta to zero and excludes its parameter from gradient updates.
-Both settings are explicit in the checkpoint contract.
+The former Static and Zero experiments describe a different reflected-readout
+architecture. Current T initializes to I, giving O=Pq Z. Existing results must not be
+relabeled as measurements of the current model.
 
-## Backend and attribution
-
-Native CUDA supports DYNAMIC, STATIC and ZERO. No-skew and no-complement
-require the reference implementation; there is no implicit fallback. Rotation
-and its configuration switch have been removed from both backends. Keep external
-position embeddings, precision, optimizer and data order fixed across core modes.
-Historical results retain their original rotated source snapshots.
+Future architectural interventions require a stated formula, matched training
+budget and an updated mathematical/gradient oracle. Exploratory experiment
+records stay outside this repository.

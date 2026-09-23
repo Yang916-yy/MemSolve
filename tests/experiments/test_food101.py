@@ -1,24 +1,20 @@
-"""Contracts that make the short vision ablations comparable."""
 import torch
+from experiments.food101 import build_model, learning_rate
 
-from experiments.food101 import VARIANTS, build_model, learning_rate
 
-
-def test_variants_share_initialization_and_grid_but_change_requested_core():
+def test_food_model_uses_current_qkv_operator_and_existing_grid():
     torch.set_num_threads(2)
-    dynamic = build_model("dynamic")
-    reference = dict(dynamic.named_parameters())
-    assert dynamic.encoder.pos_embed.shape == (1, 14 * 14, 384)
-    assert dynamic.encoder.no_embed_class
-    assert len(dynamic.encoder.blocks) == 12
-    for variant in VARIANTS[1:]:
-        candidate = build_model(variant)
-        for name, parameter in candidate.named_parameters():
-            torch.testing.assert_close(parameter, reference[name], rtol=0, atol=0)
-        for block in candidate.encoder.blocks:
-            cfg = block.attn.mixer.config
-            assert cfg.core_mode.value == variant
-            assert block.attn.implementation == "reference"
+    model = build_model()
+    assert model.encoder.pos_embed is None
+    assert model.encoder.cls_token is None
+    assert isinstance(model.encoder.fc_norm, torch.nn.Identity)
+    assert len(model.encoder.blocks) == 12
+    for block in model.encoder.blocks:
+        assert isinstance(block.ls1, torch.nn.Identity)
+        assert block.cpe.kernel_size == (3, 3)
+        mixer = block.attn.mixer
+        assert mixer.w_qkv.out_features == 2 * 6 * 32 + 384
+        assert block.attn.implementation == "reference"
 
 
 def test_schedule_has_three_epoch_warmup_and_fixed_final_floor():

@@ -1,4 +1,4 @@
-"""Thin timm VisionTransformer adapter for LSSO."""
+"""Thin timm VisionTransformer adapter for Ridgon."""
 
 from __future__ import annotations
 
@@ -10,15 +10,15 @@ from typing import Any, Literal, Sequence, cast
 import torch
 import torch.nn as nn
 
-from lsso import CoreMode, LSSO, LSSOConfig
+from ridgon import Ridgon, RidgonConfig
 
 
 _Implementation = Literal["reference", "cuda"]
 
 
 @dataclass(frozen=True)
-class DeiT3Spec:
-    """The published DeiT III geometry and regularization for one scale."""
+class VisionSpec:
+    """Geometry and stochastic depth for an Ridgon vision scale."""
 
     embed_dim: int
     depth: int
@@ -26,12 +26,14 @@ class DeiT3Spec:
     drop_path_rate: float
 
 
-_DEIT3_SPECS: dict[str, DeiT3Spec] = {
-    "small": DeiT3Spec(384, 12, 6, 0.05),
-    "base": DeiT3Spec(768, 12, 12, 0.20),
-    "large": DeiT3Spec(1024, 24, 16, 0.45),
+_VISION_SPECS: dict[str, VisionSpec] = {
+    "tiny": VisionSpec(192, 12, 6, 0.0),
+    "small": VisionSpec(384, 12, 6, 0.1),
+    "base": VisionSpec(768, 12, 12, 0.4),
+    "large": VisionSpec(1024, 24, 16, 0.45),
 }
-_DEIT3_DEFAULT_RANKS: dict[str, int] = {
+_VISION_DEFAULT_RANKS: dict[str, int] = {
+    "tiny": 16,
     "small": 32,
     "base": 48,
     "large": 64,
@@ -43,25 +45,26 @@ class VisionTokenLayout:
     """Token validity for the vision mixer."""
 
     valid_mask: torch.Tensor | None
+    grid_size: tuple[int, int] | None = None
 
 
-def deit3_spec(variant: str) -> DeiT3Spec:
-    """Return the official DeiT III Small, Base, or Large geometry."""
+def vision_spec(variant: str) -> VisionSpec:
+    """Return the Ridgon vision geometry; large is for optional feature adapters."""
 
     try:
-        return _DEIT3_SPECS[variant]
+        return _VISION_SPECS[variant]
     except KeyError as error:
-        choices = ", ".join(_DEIT3_SPECS)
+        choices = ", ".join(_VISION_SPECS)
         raise ValueError(
             f"variant must be one of {{{choices}}}, got {variant!r}"
         ) from error
 
 
-def deit3_default_rank(variant: str) -> int:
-    """Return the agreed CUDA-fast LSSO rank for a DeiT III scale."""
+def vision_default_rank(variant: str) -> int:
+    """Return the default Ridgon rank for a vision scale."""
 
-    deit3_spec(variant)
-    return _DEIT3_DEFAULT_RANKS[variant]
+    vision_spec(variant)
+    return _VISION_DEFAULT_RANKS[variant]
 
 
 def _validate_implementation(implementation: str) -> _Implementation:
@@ -87,13 +90,13 @@ def _require_timm_attention_mask_api(vision_transformer: type[nn.Module]) -> Non
     if missing:
         joined = ", ".join(missing)
         raise RuntimeError(
-            "LSSO vision adapters require timm>=1.0.16 with attn_mask support "
+            "Ridgon vision adapters require timm>=1.0.16 with attn_mask support "
             f"in VisionTransformer.{joined}"
         )
 
 
-class _TimmLSSOMixer(nn.Module):
-    """Adapt LSSO to timm's attention call signature without owning math."""
+class _TimmRidgonMixer(nn.Module):
+    """Adapt Ridgon to timm's attention call signature without owning math."""
 
     def __init__(
         self,
@@ -101,7 +104,6 @@ class _TimmLSSOMixer(nn.Module):
         num_heads: int,
         *,
         rank: int,
-        core_mode: CoreMode,
         implementation: _Implementation,
         qkv_bias: bool,
         qk_norm: bool,
@@ -118,18 +120,17 @@ class _TimmLSSOMixer(nn.Module):
         del norm_layer, depth
         self.implementation = _validate_implementation(implementation)
         if qk_norm or scale_norm:
-            raise ValueError("LSSO does not implement qk_norm or attention scale_norm")
+            raise ValueError("Ridgon does not implement qk_norm or attention scale_norm")
         if attn_drop != 0.0 or proj_drop != 0.0:
-            raise ValueError("mixer dropout belongs outside the LSSO operator")
+            raise ValueError("mixer dropout belongs outside the Ridgon operator")
         if qkv_bias != proj_bias:
-            raise ValueError("LSSO requires matching input and output bias settings")
+            raise ValueError("Ridgon requires matching input and output bias settings")
 
-        self.mixer = LSSO(
-            LSSOConfig(
+        self.mixer = Ridgon(
+            RidgonConfig(
                 dim=dim,
                 num_heads=num_heads,
                 rank=rank,
-                core_mode=core_mode,
                 bias=qkv_bias,
             )
         )
@@ -156,383 +157,178 @@ class _TimmLSSOMixer(nn.Module):
                 "not a generic attention mask"
             )
         valid_mask = None if layout is None else layout.valid_mask
-        # Residuals and learned position embeddings can keep timm tokens FP32 under AMP.
-        if self.implementation == "cuda" and x.is_cuda and torch.is_autocast_enabled("cuda"):
+        # Both implementations use the same AMP input/output boundary. timm's
+        # FP32 residual stream must not make the oracle skip the output cast.
+        if x.is_cuda and torch.is_autocast_enabled("cuda"):
             x = x.to(torch.get_autocast_dtype("cuda"))
         return self.mixer(
             x, valid_mask=valid_mask, implementation=self.implementation,
         )
 
 
-def create_lsso_vit(
-    *,
-    image_size: int,
-    patch_size: int,
-    num_classes: int,
-    embed_dim: int,
-    depth: int,
-    num_heads: int,
-    rank: int,
-    mlp_ratio: float,
-    core_mode: CoreMode | str,
-    bias: bool,
-    implementation: _Implementation = "reference",
-    drop_path_rate: float = 0.0,
-) -> nn.Module:
-    """Build timm's ViT with LSSO as the sole token mixer."""
+class RidgonViT(nn.Module):
+    """ViT³ scaffold with Ridgon, SwiGLU, CPE and token-LN mean pooling.
 
-    mode = CoreMode(core_mode)
-    resolved_implementation = _validate_implementation(implementation)
-    if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
-        raise ValueError("depth must be a positive integer")
-
-    from timm.models.vision_transformer import VisionTransformer
-
-    _require_timm_attention_mask_api(VisionTransformer)
-
-    class ConfiguredMixer(_TimmLSSOMixer):
-        def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            **kwargs: Any,
-        ) -> None:
-            super().__init__(
-                dim,
-                num_heads,
-                rank=rank,
-                core_mode=mode,
-                implementation=resolved_implementation,
-                **kwargs,
-            )
-
-    return VisionTransformer(
-        img_size=image_size,
-        patch_size=patch_size,
-        num_classes=num_classes,
-        global_pool="token",
-        embed_dim=embed_dim,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        qkv_bias=bias,
-        proj_bias=bias,
-        drop_path_rate=drop_path_rate,
-        attn_layer=ConfiguredMixer,
-    )
-
-
-def _create_deit3_encoder(
-    *,
-    image_size: int,
-    patch_size: int,
-    num_classes: int,
-    embed_dim: int,
-    depth: int,
-    num_heads: int,
-    rank: int,
-    mlp_ratio: float,
-    core_mode: CoreMode | str,
-    bias: bool,
-    implementation: _Implementation,
-    drop_path_rate: float,
-    layer_scale_init_value: float,
-    norm_eps: float,
-    dynamic_img_size: bool,
-    dynamic_img_pad: bool,
-    position_encoding: str = "learned",
-    drop_path_schedule: str = "constant",
-) -> nn.Module:
-    """Build the one DeiT III-compatible LSSO encoder.
-
-    The engineering form uses timm blocks, but it preserves DeiT III's
-    no-CLS-position layout, LayerScale initialization, and constant stochastic
-    depth by default. ImageNet ViT³ training selects timm's linear schedule.
+    mlp_ratio specifies the equivalent two-projection MLP weight budget.
+    SwiGLU uses two-thirds of that hidden width, rounded up to 16 channels.
     """
 
-    if position_encoding not in {"learned", "cpe"}:
-        raise ValueError("position_encoding must be learned or cpe")
-    if position_encoding == "cpe" and (dynamic_img_size or dynamic_img_pad):
-        raise ValueError("CPE currently requires the configured fixed image grid")
-    if drop_path_schedule not in {"constant", "linear"}:
-        raise ValueError("drop_path_schedule must be constant or linear")
-    if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
-        raise ValueError("depth must be a positive integer")
-    if not 0.0 <= drop_path_rate < 1.0:
-        raise ValueError("drop_path_rate must be in [0, 1)")
-    if layer_scale_init_value <= 0.0:
-        raise ValueError("layer_scale_init_value must be positive")
-    if norm_eps != 1e-6:
-        raise ValueError("DeiT III requires norm_eps = 1e-6")
-
-    from timm.layers import trunc_normal_
-    from timm.models.vision_transformer import Block, VisionTransformer
-
-    _require_timm_attention_mask_api(VisionTransformer)
-
-    mode = CoreMode(core_mode)
-    resolved_implementation = _validate_implementation(implementation)
-
-    class ConfiguredMixer(_TimmLSSOMixer):
-        def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            **kwargs: Any,
-        ) -> None:
-            super().__init__(
-                dim,
-                num_heads,
-                rank=rank,
-                core_mode=mode,
-                implementation=resolved_implementation,
-                **kwargs,
-            )
-
-    class ConstantDropPathBlock(Block):
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            kwargs["drop_path"] = drop_path_rate
-            super().__init__(*args, **kwargs)
-
-    block_type = ConstantDropPathBlock if drop_path_schedule == "constant" else Block
-
-    class CPEBlock(block_type):
-        # ViT³ / CPVT residual CPE, using PyTorch's cuDNN depthwise convolution.
-        # Keep this spatial operation outside the LSSO mixer.
-        def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
-            super().__init__(dim, *args, **kwargs)
-            self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-
-        def forward(self, x, attn_mask=None, is_causal=False):
-            side = image_size // patch_size
-            if x.shape[1] != side * side + 1:
-                raise ValueError("CPE requires CLS followed by the configured patch grid")
-            if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
-                raise ValueError("CPE accepts only the vision token validity layout")
-            valid = None if attn_mask is None else attn_mask.valid_mask
-            patches = x[:, 1:]
-            if valid is not None:
-                patches = torch.where(valid[:, 1:, None], patches, 0)
-            spatial = patches.reshape(x.shape[0], side, side, x.shape[2]).permute(0, 3, 1, 2)
-            # NHWC tokens give a channels-last convolution view; cuDNN owns dispatch.
-            local = self.cpe(spatial).flatten(2).transpose(1, 2)
-            patches = patches + local
-            if valid is not None:
-                patches = torch.where(valid[:, 1:, None], patches, 0)
-            x = torch.cat((x[:, :1], patches), dim=1)
-            return super().forward(x, attn_mask=attn_mask, is_causal=is_causal)
-
-    encoder = VisionTransformer(
-        img_size=image_size,
-        patch_size=patch_size,
-        num_classes=num_classes,
-        global_pool="token",
-        embed_dim=embed_dim,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        qkv_bias=bias,
-        proj_bias=bias,
-        no_embed_class=True,
-        pos_embed="none" if position_encoding == "cpe" else "learn",
-        dynamic_img_size=dynamic_img_size,
-        dynamic_img_pad=dynamic_img_pad,
-        init_values=layer_scale_init_value,
-        drop_path_rate=drop_path_rate,
-        norm_layer=partial(nn.LayerNorm, eps=norm_eps),
-        block_fn=CPEBlock if position_encoding == "cpe" else block_type,
-        attn_layer=ConfiguredMixer,
-    )
-    if encoder.cls_token is None:
-        raise RuntimeError("DeiT III requires a class token")
-    with torch.no_grad():
-        trunc_normal_(encoder.cls_token, std=0.02)
-    return encoder
-
-
-class LSSODeiT3(nn.Module):
-    """A DeiT III plain ViT with LSSO as its only token mixer."""
-
     def __init__(
-        self,
-        *,
-        image_size: int,
-        patch_size: int = 16,
-        num_classes: int = 1000,
-        embed_dim: int,
-        depth: int,
-        num_heads: int,
-        rank: int,
-        mlp_ratio: float = 4.0,
-        core_mode: CoreMode | str = CoreMode.DYNAMIC,
-        bias: bool = True,
-        implementation: _Implementation = "reference",
-        drop_path_rate: float = 0.0,
-        layer_scale_init_value: float = 1e-4,
-        norm_eps: float = 1e-6,
-        no_embed_class: bool = True,
-        dynamic_img_size: bool = False,
+        self, *, image_size: int, embed_dim: int, depth: int, num_heads: int,
+        rank: int, patch_size: int = 16, num_classes: int = 1000,
+        mlp_ratio: float = 4.0, bias: bool = True,
+        implementation: _Implementation = "reference", drop_path_rate: float = 0.0,
+        norm_eps: float = 1e-6, dynamic_img_size: bool = False,
         dynamic_img_pad: bool = False,
-        position_encoding: str = "learned",
-        drop_path_schedule: str = "constant",
     ) -> None:
         super().__init__()
-        if not no_embed_class:
-            raise ValueError("DeiT III requires no_embed_class=True")
-        self.encoder = _create_deit3_encoder(
-            image_size=image_size,
-            patch_size=patch_size,
-            num_classes=num_classes,
-            embed_dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            rank=rank,
-            mlp_ratio=mlp_ratio,
-            core_mode=core_mode,
-            bias=bias,
-            implementation=implementation,
-            drop_path_rate=drop_path_rate,
-            layer_scale_init_value=layer_scale_init_value,
-            norm_eps=norm_eps,
-            dynamic_img_size=dynamic_img_size,
-            dynamic_img_pad=dynamic_img_pad,
-            position_encoding=position_encoding,
-            drop_path_schedule=drop_path_schedule,
+        resolved = _validate_implementation(implementation)
+        if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
+            raise ValueError("depth must be a positive integer")
+        if not 0.0 <= drop_path_rate < 1.0:
+            raise ValueError("drop_path_rate must be in [0, 1)")
+        if norm_eps != 1e-6:
+            raise ValueError("the vision scaffold requires norm_eps = 1e-6")
+        if image_size <= 0 or patch_size <= 0 or image_size % patch_size:
+            raise ValueError("image_size must be positive and divisible by patch_size")
+        if not mlp_ratio > 0:
+            raise ValueError("mlp_ratio must be positive")
+        from timm.layers import GluMlp
+        from timm.models.vision_transformer import Block, VisionTransformer
+        _require_timm_attention_mask_api(VisionTransformer)
+        default_grid = (image_size // patch_size,) * 2
+
+        class ConfiguredMixer(_TimmRidgonMixer):
+            def __init__(self, dim: int, num_heads: int, **kwargs: Any) -> None:
+                super().__init__(dim, num_heads, rank=rank,
+                                 implementation=resolved, **kwargs)
+
+        class ConfiguredSwiGLU(GluMlp):
+            def __init__(self, in_features, hidden_features=None, act_layer=None, **kwargs):
+                budget = hidden_features or in_features
+                gate_width = ((2 * budget // 3 + 15) // 16) * 16
+                super().__init__(
+                    in_features, hidden_features=2 * gate_width,
+                    act_layer=nn.SiLU, gate_last=False, **kwargs,
+                )
+
+            def init_weights(self):
+                # Keep timm's Linear trunc_normal_(std=.02), zero-bias init
+                # for both branches. GluMlp's initializer instead overwrites
+                # the second half, which is the value branch for gate_last=False.
+                pass
+
+        class CPEBlock(Block):
+            # ViT³ residual CPE before Pre-LN. PyTorch/cuDNN owns convolution.
+            def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
+                kwargs["mlp_layer"] = ConfiguredSwiGLU
+                super().__init__(dim, *args, **kwargs)
+                self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+
+            def forward(self, x, attn_mask=None, is_causal=False):
+                if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
+                    raise ValueError("CPE accepts only the vision token validity layout")
+                grid = default_grid if attn_mask is None or attn_mask.grid_size is None else attn_mask.grid_size
+                if x.shape[1] != grid[0] * grid[1]:
+                    raise ValueError("CPE requires the patch grid without prefix tokens")
+                valid = None if attn_mask is None else attn_mask.valid_mask
+                patches = x if valid is None else torch.where(valid[..., None], x, 0)
+                spatial = patches.reshape(x.shape[0], *grid, x.shape[2]).permute(0, 3, 1, 2)
+                patches = patches + self.cpe(spatial).flatten(2).transpose(1, 2)
+                if valid is not None:
+                    patches = torch.where(valid[..., None], patches, 0)
+                return super().forward(patches, attn_mask=attn_mask, is_causal=is_causal)
+
+        self.encoder = VisionTransformer(
+            img_size=image_size, patch_size=patch_size, num_classes=num_classes,
+            embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio,
+            qkv_bias=bias, proj_bias=bias, class_token=False, pos_embed="none",
+            global_pool="avg", fc_norm=False, init_values=None,
+            dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
+            drop_path_rate=drop_path_rate, norm_layer=partial(nn.LayerNorm, eps=norm_eps),
+            block_fn=CPEBlock, attn_layer=ConfiguredMixer,
         )
+
+    def get_extra_state(self) -> dict[str, object]:
+        return {"version": 2, "architecture": "vit3_cpe", "ffn": "swiglu",
+                "pooling": "token_ln_mean", "class_token": False, "layer_scale": False}
+
+    def set_extra_state(self, state: object) -> None:
+        if state != self.get_extra_state():
+            raise RuntimeError("incompatible Ridgon vision scaffold checkpoint")
 
     @property
     def blocks(self) -> nn.Module:
-        return self.encoder.blocks  # type: ignore[no-any-return]
+        return self.encoder.blocks
 
     @property
     def patch_embed(self) -> nn.Module:
-        return self.encoder.patch_embed  # type: ignore[no-any-return]
+        return self.encoder.patch_embed
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        valid_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        layout = (
-            None
-            if valid_mask is None
-            else VisionTokenLayout(valid_mask)
-        )
-        return self.encoder(x, attn_mask=layout)
+    def _layout(self, x: torch.Tensor, valid_mask: torch.Tensor | None) -> VisionTokenLayout:
+        grid = self.encoder.patch_embed.dynamic_feat_size(x.shape[-2:])
+        if valid_mask is not None:
+            if valid_mask.dtype != torch.bool or valid_mask.shape != (x.shape[0], grid[0] * grid[1]):
+                raise ValueError("valid_mask must be bool [B, number of patches], without CLS")
+            valid_mask = valid_mask.to(device=x.device)
+        return VisionTokenLayout(valid_mask, grid)
+
+    def forward(self, x: torch.Tensor, *, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        layout = self._layout(x, valid_mask)
+        features = self.encoder.forward_features(x, attn_mask=layout)
+        if layout.valid_mask is None:
+            return self.encoder.forward_head(features)
+        # Features already passed through per-token final LN. Excluded patches
+        # must not enter mean pooling, including their residual or LN bias.
+        mask = layout.valid_mask
+        pooled = torch.where(mask[..., None], features, 0).sum(1)
+        pooled = pooled / mask.sum(1).clamp_min(1).unsqueeze(-1)
+        return self.encoder.head(self.encoder.head_drop(pooled))
 
     def forward_intermediates(
-        self,
-        x: torch.Tensor,
-        *,
-        indices: int | Sequence[int] | None = None,
-        valid_mask: torch.Tensor | None = None,
-        norm: bool = False,
+        self, x: torch.Tensor, *, indices: int | Sequence[int] | None = None,
+        valid_mask: torch.Tensor | None = None, norm: bool = False,
     ) -> list[torch.Tensor]:
-        layout = (
-            None
-            if valid_mask is None
-            else VisionTokenLayout(valid_mask)
-        )
         result = self.encoder.forward_intermediates(
-            x,
-            indices=indices,
-            intermediates_only=True,
-            norm=norm,
-            output_fmt="NCHW",
-            attn_mask=layout,
+            x, indices=indices, intermediates_only=True, norm=norm, output_fmt="NCHW",
+            attn_mask=self._layout(x, valid_mask),
         )
         if not isinstance(result, list):
             raise RuntimeError("timm did not return intermediate feature maps")
         return result
 
 
-def create_lsso_deit3(
-    *,
-    image_size: int,
-    num_classes: int,
-    embed_dim: int,
-    depth: int,
-    num_heads: int,
-    rank: int,
-    mlp_ratio: float,
-    core_mode: CoreMode | str,
-    bias: bool,
-    implementation: _Implementation = "reference",
-    drop_path_rate: float = 0.0,
-    layer_scale_init_value: float = 1e-4,
-    norm_eps: float = 1e-6,
-    no_embed_class: bool = True,
-    patch_size: int = 16,
-    dynamic_img_size: bool = False,
-    dynamic_img_pad: bool = False,
-    position_encoding: str = "learned",
-    drop_path_schedule: str = "constant",
-) -> LSSODeiT3:
-    """Build a DeiT III LSSO classifier or feature encoder."""
-
-    return LSSODeiT3(
-        image_size=image_size,
-        patch_size=patch_size,
-        num_classes=num_classes,
-        embed_dim=embed_dim,
-        depth=depth,
-        num_heads=num_heads,
-        rank=rank,
-        mlp_ratio=mlp_ratio,
-        core_mode=core_mode,
-        bias=bias,
-        implementation=implementation,
-        drop_path_rate=drop_path_rate,
-        layer_scale_init_value=layer_scale_init_value,
-        norm_eps=norm_eps,
-        no_embed_class=no_embed_class,
-        dynamic_img_size=dynamic_img_size,
-        dynamic_img_pad=dynamic_img_pad,
-        position_encoding=position_encoding,
-        drop_path_schedule=drop_path_schedule,
+def create_ridgon_vit(
+    *, image_size: int, num_classes: int, embed_dim: int, depth: int, num_heads: int,
+    rank: int, mlp_ratio: float, bias: bool, implementation: _Implementation = "reference",
+    drop_path_rate: float = 0.0, norm_eps: float = 1e-6, patch_size: int = 16,
+    dynamic_img_size: bool = False, dynamic_img_pad: bool = False,
+) -> RidgonViT:
+    """Build the canonical Ridgon classifier or feature encoder."""
+    return RidgonViT(
+        image_size=image_size, patch_size=patch_size, num_classes=num_classes,
+        embed_dim=embed_dim, depth=depth, num_heads=num_heads, rank=rank,
+        mlp_ratio=mlp_ratio, bias=bias, implementation=implementation,
+        drop_path_rate=drop_path_rate, norm_eps=norm_eps,
+        dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
     )
 
 
-def create_lsso_deit3_variant(
-    variant: str,
-    *,
-    image_size: int,
-    num_classes: int = 1000,
-    rank: int | None = None,
-    core_mode: CoreMode | str = CoreMode.DYNAMIC,
-    bias: bool = True,
-    implementation: _Implementation = "reference",
-    dynamic_img_size: bool = False,
-    dynamic_img_pad: bool = False,
-) -> LSSODeiT3:
-    """Build the agreed Small, Base, or Large LSSO DeiT III scale."""
-
-    spec = deit3_spec(variant)
-    return create_lsso_deit3(
-        image_size=image_size,
-        num_classes=num_classes,
-        embed_dim=spec.embed_dim,
-        depth=spec.depth,
-        num_heads=spec.num_heads,
-        rank=deit3_default_rank(variant) if rank is None else rank,
+def create_ridgon_vit_variant(
+    variant: str, *, image_size: int, num_classes: int = 1000, rank: int | None = None,
+    bias: bool = True, implementation: _Implementation = "reference",
+    dynamic_img_size: bool = False, dynamic_img_pad: bool = False,
+) -> RidgonViT:
+    spec = vision_spec(variant)
+    return create_ridgon_vit(
+        image_size=image_size, num_classes=num_classes, embed_dim=spec.embed_dim,
+        depth=spec.depth, num_heads=spec.num_heads,
+        rank=vision_default_rank(variant) if rank is None else rank,
         mlp_ratio=4.0,
-        core_mode=core_mode,
-        bias=bias,
-        implementation=implementation,
-        drop_path_rate=spec.drop_path_rate,
-        dynamic_img_size=dynamic_img_size,
-        dynamic_img_pad=dynamic_img_pad,
+        bias=bias, implementation=implementation, drop_path_rate=spec.drop_path_rate,
+        dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
     )
 
 
-__all__ = [
-    "DeiT3Spec",
-    "LSSODeiT3",
-    "VisionTokenLayout",
-    "create_lsso_deit3",
-    "create_lsso_deit3_variant",
-    "create_lsso_vit",
-    "deit3_default_rank",
-    "deit3_spec",
-]
+__all__ = ["RidgonViT", "VisionSpec", "VisionTokenLayout", "create_ridgon_vit",
+           "create_ridgon_vit_variant", "vision_default_rank", "vision_spec"]

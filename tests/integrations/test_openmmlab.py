@@ -24,8 +24,7 @@ from experiments.imagenet import (
     interpolate_position_embedding,
 )
 from experiments.train_openmmlab import _configure_checkpoint
-from integrations.timm import DeiT3Spec, LSSODeiT3
-from lsso import CoreMode
+from integrations.timm import VisionSpec, RidgonViT
 
 
 pytestmark = pytest.mark.integration
@@ -37,7 +36,7 @@ CONFIG_ROOT = (
 
 
 def _tiny_imagenet_checkpoint(
-    source: LSSODeiT3,
+    source: RidgonViT,
     *,
     image_size: int = 32,
 ) -> dict[str, object]:
@@ -49,7 +48,12 @@ def _tiny_imagenet_checkpoint(
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "layer_scale_init_value": 1e-4,
+            "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+            "class_token": False,
+            "layer_scale": False,
+            "pooling": "token_ln_mean",
+            "position_encoding": "cpe",
+            "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": 32,
             "depth": 4,
@@ -58,7 +62,7 @@ def _tiny_imagenet_checkpoint(
             "drop_path_rate": 0.0,
         },
         "operator": {
-            "core_mode": "dynamic",
+
             "bias": True,
             "implementation": "reference",
         },
@@ -84,13 +88,13 @@ def _tiny_imagenet_checkpoint(
                 "source_views": 3,
                 "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
                 "validation_partition": "worker-stride-full-per-rank",
+                "worker_rng": "epoch-rank-worker-v1",
             },
         },
         "batching": {
             "world_size": 1,
             "physical_batch_size": 1,
             "effective_batch_size": 1,
-            "augmentation_group_size": 1,
             "grad_accum": 1,
             "samples_per_epoch": 1,
             "updates_per_epoch": 1,
@@ -105,23 +109,21 @@ def _tiny_imagenet_checkpoint(
 
 
 @pytest.fixture
-def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.LSSODeiT3Backbone:
+def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.RidgonViTBackbone:
     """Build the real downstream adapter with a CPU-sized DeiT-shaped encoder."""
 
-    spec = DeiT3Spec(
+    spec = VisionSpec(
         embed_dim=32,
         depth=4,
         num_heads=4,
         drop_path_rate=0.0,
     )
-    monkeypatch.setattr(openmmlab, "deit3_spec", lambda variant: spec)
-    model = openmmlab.LSSODeiT3Backbone(
+    monkeypatch.setattr(openmmlab, "vision_spec", lambda variant: spec)
+    model = openmmlab.RidgonViTBackbone(
         variant="small",
         image_size=32,
         rank=4,
         out_indices=(0, 1, 2, 3),
-        core_mode=CoreMode.DYNAMIC,
-
         implementation="reference",
     ).eval()
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())
@@ -129,7 +131,7 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.LSSODeiT3Backbon
 
 
 def test_backbone_emits_xcit_style_four_level_pyramid(
-    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tiny_backbone: openmmlab.RidgonViTBackbone,
 ) -> None:
     """A plain ViT grid must become strides 4, 8, 16, and 32 for OpenMMLab."""
 
@@ -150,9 +152,9 @@ def test_backbone_emits_xcit_style_four_level_pyramid(
 
 
 def test_backbone_masks_padded_pixels_before_global_mixing(
-    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tiny_backbone: openmmlab.RidgonViTBackbone,
 ) -> None:
-    """Padding must neither enter LSSO nor leak back through the pyramid."""
+    """Padding must neither enter Ridgon nor leak back through the pyramid."""
 
     torch.manual_seed(102)
     valid_mask = torch.zeros(1, 48, 48, dtype=torch.bool)
@@ -189,7 +191,7 @@ def test_backbone_masks_padded_pixels_before_global_mixing(
 
 
 def test_backbone_zeros_partial_patch_padding_before_embedding(
-    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tiny_backbone: openmmlab.RidgonViTBackbone,
 ) -> None:
     """A valid edge patch must not retain arbitrary pixel-padding values."""
 
@@ -217,12 +219,12 @@ def test_backbone_zeros_partial_patch_padding_before_embedding(
 
 
 def test_backbone_accepts_the_imagenet_checkpoint_contract(
-    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tiny_backbone: openmmlab.RidgonViTBackbone,
     tmp_path: Path,
 ) -> None:
     """The downstream backbone consumes the classifier checkpoint verbatim."""
 
-    source = LSSODeiT3(
+    source = RidgonViT(
         image_size=32,
         patch_size=16,
         num_classes=1000,
@@ -230,11 +232,9 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
         depth=4,
         num_heads=4,
         rank=4,
-        core_mode=CoreMode.DYNAMIC,
-
         bias=True,
         implementation="reference",
-        drop_path_rate=0.0,
+        drop_path_rate=0.0, mlp_ratio=4.0,
     )
     checkpoint = tmp_path / "imagenet.pt"
     torch.save(_tiny_imagenet_checkpoint(source), checkpoint)
@@ -251,8 +251,8 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
     )
 
 
-def test_backbone_interpolates_a_smaller_pretrain_position_table(
-    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+def test_backbone_reuses_cpe_weights_at_a_larger_resolution(
+    tiny_backbone: openmmlab.RidgonViTBackbone,
     tmp_path: Path,
 ) -> None:
     target = type(tiny_backbone)(
@@ -260,11 +260,9 @@ def test_backbone_interpolates_a_smaller_pretrain_position_table(
         image_size=48,
         rank=4,
         out_indices=(0, 1, 2, 3),
-        core_mode=CoreMode.DYNAMIC,
-
         implementation="reference",
     ).eval()
-    source = LSSODeiT3(
+    source = RidgonViT(
         image_size=32,
         patch_size=16,
         num_classes=1000,
@@ -272,29 +270,23 @@ def test_backbone_interpolates_a_smaller_pretrain_position_table(
         depth=4,
         num_heads=4,
         rank=4,
-        core_mode=CoreMode.DYNAMIC,
-
         bias=True,
         implementation="reference",
-        drop_path_rate=0.0,
+        drop_path_rate=0.0, mlp_ratio=4.0,
     )
     checkpoint = tmp_path / "imagenet-32px.pt"
     torch.save(_tiny_imagenet_checkpoint(source, image_size=32), checkpoint)
 
-    expected = interpolate_position_embedding(
-        source.encoder.pos_embed,
-        target.encoder.pos_embed,
-    )
     target.load_pretrained(checkpoint)
-
-    torch.testing.assert_close(target.encoder.pos_embed, expected)
+    assert target.encoder.pos_embed is None
+    torch.testing.assert_close(target.blocks[0].cpe.weight, source.blocks[0].cpe.weight)
 
 
 def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
-    tiny_backbone: openmmlab.LSSODeiT3Backbone,
+    tiny_backbone: openmmlab.RidgonViTBackbone,
     tmp_path: Path,
 ) -> None:
-    source = LSSODeiT3(
+    source = RidgonViT(
         image_size=32,
         patch_size=16,
         num_classes=1000,
@@ -302,8 +294,6 @@ def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
         depth=4,
         num_heads=4,
         rank=4,
-        core_mode=CoreMode.DYNAMIC,
-
         bias=True,
         implementation="reference",
         drop_path_rate=0.0,
@@ -340,7 +330,7 @@ def test_launcher_places_new_run_checkpoint_on_backbone(tmp_path: Path) -> None:
 
 
 def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
-    """COCO leaves should vary only the LSSO DeiT III scale and rank."""
+    """COCO leaves should vary only the Ridgon DeiT III scale and rank."""
 
     expected = {
         "small": (32, 384, (3, 5, 7, 11)),
@@ -348,7 +338,7 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
         "large": (64, 1024, (7, 11, 15, 23)),
     }
     for variant, (rank, channels, out_indices) in expected.items():
-        path = CONFIG_ROOT / f"coco_mask_rcnn_lsso_deit3_{variant}_3x.py"
+        path = CONFIG_ROOT / f"coco_mask_rcnn_ridgon_deit3_{variant}_3x.py"
         config = runpy.run_path(str(path))
         backbone = config["model"]["backbone"]
         assert config["_base_"] == "./_base_/coco_mask_rcnn_fpn_3x.py"
@@ -357,19 +347,18 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
             "allow_failed_imports": False,
         }
         assert backbone == {
-            "type": "LSSODeiT3Backbone",
+            "type": "RidgonViTBackbone",
             "variant": variant,
             "rank": rank,
             "out_indices": out_indices,
             "implementation": "cuda",
-            "core_mode": "dynamic",
         }
         assert config["model"]["neck"] == {
             "in_channels": [channels] * 4,
         }
 
     base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "coco_mask_rcnn_fpn_3x.py"))
-    assert base["model"]["type"] == "LSSOMaskRCNN"
+    assert base["model"]["type"] == "RidgonMaskRCNN"
     assert "init_cfg" not in base["model"]["backbone"]
     assert base["model"]["neck"]["type"] == "FPN"
     assert base["model"]["neck"]["num_outs"] == 5
@@ -391,7 +380,7 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         "large": (64, 1024, (7, 11, 15, 23), 512),
     }
     for variant, (rank, channels, out_indices, decoder_channels) in expected.items():
-        path = CONFIG_ROOT / f"ade20k_upernet_lsso_deit3_{variant}_160k.py"
+        path = CONFIG_ROOT / f"ade20k_upernet_ridgon_deit3_{variant}_160k.py"
         config = runpy.run_path(str(path))
         backbone = config["model"]["backbone"]
         assert config["_base_"] == "./_base_/ade20k_upernet_160k.py"
@@ -399,7 +388,7 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         assert backbone["rank"] == rank
         assert backbone["out_indices"] == out_indices
         assert backbone["implementation"] == "cuda"
-        assert backbone["core_mode"] == "dynamic"
+        assert "core_mode" not in backbone
         assert config["model"]["decode_head"] == {
             "in_channels": [channels] * 4,
             "channels": decoder_channels,
@@ -407,7 +396,7 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         assert config["model"]["auxiliary_head"] == {"in_channels": channels}
 
     base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "ade20k_upernet_160k.py"))
-    assert base["model"]["type"] == "LSSOEncoderDecoder"
+    assert base["model"]["type"] == "RidgonEncoderDecoder"
     assert "init_cfg" not in base["model"]["backbone"]
     assert base["model"]["decode_head"]["type"] == "UPerHead"
     assert base["crop_size"] == (512, 512)

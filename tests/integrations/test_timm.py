@@ -11,15 +11,70 @@ import pytest
 import torch
 
 from integrations.timm import (
-    _TimmLSSOMixer,
+    _TimmRidgonMixer,
     _require_timm_attention_mask_api,
-    create_lsso_vit,
+    create_ridgon_vit,
 )
-from lsso import CoreMode, LSSO
-from lsso.ball import cuda
+from ridgon import Ridgon
+from ridgon.ball import cuda
 
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("factory", [create_ridgon_vit])
+def test_vision_initialization_preserves_key_fan_in_and_timm_qv_rules(factory):
+    pytest.importorskip("timm")
+    torch.manual_seed(41)
+    model = factory(
+        image_size=32, patch_size=4, num_classes=10, embed_dim=192,
+        depth=2, num_heads=6, rank=16, mlp_ratio=2, bias=True,
+    )
+    encoder = model.encoder if hasattr(model, "encoder") else model
+    for reinitialize in (False, True):
+        if reinitialize:
+            encoder.init_weights()
+        layers = [module for module in model.modules() if isinstance(module, Ridgon)]
+        assert len(layers) == 2
+        for layer in layers:
+            q, k, v = layer.w_qkv.weight.split((96, 96, 192))
+            assert abs(k.std().item() * 192**0.5 - 1) < 0.05
+            for weight in (q, v):
+                assert abs(weight.std().item() / 0.02 - 1) < 0.05
+            assert torch.count_nonzero(layer.w_qkv.bias) == 0
+        for block in model.blocks:
+            for weight in block.mlp.fc1.weight.chunk(2):
+                assert abs(weight.std().item() / 0.02 - 1) < 0.05
+            assert torch.count_nonzero(block.mlp.fc1.bias) == 0
+
+
+def test_small_swiglu_width_and_packed_forward_backward():
+    pytest.importorskip("timm")
+    torch.manual_seed(71)
+    model = create_ridgon_vit(
+        image_size=32, patch_size=16, num_classes=10, embed_dim=384,
+        depth=1, num_heads=6, rank=32, mlp_ratio=4.0, bias=True,
+    )
+    mlp = model.blocks[0].mlp
+    assert mlp.fc1.out_features == 2048
+    assert mlp.fc2.in_features == 1024
+    x = torch.randn(2, 4, 384, requires_grad=True)
+    wg, wv = mlp.fc1.weight.chunk(2)
+    bg, bv = mlp.fc1.bias.chunk(2)
+    linear = torch.nn.functional.linear
+    expected = linear(torch.nn.functional.silu(linear(x, wg, bg)) * linear(x, wv, bv),
+                      mlp.fc2.weight, mlp.fc2.bias)
+    actual = mlp(x)
+    torch.testing.assert_close(actual, expected)
+    inputs = (x, *mlp.parameters())
+    grad = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, inputs, grad)
+    expected_grads = torch.autograd.grad(expected, inputs, grad)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=2e-6, rtol=2e-5)
+    old_state = model.get_extra_state() | {"version": 1}
+    with pytest.raises(RuntimeError, match="incompatible"):
+        model.set_extra_state(old_state)
 
 
 def test_vision_extra_requires_the_attn_mask_capable_timm_release() -> None:
@@ -52,7 +107,7 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 def test_timm_factory_rejects_empty_depth_before_framework_import() -> None:
     with pytest.raises(ValueError, match="positive integer"):
-        create_lsso_vit(
+        create_ridgon_vit(
             image_size=32,
             patch_size=4,
             num_classes=100,
@@ -61,8 +116,6 @@ def test_timm_factory_rejects_empty_depth_before_framework_import() -> None:
             num_heads=2,
             rank=4,
             mlp_ratio=2.0,
-            core_mode=CoreMode.DYNAMIC,
-
             bias=True,
         )
 
@@ -70,12 +123,10 @@ def test_timm_factory_rejects_empty_depth_before_framework_import() -> None:
 def test_timm_adapter_forwards_the_requested_implementation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter = _TimmLSSOMixer(
+    adapter = _TimmRidgonMixer(
         16,
         2,
         rank=4,
-        core_mode=CoreMode.DYNAMIC,
-
         implementation="cuda",
         qkv_bias=True,
         qk_norm=False,
@@ -106,7 +157,7 @@ def test_timm_adapter_forwards_the_requested_implementation(
 
 def test_timm_factory_rejects_unknown_implementation_before_framework_import() -> None:
     with pytest.raises(ValueError, match="implementation"):
-        create_lsso_vit(
+        create_ridgon_vit(
             image_size=32,
             patch_size=4,
             num_classes=10,
@@ -115,20 +166,16 @@ def test_timm_factory_rejects_unknown_implementation_before_framework_import() -
             num_heads=2,
             rank=4,
             mlp_ratio=2.0,
-            core_mode=CoreMode.DYNAMIC,
-
             bias=True,
             implementation="automatic",
         )
 
 
 def test_timm_cuda_adapter_does_not_fall_back_to_reference() -> None:
-    adapter = _TimmLSSOMixer(
+    adapter = _TimmRidgonMixer(
         32,
         2,
         rank=16,
-        core_mode=CoreMode.DYNAMIC,
-
         implementation="cuda",
         qkv_bias=False,
         qk_norm=False,
@@ -161,12 +208,11 @@ def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
         "num_heads": 2,
         "rank": 16,
         "mlp_ratio": 2.0,
-        "core_mode": CoreMode.DYNAMIC,
         "bias": True,
         "drop_path_rate": 0.0,
     }
-    fast = create_lsso_vit(**kwargs, implementation="cuda").cuda().eval()
-    reference = create_lsso_vit(
+    fast = create_ridgon_vit(**kwargs, implementation="cuda").cuda().eval()
+    reference = create_ridgon_vit(
         **kwargs,
         implementation="reference",
     ).cuda().eval()
@@ -196,28 +242,28 @@ def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
         assert _relative_l2(fast_gradient, reference_gradient) <= 1e-2
 
 
-@pytest.mark.parametrize("schedule,expected", [("linear", [0.0, 0.2, 0.4]), ("constant", [0.4] * 3)])
-def test_shared_scaffold_applies_the_selected_drop_path_schedule(schedule, expected):
+def test_shared_scaffold_applies_linear_drop_path_without_layerscale():
     pytest.importorskip("timm")
-    from integrations.timm import create_lsso_deit3
+    from integrations.timm import create_ridgon_vit
 
-    model = create_lsso_deit3(
+    model = create_ridgon_vit(
         image_size=32, patch_size=16, num_classes=10, embed_dim=32,
-        depth=3, num_heads=2, rank=16, mlp_ratio=2, core_mode="dynamic",
-        bias=True, drop_path_rate=0.4, drop_path_schedule=schedule,
+        depth=3, num_heads=2, rank=16, mlp_ratio=2,
+        bias=True, drop_path_rate=0.4,
     )
     actual = [getattr(block.drop_path1, "drop_prob", 0.0) for block in model.blocks]
-    assert actual == pytest.approx(expected)
+    assert actual == pytest.approx([0.0, 0.2, 0.4])
+    assert all(isinstance(block.ls1, torch.nn.Identity) and isinstance(block.ls2, torch.nn.Identity) for block in model.blocks)
 
 
 def test_cpe_replaces_absolute_positions_and_matches_patch_grid_convolution():
     pytest.importorskip("timm")
-    from integrations.timm import create_lsso_deit3, VisionTokenLayout
+    from integrations.timm import create_ridgon_vit, VisionTokenLayout
     torch.manual_seed(137)
-    model = create_lsso_deit3(
+    model = create_ridgon_vit(
         image_size=32, patch_size=16, num_classes=10, embed_dim=32,
-        depth=1, num_heads=2, rank=16, mlp_ratio=2, core_mode="dynamic",
-        bias=True, position_encoding="cpe",
+        depth=1, num_heads=2, rank=16, mlp_ratio=2,
+        bias=True,
     )
     assert model.encoder.pos_embed is None
     block = model.blocks[0]
@@ -225,16 +271,15 @@ def test_cpe_replaces_absolute_positions_and_matches_patch_grid_convolution():
     # Observe exactly the tensor entering the first normalization.
     seen = []
     handle = block.norm1.register_forward_pre_hook(lambda _module, inputs: seen.append(inputs[0]))
-    x = torch.randn(2, 5, 32, requires_grad=True)
+    x = torch.randn(2, 4, 32, requires_grad=True)
     block(x)
-    grid = x[:, 1:].reshape(2, 2, 2, 32).permute(0, 3, 1, 2).contiguous()
-    expected = x[:, 1:] + torch.nn.functional.conv2d(
+    grid = x.reshape(2, 2, 2, 32).permute(0, 3, 1, 2).contiguous()
+    expected = x + torch.nn.functional.conv2d(
         grid, block.cpe.weight, block.cpe.bias, padding=1, groups=32,
     ).flatten(2).transpose(1, 2)
-    torch.testing.assert_close(seen[-1][:, 0], x[:, 0])
-    torch.testing.assert_close(seen[-1][:, 1:], expected)
+    torch.testing.assert_close(seen[-1], expected)
     seen.clear()
-    valid = torch.ones(2, 5, dtype=torch.bool);valid[:, 2] = False
+    valid = torch.ones(2, 4, dtype=torch.bool);valid[:, 2] = False
     first = block(x, attn_mask=VisionTokenLayout(valid))
     altered = x.detach().clone();altered[:, 2] = 1000
     second = block(altered, attn_mask=VisionTokenLayout(valid))
@@ -260,3 +305,33 @@ def test_fused_adamw_matches_unfused_fp32_updates():
         fused.step(); unfused.step()
     for a, b in zip(first.parameters(), second.parameters()):
         torch.testing.assert_close(a, b, atol=1e-7, rtol=1e-6)
+
+
+def test_mean_pooling_uses_token_norm_and_excludes_invalid_patches():
+    pytest.importorskip("timm")
+    torch.manual_seed(211)
+    model = create_ridgon_vit(
+        image_size=32, patch_size=16, num_classes=10, embed_dim=32,
+        depth=2, num_heads=2, rank=16, mlp_ratio=2, bias=True,
+    ).eval()
+    encoder = model.encoder
+    assert encoder.cls_token is None and encoder.num_prefix_tokens == 0
+    assert encoder.pos_embed is None
+    assert isinstance(encoder.norm, torch.nn.LayerNorm)
+    assert isinstance(encoder.fc_norm, torch.nn.Identity)
+    images = torch.randn(2, 3, 32, 32)
+    features = encoder.forward_features(images)
+    assert features.shape == (2, 4, 32)
+    torch.testing.assert_close(model(images), encoder.head(features.mean(1)))
+    # The top-right patch is excluded from both memory and classification.
+    mask = torch.tensor([[True, False, True, True], [False, False, False, False]])
+    changed = images.clone(); changed[:, :, :16, 16:] = 10000
+    first, second = model(images, valid_mask=mask), model(changed, valid_mask=mask)
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(first[1], encoder.head.bias)
+    with pytest.raises(ValueError, match="without CLS"):
+        model(images, valid_mask=torch.ones(2, 5, dtype=torch.bool))
+    state = model.state_dict()
+    state["_extra_state"] = {"architecture": "cls_layerscale"}
+    with pytest.raises(RuntimeError, match="vision scaffold"):
+        model.load_state_dict(state)

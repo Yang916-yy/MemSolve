@@ -1,7 +1,7 @@
 """COCO 2017 Mask R-CNN + FPN 3x downstream protocol.
 
 This is the current MMDetection 3.x expression of the public XCiT
-downstream recipe.  The LSSO-specific leaf configs supply the plain-ViT
+downstream recipe.  The Ridgon-specific leaf configs supply the plain-ViT
 backbone geometry and its four feature levels.
 """
 
@@ -11,7 +11,7 @@ data_root = "data/coco/"
 backend_args = None
 
 model = dict(
-    type="LSSOMaskRCNN",
+    type="RidgonMaskRCNN",
     data_preprocessor=dict(
         type="DetDataPreprocessor",
         mean=[123.675, 116.28, 103.53],
@@ -20,7 +20,7 @@ model = dict(
         pad_size_divisor=32,
     ),
     backbone=dict(
-        type="LSSODeiT3Backbone",
+        type="RidgonViTBackbone",
     ),
     neck=dict(
         type="FPN",

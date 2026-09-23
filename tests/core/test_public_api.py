@@ -1,25 +1,9 @@
-from __future__ import annotations
-
-import pytest
-
-import lsso
-from lsso import CoreMode, LSSO, LSSOConfig
-from lsso.ball import CoreMode as BallCoreMode
-from lsso.ball import LSSO as BallLSSO
-from lsso.ball import LSSOConfig as BallConfig
+import ridgon
+from ridgon import Ridgon, RidgonConfig
+from ridgon.ball import Ridgon as BallRidgon, RidgonConfig as BallConfig
 
 
-pytestmark = pytest.mark.core
-
-
-def test_public_api_is_narrow() -> None:
-    assert CoreMode is BallCoreMode
-    assert LSSO is BallLSSO
-    assert LSSOConfig is BallConfig
-    assert set(lsso.__all__) == {
-        "CoreMode",
-        "LSSO",
-        "LSSOConfig",
-        "__version__",
-    }
-    assert lsso.__version__ == "0.6.3"
+def test_public_api_is_narrow():
+    assert Ridgon is BallRidgon and RidgonConfig is BallConfig
+    assert set(ridgon.__all__) == {"Ridgon", "RidgonConfig", "__version__"}
+    assert ridgon.__version__ == "0.11.0"

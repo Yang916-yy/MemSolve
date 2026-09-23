@@ -3,7 +3,7 @@
 This file defines the repository contract for contributors who use coding
 agents, large language models, or other AI-assisted development tools. It
 governs proposed changes and review evidence; it does not affect installation,
-runtime behavior, or ordinary use of LSSO.
+runtime behavior, or ordinary use of Ridgon.
 
 The human contributor remains responsible for the scope, correctness,
 provenance, testing, and reviewability of every submitted change. AI-generated
@@ -28,13 +28,13 @@ informed.
 
 ## Core Ownership
 
-- `lsso/ball/reference.py` is the only owner of operator mathematics and the
+- `ridgon/ball/reference.py` is the only owner of operator mathematics and the
   canonical numerical contract.
-- `lsso/ball/model.py` is the only owner of parameters and `nn.Module` behavior.
-- `lsso/ball/config.py` is the only owner of public variants and validation.
+- `ridgon/ball/model.py` is the only owner of parameters and `nn.Module` behavior.
+- `ridgon/ball/config.py` is the only owner of public variants and validation.
 - Do not add compatibility aliases, legacy imports, duplicate model classes, or
   a second reference implementation.
-- Do not add files under `lsso/ball/` without maintainer approval.
+- Do not add files under `ridgon/ball/` without maintainer approval.
 
 ## Equivalent Implementations
 
@@ -61,10 +61,10 @@ informed.
 
 ## CUDA Boundary
 
-- CUDA supports DYNAMIC, STATIC and ZERO with default skew and complement
-  settings at ranks 16, 32, 48 and 64; see `docs/CUDA_CONTRACT.md`.
+- CUDA supports the independent Q/K/V ridge readout with an identity-plus-delta
+  shared query map at ranks 16, 32, 48 and 64; see `docs/CUDA_CONTRACT.md`.
 - Unsupported variants, layouts, dtypes, or devices must fail explicitly.
-- CUDA must not silently fall back or preserve an old ABI.
+- CUDA must not silently fall back or load a native library from an old contract.
 - Every CUDA forward result and gradient must be checked against `reference.py`.
 
 ## Peripheral Code
@@ -85,7 +85,7 @@ informed.
   `tests/cuda`, `tests/integrations`, `tests/experiments`, or
   `tests/repository`. Use `-m "not cuda"` when a CPU-only check is sufficient.
 - Core math changes require the relevant `tests/core` checks and CUDA oracle
-  checks when the native path is affected. CUDA changes require `tests/cuda`
+  checks when the CUDA path is affected. CUDA changes require `tests/cuda`
   and the corresponding reference comparison. Integration and experiment
   changes require their own domain.
 - Run `python tools/check_repository.py` after package or repository-layout

@@ -1,7 +1,7 @@
 """Distributed ImageNet-1K training with the plain ViT³-derived recipes.
 
 The model itself intentionally lives outside this entrypoint.  The runner calls
-``integrations.timm.create_lsso_deit3`` so classification, detection, and
+``integrations.timm.create_ridgon_vit`` so classification, detection, and
 segmentation share one backbone implementation rather than recreating model
 math in every experiment.
 """
@@ -48,7 +48,7 @@ OFFICIAL_VIT3_URL = (
     "https://github.com/LeapLabTHU/ViTTT/tree/"
     "e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt"
 )
-IMAGENET_CHECKPOINT_FORMAT = 7
+IMAGENET_CHECKPOINT_FORMAT = 12
 IMAGENET_WDS_SOURCE = "timm/imagenet-1k-wds"
 IMAGENET_WDS_MANIFEST_SHA256 = (
     "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f"
@@ -117,12 +117,11 @@ class DistributedState:
 
 @dataclass(frozen=True)
 class BatchingPlan:
-    """Resolved physical, virtual, and optimizer-update batching contract."""
+    """Resolved physical and optimizer-update batching contract."""
 
     world_size: int
     physical_batch_size: int
     effective_batch_size: int
-    augmentation_group_size: int
     grad_accum: int
     samples_per_epoch: int
     updates_per_epoch: int
@@ -140,7 +139,6 @@ class BatchingPlan:
             "world_size": self.world_size,
             "physical_batch_size": self.physical_batch_size,
             "effective_batch_size": self.effective_batch_size,
-            "augmentation_group_size": self.augmentation_group_size,
             "grad_accum": self.grad_accum,
             "samples_per_epoch": self.samples_per_epoch,
             "updates_per_epoch": self.updates_per_epoch,
@@ -217,7 +215,7 @@ class ImageNetRun:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train LSSO with plain ViT³ T/S/B recipes on ImageNet-1K with torchrun."
+        description="Train Ridgon with plain ViT³ T/S/B recipes on ImageNet-1K with torchrun."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--tier", choices=("tiny", "small", "base"), required=True)
@@ -239,7 +237,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--implementation",
         choices=("cuda", "reference"),
-        help="Override the configured LSSO implementation for a diagnostic run.",
+        help="Override the configured Ridgon implementation for a diagnostic run.",
     )
     parser.add_argument(
         "--resume",
@@ -348,8 +346,11 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         "patch_size": defaults["patch_size"],
         "num_classes": defaults["num_classes"],
         "mlp_ratio": defaults["mlp_ratio"],
-        "layer_scale_init_value": defaults["layer_scale_init_value"],
         "norm_eps": defaults["norm_eps"],
+        "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+        "layer_scale": False,
+        "class_token": False,
+        "pooling": "token_ln_mean",
         "drop_path_schedule": "linear",
         "position_encoding": defaults["position_encoding"],
         **tier_values,
@@ -409,7 +410,6 @@ def _validate_run(
             "num_heads",
             "rank",
             "mlp_ratio",
-            "layer_scale_init_value",
             "norm_eps",
             "drop_path_rate",
         ),
@@ -417,7 +417,7 @@ def _validate_run(
     )
     _require_keys(
         operator,
-        ("core_mode", "bias", "implementation"),
+        ("bias", "implementation"),
         "[operator]",
     )
     _require_keys(
@@ -426,7 +426,6 @@ def _validate_run(
             "epochs",
             "batch_size",
             "effective_batch",
-            "augmentation_group_size",
             "lr",
             "min_lr",
             "warmup_lr",
@@ -467,14 +466,22 @@ def _validate_run(
     _positive_int(model["rank"], "rank")
     _positive_int(model["num_classes"], "num_classes")
     _positive_float(model["mlp_ratio"], "mlp_ratio")
-    _positive_float(model["layer_scale_init_value"], "layer_scale_init_value")
     _positive_float(model["norm_eps"], "norm_eps")
     _probability(model["drop_path_rate"], "drop_path_rate")
 
-    if operator["core_mode"] != "dynamic":
-        raise ValueError("the ImageNet recipe requires the DYNAMIC LSSO core")
+    for key, expected in {
+        "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu", "layer_scale": False, "class_token": False,
+        "pooling": "token_ln_mean", "drop_path_schedule": "linear", "position_encoding": "cpe",
+    }.items():
+        if model.get(key) != expected:
+            raise ValueError(f"the vision scaffold requires {key}={expected!r}")
+    if "layer_scale_init_value" in model or "layer_scale_init_value" in train:
+        raise ValueError("LayerScale is not part of the current vision scaffold")
+
+    if "core_mode" in operator:
+        raise ValueError("core_mode is not part of the QKV equilibrium contract")
     if operator["bias"] is not True:
-        raise ValueError("the DeiT III scaffold requires qkv/projection bias")
+        raise ValueError("the ViT³ scaffold requires qkv/projection bias")
     if operator["implementation"] not in {"cuda", "reference"}:
         raise ValueError("operator.implementation must be 'cuda' or 'reference'")
 
@@ -482,13 +489,7 @@ def _validate_run(
         raise ValueError("unsupported training execution")
     _positive_int(train["epochs"], "epochs")
     _positive_int(train["batch_size"], "batch_size")
-    effective_batch = _positive_int(train["effective_batch"], "effective_batch")
-    augmentation_group_size = _positive_int(
-        train["augmentation_group_size"],
-        "augmentation_group_size",
-    )
-    if effective_batch % augmentation_group_size:
-        raise ValueError("effective_batch must be divisible by augmentation_group_size")
+    _positive_int(train["effective_batch"], "effective_batch")
     _nonnegative_int(train["train_workers"], "train_workers")
     _nonnegative_int(train["val_workers"], "val_workers")
     _nonnegative_int(train["warmup_epochs"], "warmup_epochs")
@@ -536,7 +537,6 @@ def _validate_batching_contract(value: object) -> None:
             "world_size",
             "physical_batch_size",
             "effective_batch_size",
-            "augmentation_group_size",
             "grad_accum",
             "samples_per_epoch",
             "updates_per_epoch",
@@ -552,10 +552,6 @@ def _validate_batching_contract(value: object) -> None:
         batching["effective_batch_size"],
         "batching.effective_batch_size",
     )
-    augmentation_group_size = _positive_int(
-        batching["augmentation_group_size"],
-        "batching.augmentation_group_size",
-    )
     grad_accum = _positive_int(batching["grad_accum"], "batching.grad_accum")
     samples_per_epoch = _positive_int(
         batching["samples_per_epoch"],
@@ -565,10 +561,6 @@ def _validate_batching_contract(value: object) -> None:
         batching["updates_per_epoch"],
         "batching.updates_per_epoch",
     )
-    if physical_batch_size % augmentation_group_size:
-        raise ValueError(
-            "checkpoint physical_batch_size must be divisible by augmentation_group_size"
-        )
     if effective_batch_size != world_size * physical_batch_size * grad_accum:
         raise ValueError(
             "checkpoint effective_batch_size does not match world_size, "
@@ -593,13 +585,6 @@ def resolve_batching_plan(
         raise ValueError("ImageNet train dataset must contain at least one sample")
     physical_batch_size = int(run.train["batch_size"])
     effective_batch_size = int(run.train["effective_batch"])
-    augmentation_group_size = int(run.train["augmentation_group_size"])
-    if physical_batch_size % augmentation_group_size:
-        raise ValueError(
-            "physical batch_size must be divisible by augmentation_group_size"
-        )
-    if effective_batch_size % augmentation_group_size:
-        raise ValueError("effective_batch must be divisible by augmentation_group_size")
 
     global_physical_batch = state.world_size * physical_batch_size
     if requested_grad_accum is None:
@@ -624,7 +609,6 @@ def resolve_batching_plan(
         world_size=state.world_size,
         physical_batch_size=physical_batch_size,
         effective_batch_size=effective_batch_size,
-        augmentation_group_size=augmentation_group_size,
         grad_accum=grad_accum,
         samples_per_epoch=updates_per_epoch * effective_batch_size,
         updates_per_epoch=updates_per_epoch,
@@ -642,7 +626,7 @@ def initialize_distributed() -> DistributedState:
             "incomplete torchrun environment; missing " + ", ".join(missing)
         )
     if not torch.cuda.is_available():
-        raise RuntimeError("ImageNet DeiT III training requires a CUDA device")
+        raise RuntimeError("ImageNet training requires a CUDA device")
 
     if not present:
         return DistributedState(
@@ -893,6 +877,7 @@ class ImageNetWebDatasetManifest:
                 "source_views": 3 if repeated_augmentation else 1,
                 "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
                 "validation_partition": "worker-stride-full-per-rank",
+                "worker_rng": "epoch-rank-worker-v1",
             },
         }
 
@@ -1133,6 +1118,7 @@ def _validate_webdataset_contract(value: object) -> None:
             "source_views",
             "repeated_augmentation_placement",
             "validation_partition",
+            "worker_rng",
         ),
         "checkpoint WebDataset streaming contract",
     )
@@ -1156,6 +1142,8 @@ def _validate_webdataset_contract(value: object) -> None:
         raise ValueError("checkpoint WebDataset repeated-augmentation placement is invalid")
     if streaming["validation_partition"] != "worker-stride-full-per-rank":
         raise ValueError("checkpoint WebDataset validation partition is invalid")
+    if streaming["worker_rng"] != "epoch-rank-worker-v1":
+        raise ValueError("checkpoint WebDataset worker RNG policy is invalid")
 
 
 def _webdataset_seed(*values: int) -> int:
@@ -1228,15 +1216,14 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         seed: int,
         num_classes: int,
         training: bool,
-        augmentation_group_size: int = 1,
         source_views: int = 1,
         physical_batch_size: int | None = None,
         microbatches_per_epoch: int | None = None,
         worker_count: int | None = None,
     ) -> None:
         super().__init__()
-        if augmentation_group_size < 1 or source_views < 1:
-            raise ValueError("WebDataset group size and source views must be positive")
+        if source_views < 1:
+            raise ValueError("WebDataset source views must be positive")
         if training:
             if (
                 physical_batch_size is None
@@ -1244,10 +1231,8 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
                 or worker_count is None
             ):
                 raise ValueError("training WebDataset requires a complete batching plan")
-            if physical_batch_size < 1 or physical_batch_size % augmentation_group_size:
-                raise ValueError(
-                    "training WebDataset physical batch size must align to augmentation groups"
-                )
+            if physical_batch_size < 1:
+                raise ValueError("training WebDataset physical batch size must be positive")
             if microbatches_per_epoch < 1 or worker_count < 1:
                 raise ValueError("training WebDataset requires positive batch and worker counts")
         self.split = split
@@ -1256,17 +1241,21 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         self.seed = int(seed)
         self.num_classes = int(num_classes)
         self.training = training
-        self.augmentation_group_size = int(augmentation_group_size)
         self.source_views = int(source_views)
         self.physical_batch_size = physical_batch_size
         self.microbatches_per_epoch = microbatches_per_epoch
         self.worker_count = worker_count
-        self._epoch = 0
+        # Dataset copies in persistent workers must observe the parent's epoch.
+        self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+
+    @property
+    def _epoch(self) -> int:
+        return int(self._shared_epoch.item())
 
     def set_epoch(self, epoch: int) -> None:
         if epoch < 0:
             raise ValueError("WebDataset epoch must be non-negative")
-        self._epoch = int(epoch)
+        self._shared_epoch.fill_(int(epoch))
 
     @staticmethod
     def _worker_state() -> tuple[int, int]:
@@ -1312,63 +1301,56 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
             raise RuntimeError("WebDataset shard assignment exceeded its source records")
         return tuple(slices)
 
-    def _training_virtual_group_counts(self) -> tuple[int, ...]:
+    def _training_batch_counts(self) -> tuple[int, ...]:
         if (
             self.physical_batch_size is None
             or self.microbatches_per_epoch is None
             or self.worker_count is None
         ):
             raise RuntimeError("training WebDataset is missing its batching plan")
-        groups_per_batch = self.physical_batch_size // self.augmentation_group_size
-        total_groups = self.microbatches_per_epoch * groups_per_batch
-        full_unit = math.lcm(groups_per_batch, self.source_views)
-        unit_count, remainder = divmod(total_groups, full_unit)
+        total_batches = self.microbatches_per_epoch
+        full_unit = self.source_views
+        unit_count, remainder = divmod(total_batches, full_unit)
         base, extra = divmod(unit_count, self.worker_count)
-        groups = [
+        batches = [
             (base + (worker_id < extra)) * full_unit
             for worker_id in range(self.worker_count)
         ]
-        groups[-1] += remainder
-        return tuple(groups)
-
-    def _groups_per_physical_batch(self) -> int:
-        if self.physical_batch_size is None:
-            raise RuntimeError("training WebDataset is missing its physical batch size")
-        return self.physical_batch_size // self.augmentation_group_size
+        batches[-1] += remainder
+        return tuple(batches)
 
     def _repeated_augmentation_block(
         self,
-        remaining_virtual_groups: int,
+        remaining_batches: int,
     ) -> tuple[int, int]:
-        """Return source groups to cache and virtual groups to emit from one block."""
+        """Return source batches to cache and physical batches to emit from one block."""
 
-        if remaining_virtual_groups < 1:
-            raise ValueError("remaining virtual groups must be positive")
-        groups_per_batch = self._groups_per_physical_batch()
-        source_window = self.source_views * groups_per_batch
+        if remaining_batches < 1:
+            raise ValueError("remaining batches must be positive")
+        source_window = self.source_views
         output_window = self.source_views * source_window
-        if remaining_virtual_groups >= output_window:
+        if remaining_batches >= output_window:
             return source_window, output_window
         return (
             max(
-                math.ceil(remaining_virtual_groups / self.source_views),
-                groups_per_batch,
+                math.ceil(remaining_batches / self.source_views),
+                1,
             ),
-            remaining_virtual_groups,
+            remaining_batches,
         )
 
-    def _source_group_count(self, virtual_groups: int) -> int:
-        if virtual_groups < 0:
-            raise ValueError("virtual group count must be non-negative")
+    def _source_batch_count(self, batches: int) -> int:
+        if batches < 0:
+            raise ValueError("batch count must be non-negative")
         if self.source_views == 1:
-            return virtual_groups
-        source_groups = 0
-        remaining = virtual_groups
+            return batches
+        source_batches = 0
+        remaining = batches
         while remaining:
             block_sources, block_outputs = self._repeated_augmentation_block(remaining)
-            source_groups += block_sources
+            source_batches += block_sources
             remaining -= block_outputs
-        return source_groups
+        return source_batches
 
     def _training_slices(
         self,
@@ -1381,12 +1363,12 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
             raise RuntimeError(
                 "training WebDataset worker count changed after its batching plan was resolved"
             )
-        groups = self._training_virtual_group_counts()
-        if not 0 <= worker_id < len(groups):
+        batches = self._training_batch_counts()
+        if not 0 <= worker_id < len(batches):
             raise RuntimeError("training WebDataset reported an invalid worker id")
         source_counts = tuple(
-            self._source_group_count(group_count) * self.augmentation_group_size
-            for group_count in groups
+            self._source_batch_count(batch_count) * self.physical_batch_size
+            for batch_count in batches
         )
         shards = self._rank_shards(epoch)
         available = sum(shard_length for _, shard_length in shards)
@@ -1464,8 +1446,8 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         worker_id: int,
         worker_count: int,
     ) -> Iterator[tuple[torch.Tensor, int]]:
-        virtual_groups = self._training_virtual_group_counts()[worker_id]
-        if not virtual_groups:
+        batches = self._training_batch_counts()[worker_id]
+        if not batches:
             return
         source = iter(
             self._raw_samples(
@@ -1482,39 +1464,39 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
                 ),
             )
         )
-        emitted_groups = 0
-        while emitted_groups < virtual_groups:
+        emitted_batches = 0
+        while emitted_batches < batches:
             if self.source_views == 1:
-                source_group_count = 1
-                output_group_count = 1
+                source_batch_count = 1
+                output_batch_count = 1
             else:
-                source_group_count, output_group_count = self._repeated_augmentation_block(
-                    virtual_groups - emitted_groups
+                source_batch_count, output_batch_count = self._repeated_augmentation_block(
+                    batches - emitted_batches
                 )
-            source_groups = [
-                list(itertools.islice(source, self.augmentation_group_size))
-                for _ in range(source_group_count)
+            source_batches = [
+                list(itertools.islice(source, self.physical_batch_size))
+                for _ in range(source_batch_count)
             ]
-            if any(len(group) != self.augmentation_group_size for group in source_groups):
+            if any(len(group) != self.physical_batch_size for group in source_batches):
                 raise RuntimeError(
                     "WebDataset stream ended before its unique-source batch quota was produced"
                 )
             # Buffer three input physical batches, then cycle their views across
             # nine output physical batches. Every window, including the final
             # partial one, keeps a source out of duplicate positions in a
-            # physical batch or virtual Mixup group.
+            # physical batch.
             block_emitted = 0
             for _ in range(self.source_views):
-                for group in source_groups:
-                    if block_emitted == output_group_count:
+                for group in source_batches:
+                    if block_emitted == output_batch_count:
                         break
                     for sample in group:
                         yield self._decode(sample)
                     block_emitted += 1
-                    emitted_groups += 1
-                if block_emitted == output_group_count:
+                    emitted_batches += 1
+                if block_emitted == output_batch_count:
                     break
-        if emitted_groups != virtual_groups:
+        if emitted_batches != batches:
             raise RuntimeError(
                 "WebDataset stream ended before its unique-source batch quota was produced"
             )
@@ -1536,6 +1518,15 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, int]]:
         worker_id, worker_count = self._worker_state()
+        if get_worker_info() is not None:
+            # A resumed loader creates fresh workers; persistent workers do not
+            # rerun worker_init_fn. Seed each iterator independently of lifetime.
+            seed = _webdataset_seed(
+                self.seed, self._epoch if self.training else 0,
+                self.state.rank, worker_id, int(self.training),
+            )
+            torch.manual_seed(seed)
+            _seed_worker(worker_id)
         if self.training:
             yield from self._iter_training(
                 worker_id=worker_id,
@@ -1555,12 +1546,14 @@ def _loader_kwargs(
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "num_workers": workers,
-        "persistent_workers": False,
+        "persistent_workers": workers > 0,
         "pin_memory": True,
         "worker_init_fn": _seed_worker,
         "generator": generator,
     }
     if workers:
+        # Workers start after CUDA/DDP initialization; avoid inheriting its state.
+        kwargs["multiprocessing_context"] = "spawn"
         # One prefetched physical batch per worker bounds host-side image memory.
         kwargs["prefetch_factor"] = 1
     return kwargs
@@ -1610,7 +1603,6 @@ def build_loaders(
         seed=int(run.train["seed"]),
         num_classes=int(run.model["num_classes"]),
         training=True,
-        augmentation_group_size=batching_plan.augmentation_group_size,
         source_views=source_views,
         physical_batch_size=batching_plan.physical_batch_size,
         microbatches_per_epoch=batching_plan.microbatches_per_epoch,
@@ -1659,24 +1651,24 @@ def build_loaders(
 
 def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
     if run.operator["implementation"] == "cuda":
-        from lsso.ball import cuda
+        from ridgon.ball import cuda
 
         cuda.load(device=device)
 
 
 def build_model(run: ImageNetRun) -> nn.Module:
-    """Call the shared DeiT III LSSO backbone factory owned by integrations."""
+    """Call the shared ViT³-style Ridgon backbone factory owned by integrations."""
 
     try:
-        from integrations.timm import create_lsso_deit3
+        from integrations.timm import create_ridgon_vit
     except ImportError as error:
         raise RuntimeError(
-            "ImageNet training requires integrations.timm.create_lsso_deit3; "
-            "the shared DeiT III backbone adapter is not available."
+            "ImageNet training requires integrations.timm.create_ridgon_vit; "
+            "the shared ViT³-style backbone adapter is not available."
         ) from error
 
     model = run.model
-    return create_lsso_deit3(
+    return create_ridgon_vit(
         image_size=int(model["image_size"]),
         patch_size=int(model["patch_size"]),
         num_classes=int(model["num_classes"]),
@@ -1685,15 +1677,10 @@ def build_model(run: ImageNetRun) -> nn.Module:
         num_heads=int(model["num_heads"]),
         rank=int(model["rank"]),
         mlp_ratio=float(model["mlp_ratio"]),
-        core_mode=str(run.operator["core_mode"]),
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
         drop_path_rate=float(model["drop_path_rate"]),
-        drop_path_schedule=str(model["drop_path_schedule"]),
-        position_encoding=str(model["position_encoding"]),
-        layer_scale_init_value=float(model["layer_scale_init_value"]),
         norm_eps=float(model["norm_eps"]),
-        no_embed_class=True,
     )
 
 
@@ -1708,7 +1695,7 @@ def _checkpoint_model_state(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in state.items()
     ):
         raise ValueError(
-            "checkpoint must contain tensor model state and LSSO _extra_state contracts"
+            "checkpoint must contain tensor model state and Ridgon _extra_state contracts"
         )
     return copy.deepcopy(state)
 
@@ -1795,7 +1782,9 @@ def build_optimizer(model: nn.Module, run: ImageNetRun) -> tuple[torch.optim.Opt
         no_weight_decay_list=_no_weight_decay(model),
     )
     return (
-        torch.optim.AdamW(groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8, fused=True),
+        torch.optim.AdamW(
+            groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8, fused=True,
+        ),
         "torch.adamw.fused",
     )
 
@@ -1851,32 +1840,6 @@ def build_mixup_and_loss(run: ImageNetRun) -> tuple[Any | None, nn.Module]:
     return mixup, nn.CrossEntropyLoss()
 
 
-def apply_virtual_group_mixup(
-    images: torch.Tensor,
-    targets: torch.Tensor,
-    mixup: Any,
-    group_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply batch-mode Mixup/CutMix independently to virtual GPU groups."""
-
-    if images.shape[0] != targets.shape[0]:
-        raise ValueError("images and targets must have the same batch dimension")
-    if group_size < 1:
-        raise ValueError("group_size must be positive")
-    if images.shape[0] % group_size:
-        raise ValueError(
-            "physical batch size must be divisible by the virtual Mixup group size"
-        )
-
-    mixed_targets: list[torch.Tensor] = []
-    for start in range(0, images.shape[0], group_size):
-        stop = start + group_size
-        # timm's batch-mode Mixup mutates this image view in place.
-        _, group_targets = mixup(images[start:stop], targets[start:stop])
-        mixed_targets.append(group_targets)
-    return images, torch.cat(mixed_targets, dim=0)
-
-
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DistributedDataParallel) else model
 
@@ -1912,15 +1875,24 @@ def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
 
 
 def prepare_training_model(model: nn.Module, state: DistributedState, execution: str) -> nn.Module:
-    """Compile surrounding vision blocks; retain the tested LSSO CUDA boundary."""
+    """Compile surrounding vision blocks; retain the tested Ridgon CUDA boundary."""
     if execution not in {"eager", "graph", "compile-graph"}:
         raise ValueError(f"unsupported training execution: {execution}")
     if execution == "compile-graph":
-        from lsso import LSSO
+        from ridgon import Ridgon
+        import torch._dynamo.config as dynamo_config
+
+        # timm's blocks share Python code but specialize on their per-layer
+        # DropPath probabilities. Reserve train/eval variants for each block
+        # instead of hitting Dynamo's default eight-variant eager fallback.
+        mixer_count = sum(isinstance(module, Ridgon) for module in model.modules())
+        dynamo_config.recompile_limit = max(
+            dynamo_config.recompile_limit, 2 * mixer_count + 4
+        )
         for module in model.modules():
-            if isinstance(module, LSSO):
+            if isinstance(module, Ridgon):
                 module.forward = torch.compiler.disable(module.forward)
-        # One outer graph captures all compiled segments and native LSSO calls.
+        # One outer graph captures all compiled segments and CUDA Ridgon calls.
         # Disable Inductor's own graphs so graph pools and RNG have one owner.
         model.compile(backend="inductor", fullgraph=False, dynamic=False,
                       options={"triton.cudagraphs": False})
@@ -1935,7 +1907,7 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
                 gradient_as_bucket_view=True,
             )
         torch.cuda.current_stream(state.device).wait_stream(stream)
-        model._lsso_graph_stream = stream
+        model._ridgon_graph_stream = stream
     return model
 
 
@@ -1962,7 +1934,7 @@ class ImageNetGraphStep:
         cpu_rng = torch.get_rng_state()
         cuda_rng = torch.cuda.get_rng_state(images.device)
         buffers = [(b, b.clone()) for b in self.model.buffers()]
-        stream = getattr(self.model, "_lsso_graph_stream", None)
+        stream = getattr(self.model, "_ridgon_graph_stream", None)
         if stream is None:
             stream = torch.cuda.Stream(device=images.device)
         stream.wait_stream(torch.cuda.current_stream(images.device))
@@ -2052,12 +2024,8 @@ def train_epoch(
         targets = targets.to(state.device, non_blocking=True)
         metric_targets = targets
         if mixup is not None:
-            images, targets = apply_virtual_group_mixup(
-                images,
-                targets,
-                mixup,
-                batching_plan.augmentation_group_size,
-            )
+            # ViT³ applies timm Mixup/CutMix once to the full per-GPU batch.
+            images, targets = mixup(images, targets)
 
         update_boundary = (step + 1) % batching_plan.grad_accum == 0
         sync_context = nullcontext()
@@ -2260,8 +2228,6 @@ def _recipe_fidelity(
         matches_recipe
         and not (set(run.overrides) - non_semantic_overrides)
         and batching_plan.effective_batch_size == int(run.train["effective_batch"])
-        and batching_plan.augmentation_group_size
-        == int(run.train["augmentation_group_size"])
         and resolved_optimizer == "torch.adamw.fused"
     ):
         return "vit3-derived"
@@ -2476,7 +2442,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "physical_batch_size": batching_plan.physical_batch_size,
                         "effective_batch": batching_plan.effective_batch_size,
                         "grad_accum": batching_plan.grad_accum,
-                        "augmentation_group_size": batching_plan.augmentation_group_size,
                         "optimizer": resolved_optimizer,
                         "world_size": state.world_size,
                     }

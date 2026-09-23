@@ -15,7 +15,7 @@ DEFAULT_WORK_ROOT = ROOT / "runs" / "openmmlab"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run an LSSO OpenMMLab downstream experiment."
+        description="Run an Ridgon OpenMMLab downstream experiment."
     )
     parser.add_argument("config", type=Path, help="MMDet/MMSeg config path")
     parser.add_argument("--work-dir", type=Path)
@@ -154,10 +154,10 @@ def _load_cuda_backend(cfg: Any) -> None:
     import torch
 
     if not torch.cuda.is_available():
-        raise SystemExit("the configured LSSO CUDA fast path requires a CUDA device")
+        raise SystemExit("the configured Ridgon CUDA fast path requires a CUDA device")
     device_index = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(device_index)
-    from lsso.ball import cuda
+    from ridgon.ball import cuda
 
     cuda.load(device=device_index)
 
@@ -170,12 +170,12 @@ def _require_openmmlab_runtime(default_scope: str) -> None:
         if default_scope == "mmdet":
             from mmdet.models.detectors import MaskRCNN  # noqa: F401
 
-            registered = getattr(bridge, "LSSOMaskRCNN", None)
+            registered = getattr(bridge, "RidgonMaskRCNN", None)
             framework = "MMDetection"
         elif default_scope == "mmseg":
             from mmseg.models.segmentors import EncoderDecoder  # noqa: F401
 
-            registered = getattr(bridge, "LSSOEncoderDecoder", None)
+            registered = getattr(bridge, "RidgonEncoderDecoder", None)
             framework = "MMSegmentation"
         else:
             raise ValueError(f"unexpected OpenMMLab scope {default_scope!r}")
@@ -188,7 +188,7 @@ def _require_openmmlab_runtime(default_scope: str) -> None:
     if registered is None:
         raise SystemExit(
             f"{framework} loaded, but integrations.openmmlab did not register "
-            "the required mask-aware LSSO wrapper"
+            "the required mask-aware Ridgon wrapper"
         )
 
 

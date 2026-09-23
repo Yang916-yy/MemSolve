@@ -7,7 +7,7 @@
 \usepackage{graphicx}
 \usepackage{microtype}
 \usepackage[hidelinks]{hyperref}
-\hypersetup{pdftitle={LSSO: Solved Contextual Operators for Bidirectional Sequence Modeling},
+\hypersetup{pdftitle={Ridgon: From Sequential Memory Updates to Global Equilibrium},
   pdfauthor={Zhaoyang Wang}}
 
 \newtheorem{theorem}{Theorem}[section]
@@ -28,12 +28,20 @@
 \newcommand{\triu}{\operatorname{triu}}
 \newcommand{\qf}{\operatorname{qf}}
 
-\title{LSSO: Solved Contextual Operators for Bidirectional Sequence Modeling}
+\title{Ridgon: From Sequential Memory Updates to Global Equilibrium}
 \author{Zhaoyang Wang\\\texttt{zhaoy@uir.edu.cn}}
 \date{}
 
 \begin{document}
 \maketitle
+
+\begin{quote}
+\small\textbf{Working-draft status.} Ridgon is the current model name.
+The technical body, figures, and experimental results below still document
+its earlier LSSO formulation, including the Dynamic system. They have not
+yet been revised or revalidated for the current independent-Q/K/V
+ridge-regression model. Historical LSSO results are not Ridgon results.
+\end{quote}
 
 \begin{abstract}
 Test-time training constructs an input-specific memory by adapting an internal

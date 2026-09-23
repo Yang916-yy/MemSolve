@@ -1,16 +1,17 @@
 # Dense Downstream Protocols
 
-> Current source uses model contract 13 and native ABI 11. External position
+> Current source uses model contract 19 and CUDA contract 17. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
 
-The dense experiments share the DeiT III LSSO backbone used by ImageNet. They
-use a learned two-dimensional patch position table with no learned CLS
-position. The learned spatial position table belongs to the backbone; the
-mixer consumes token features and the validity mask.
+The optional dense adapters share the current RidgonViT encoder used by ImageNet:
+residual CPE, Pre-LN, no CLS and no LayerScale. CPE uses the actual patch grid,
+including rectangular padded images; the mixer consumes patch features and the
+validity mask. Updating this shared adapter does not constitute a new detection
+or segmentation experiment.
 
-| Scale | Width | Depth | Heads | LSSO rank | Feature taps |
+| Scale | Width | Depth | Heads | Ridgon rank | Feature taps |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Small | 384 | 12 | 6 | 32 | `(3, 5, 7, 11)` |
 | Base | 768 | 12 | 12 | 48 | `(3, 5, 7, 11)` |
@@ -23,7 +24,7 @@ The external FPN or UperNet head then consumes those four maps.
 
 The OpenMMLab wrappers derive an image-validity mask from each sample's
 `img_shape`, zero padded pixels before patch embedding, and pass the resulting
-token mask to every global LSSO mix. This prevents another image's batch
+token mask to every global Ridgon mix. This prevents another image's batch
 padding, including padding that partially overlaps an edge patch, from affecting
 valid outputs.
 
@@ -99,23 +100,17 @@ backbone; the launch examples below use Base.
 
 ## Pretrained checkpoint compatibility
 
-Current loading validates both ImageNet envelope format **5** and each LSSO
-layer's model contract **12**. The native extension separately requires ABI
-**8**. A valid envelope digest does not bypass a mismatched model contract.
-
-A v0.6.3 ImageNet checkpoint may contain model contract 11 and therefore cannot
-be loaded directly into current source. The repository does not yet provide an
-automatic migration command. Preserve the original file; check tensor names,
-shapes, geometry and numerical semantics before producing a migrated copy,
-then validate loading and forward/backward behavior. Do not simply overwrite
-`_extra_state` or use `strict=False` as a conversion procedure.
+Current loading validates ImageNet envelope **12**, Ridgon model contract **19**
+and CUDA contract **17**. The independent-QKV architecture cannot load earlier
+shared-A checkpoints. A new matching ImageNet checkpoint is required; changing
+metadata or using `strict=False` is not a conversion.
 
 For new downstream training, `--backbone-checkpoint` initializes the encoder,
 drops the ImageNet classifier, and allows the new pyramid/task heads to start
 from their own initialization. ImageNet optimizer state is not a downstream
 resume. `--resume` applies to an existing checkpoint of the downstream task.
 
-The latest operator optimization was tested on SM120 with biased LSSO shapes.
+The latest operator optimization was tested on SM120 with biased Ridgon shapes.
 The local verification environment did not contain timm, compiled MMCV,
 MMDetection or MMSegmentation; it did not execute a complete detector or
 segmenter. A matching compiled MMCV stack must be validated with the required
@@ -124,30 +119,29 @@ end-to-end throughput or evidence of COCO AP/ADE20K mIoU.
 
 ## Launch
 
-The CUDA extension must have been built for every participating GPU
-architecture with `tools/build_cuda.sh`. The launcher loads the strict artifact
-before MMEngine constructs the model. New downstream runs require an explicit
+The launcher validates the CUDA/Triton runtime before MMEngine constructs
+the model. It attaches shared-core optimizer constraints before training. New downstream runs require an explicit
 ImageNet checkpoint; they never silently train a paper result from scratch.
 The backbone verifies the checkpoint's current ImageNet contract and canonical
-digest, then checks its tier, LSSO operator, and shared DeiT III geometry before
-accepting any pretrained tensor. When a valid ImageNet checkpoint and the
-downstream backbone use different learned 2D patch grids, the backbone applies
-the same bicubic position-table interpolation used by ImageNet fine-tuning.
+digest, then checks its tier, Ridgon operator, and shared vision geometry before
+accepting any pretrained tensor. CPE convolution weights transfer across patch
+grid sizes without a learned position table to interpolate. Config filenames
+containing `deit3` are historical paths; their registered backbone is RidgonViTBackbone.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_openmmlab.py \
-  experiments/openmmlab/configs/coco_mask_rcnn_lsso_deit3_base_3x.py \
+  experiments/openmmlab/configs/coco_mask_rcnn_ridgon_deit3_base_3x.py \
   --data-root /datasets/coco \
   --backbone-checkpoint runs/imagenet/deit3_base_224/checkpoint_best.pt \
-  --work-dir runs/coco/lsso_deit3_base_3x --launcher pytorch
+  --work-dir runs/coco/ridgon_deit3_base_3x --launcher pytorch
 ```
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_openmmlab.py \
-  experiments/openmmlab/configs/ade20k_upernet_lsso_deit3_base_160k.py \
+  experiments/openmmlab/configs/ade20k_upernet_ridgon_deit3_base_160k.py \
   --data-root /datasets/ADEChallengeData2016 \
   --backbone-checkpoint runs/imagenet/deit3_base_224/checkpoint_best.pt \
-  --work-dir runs/ade20k/lsso_deit3_base_160k --launcher pytorch
+  --work-dir runs/ade20k/ridgon_deit3_base_160k --launcher pytorch
 ```
 
 Use `--resume` for a downstream checkpoint, `--resume auto` for the latest

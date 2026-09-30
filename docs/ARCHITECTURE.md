@@ -12,6 +12,7 @@ explicit CUDA implementation.
 | `ridgon/ball/cuda.py` | CUDA contract 17 validation, token tiling, compact analytic VJP, FLA-derived grouped RMSNorm |
 | `integrations/timm.py` | ViT³-style vision encoder, packed SwiGLU, CPE, token-LN mean pooling and AMP boundaries |
 | `integrations/openmmlab.py` | Dense framework registration and padded-image plumbing |
+| `integrations/transformers.py` | HF BERT/MLM registration, packed SwiGLU, Post-LN adapter, padding and checkpoint metadata |
 
 There is one public operator and no mode selector. The learned core is
 sample-independent, while the key Gram and key/value memory remain

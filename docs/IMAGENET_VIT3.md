@@ -88,7 +88,9 @@ group size or divisibility-by-128 requirement. The upstream default batch size
 of 128 is configurable; it is not an additional augmentation grouping rule.
 Changing physical batch size changes the batch-mode mixing correlations and
 pairing pool, even when gradient accumulation preserves the effective batch.
-Worker quotas and optional repeated augmentation use complete physical batches.
+Worker quotas use complete physical batches. The separate
+[DeiT III recipe](IMAGENET_DEIT3.md) explicitly enables virtual augmentation
+groups and repeated augmentation; it does not change the ViT³ recipe above.
 
 The existing `timm/imagenet-1k-wds` data contract is retained: `_info.json`,
 1,024 training tar shards and 64 validation tar shards, with a pinned manifest
@@ -116,10 +118,12 @@ Inductor's own CUDA Graphs are disabled for this mode.
 The compiler variant budget accounts for each block's distinct DropPath
 probability and train/eval mode, avoiding the default eight-variant limit.
 
-Both Graph modes require CUDA, fixed input shapes and `grad_accum = 1`.
-Use `--execution eager` when a smaller physical batch requires gradient
-accumulation. The default two-GPU configuration uses batch 512 per GPU and
-therefore satisfies the Graph requirement.
+Both Graph modes require CUDA and fixed microbatch shapes. They capture an
+entire accumulated update, divide each microbatch loss by `grad_accum`, and
+synchronize DDP gradients only on the last microbatch. Optimizer and scheduler
+updates remain outside the graph. The default two-GPU configuration uses batch
+512 per GPU and accumulation 1. See [DeiT III](IMAGENET_DEIT3.md) for the
+two-microbatch, global-batch-2048 configuration.
 
 ## Launch and resume
 

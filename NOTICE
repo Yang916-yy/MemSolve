@@ -3,6 +3,26 @@ Copyright 2026 Zhaoyang Wang
 
 This product is licensed under the Apache License, Version 2.0.
 
+The DeiT III 400/800-epoch training recipes and PIL blur/3-Augment pipeline in
+experiments/imagenet.py follow facebookresearch/deit (Apache-2.0):
+https://github.com/facebookresearch/deit/blob/main/augment.py
+https://github.com/facebookresearch/deit/blob/main/README_revenge.md
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+VirtualGroupSampler restores the repository's earlier group-level adaptation
+of Meta's repeat-before-rank-split RASampler:
+https://github.com/facebookresearch/deit/blob/main/samplers.py
+Indexed local tar access is imported from the BSD-3-Clause WebDataset WIDS
+package (https://github.com/webdataset/wids); its reader is not vendored.
+Fused LAMB is imported from NVIDIA Apex (BSD-3-Clause), not vendored.
+The accumulated CUDA Graph prewarm follows the synchronized-first-backward
+workaround documented in https://github.com/pytorch/pytorch/issues/143580.
+
+The packed SwiGLU gate/up layout in integrations/transformers.py follows
+Transformers' Apache-2.0 Phi3MLP implementation:
+https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/phi3/modeling_phi3.py
+Copyright 2024 Microsoft and the HuggingFace Inc. team. All rights reserved.
+Ridgon retains BERT projection biases and its FFN output residual module.
+
 The grouped RMSNorm kernels in ridgon/ball/cuda.py are adapted from
 https://github.com/fla-org/flash-linear-attention/blob/954438d1fcb5e1bb05c22f9908de9c5c2df74ae5/fla/modules/layernorm.py
 Copyright (c) 2023 Tri Dao
@@ -65,3 +85,11 @@ https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.
 * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
+The NLP experiment entrypoints use Hugging Face Datasets/Transformers,
+Sentence Transformers and MTEB through their public APIs. The MLM recipe is
+adapted from LIONS-EPFL/LION (Masked_Language_Modeling/yamls/pretrain), with
+Composer-to-PyTorch weight-decay conversion. Retrieval data/loss choices follow
+JHU-CLSP/ettin-encoder-vs-decoder, retrieval_eval/train_st.py (Apache-2.0,
+Copyright 2024 onwards Answer.AI, LightOn, and contributors). These framework
+implementations are imported, not vendored; adaptations are documented in
+docs/BERT_MLM.md.

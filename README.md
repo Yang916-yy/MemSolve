@@ -72,7 +72,9 @@ with PyTorch `2.14.0+cu132`.
 | CUDA precision, upstream reuse and Graph execution | [CUDA contract](docs/CUDA_CONTRACT.md) |
 | Code ownership | [Architecture](docs/ARCHITECTURE.md) |
 | ImageNet, ViT³-derived training recipe | [ImageNet](docs/IMAGENET_VIT3.md) |
+| ImageNet, DeiT III 400/800 + 20 epochs | [DeiT III](docs/IMAGENET_DEIT3.md) |
 | Sequence training | [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) |
+| BERT, C4 MLM, retrieval fine-tuning and MTEB/LongEmbed | [NLP integration and launch guide](docs/BERT_MLM.md) |
 | Assembly101 integration | [Assembly101](docs/ASSEMBLY101.md) |
 | Food-101 training | [Food-101](docs/FOOD101.md) |
 | Future component studies | [Research scope](docs/ABLATIONS.md) |

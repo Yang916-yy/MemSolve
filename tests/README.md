@@ -8,9 +8,17 @@ rather than a local experiment or benchmark.
 | --- | --- | --- |
 | `core` | `python -m pytest tests/core -m "not cuda"` | Operator mathematics, model/configuration behavior, and public API. |
 | `cuda` | `python -m pytest tests/cuda` | CUDA device contract, dispatch, and CUDA oracle comparisons. |
-| `integrations` | `python -m pytest tests/integrations -m "not cuda"` | timm and OpenMMLab adapters. |
+| `integrations` | `python -m pytest tests/integrations -m "not cuda"` | timm, OpenMMLab and Hugging Face BERT adapters. |
 | `experiments` | `python -m pytest tests/experiments -m "not cuda"` | Data protocols and training entrypoints. |
 | `repository` | `python -m pytest tests/repository` | Repository shape and ownership contract. |
+
+`tests/experiments/test_nlp.py` uses the optional `nlp` environment. It checks
+fixed MLM masks, token-weighted loss, C4 partition integrity, MLM/retrieval
+Trainer resume and a local MTEB retrieval task without downloading datasets.
+
+ImageNet data checks use WebDataset and WIDS from the `vision` or `test` extra.
+They cover global virtual-group RA, independent group mixing with one physical
+forward, persistent-worker epoch changes and restart replay using local tar fixtures.
 
 Use `python -m pytest -m cuda` to select all CUDA-marked checks across scopes.
 Run `python -m pytest -q` only for a release, a broad refactor, or a change

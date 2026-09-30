@@ -56,13 +56,14 @@ This is a statistical initialization criterion, not an accuracy guarantee.
 on direct construction and after timm's depth-first initialization of child
 Linear modules. Q/V and the output projection keep their existing initializer
 (default Linear outside vision; timm std=0.02 and zero bias in the vision
-factory). T, RMSNorm gains, CPE and LayerScale are not changed by this method.
+factory). Delta, RMSNorm gains and encoder-owned CPE are not changed by this method.
 No key rescaling or normalization is added to the forward pass.
 
 Loading a checkpoint restores its saved K; it does not reinitialize that tensor.
 The K-only initialization change in source 0.8.1 retained model contract 15.
-Source 0.9.0 uses model contract 16 because the T initialization and optimizer
-constraint radius both change; older contracts are rejected on load.
+The historical source 0.9.0 introduced constrained T under contract 16.
+Current contract 19 uses unconstrained Delta initialized to zero; older
+contracts are rejected on load.
 
 ## Exact memory interpretation
 
@@ -106,9 +107,12 @@ products as before. Since dT/dDelta is the identity, dLoss/dDelta = dLoss/dT.
 The parameter count and identity initial function are unchanged from contract 18.
 
 Use ordinary [PyTorch AdamW](https://docs.pytorch.org/docs/2.14/generated/torch.optim.AdamW.html)
-without model-specific hooks. Delta belongs to the regular weight-decay group;
-the ImageNet launcher uses fused AdamW with weight decay 0.05. If u is Adam's
-bias-corrected adaptive gradient update, the effective map changes as
+without model-specific hooks. Delta belongs to the regular weight-decay group.
+The [ViT³-derived ImageNet recipe](IMAGENET_VIT3.md) uses fused AdamW with
+weight decay 0.05. The [DeiT III-derived recipes](IMAGENET_DEIT3.md) use fused
+LAMB for pretraining and fused AdamW for resolution fine-tuning, with
+recipe-specific decay. For AdamW, if u is the bias-corrected adaptive gradient
+update, the effective map changes as
 
 ```text
 Delta_next = (1 - lr * wd) Delta - lr * u

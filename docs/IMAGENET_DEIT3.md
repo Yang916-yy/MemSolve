@@ -125,7 +125,9 @@ CPE has no resolution-dependent learned position table to interpolate. The
 optimizer, schedule, epoch counter, best metric and random streams start anew;
 the source checkpoint is recorded in `metrics.jsonl`. Use `--resume` for an
 interrupted run within the same phase. `--resume` and `--finetune` are mutually
-exclusive, and output directories cannot overwrite an existing experiment.
+exclusive. Fresh runs require an empty output directory. For resume, use the
+original run directory: checkpoint compatibility is checked, but the loader
+does not yet verify that a nonempty destination belongs to that checkpoint.
 
 For the 800-epoch protocol, use `imagenet_deit3_800.toml` in both commands and
 separate output directories. Initialize pretraining from scratch rather than

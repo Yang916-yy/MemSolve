@@ -5,12 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ridgon-operator"
 version = "0.11.0"
-description = "Compact key/value memory with independent queries, learned query readout and Triton CUDA."
+description = "Bidirectional associative memory via compact global ridge solves, with linear sequence scaling and PyTorch/Triton acceleration."
+keywords = [
+    "ridgon", "associative-memory", "bidirectional", "ridge-regression",
+    "test-time-training", "linear-complexity", "efficient-transformers",
+    "sequence-modeling", "computer-vision", "masked-language-modeling",
+    "pytorch", "triton", "cuda",
+]
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 dependencies = ["torch>=2.14,<2.15", "tomli>=2; python_version < '3.11'"]
+
+[project.urls]
+Repository = "https://github.com/Yang916-yy/Ridgon"
+Documentation = "https://github.com/Yang916-yy/Ridgon/blob/main/README.md"
+Issues = "https://github.com/Yang916-yy/Ridgon/issues"
 
 [project.optional-dependencies]
 nlp = [

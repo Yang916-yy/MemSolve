@@ -1,4 +1,8 @@
-# Dense Downstream Protocols
+# Optional dense downstream adapters
+
+Detection and segmentation are outside the current experimental scope. The
+adapters below are retained for development; no current Ridgon downstream
+accuracy or complete detector/segmenter validation is claimed.
 
 > Current source uses model contract 19 and CUDA contract 17. External position
 > embeddings belong to the surrounding model. Historical measurements retain
@@ -31,9 +35,10 @@ valid outputs.
 ## Protocol provenance
 
 The historical ImageNet results used DeiT III training. The current classifier
-uses plain ViT³-derived T/S/B training, documented in `docs/IMAGENET_VIT3.md`.
-The dense S/B/L configurations below retain their original geometry and are
-not newly validated downstream results under that training protocol.
+supports both [ViT³-derived](IMAGENET_VIT3.md) and
+[DeiT III-derived](IMAGENET_DEIT3.md) training. The dense S/B/L configurations
+below retain their original geometry and are not validated downstream results
+for either current recipe.
 
 COCO is a **downstream standard protocol**, not an official DeiT III detection
 recipe. It is the public [XCiT Mask R-CNN + FPN 3x
@@ -61,7 +66,8 @@ Then install a **compiled** `mmcv==2.1.*` build matched to the active PyTorch
 and CUDA stack using the [OpenMMLab installation
 guide](https://mmcv.readthedocs.io/en/latest/get_started/installation.html).
 `mmcv-lite` does not provide the CUDA/C++ operators required by Mask R-CNN.
-The current ImageNet training entrypoint uses PyTorch AdamW and needs no Apex.
+These downstream launchers use AdamW. ImageNet
+[DeiT III pretraining](IMAGENET_DEIT3.md#nvidia-apex) separately requires Apex.
 
 ## Dataset layout
 
@@ -105,22 +111,27 @@ and CUDA contract **17**. The independent-QKV architecture cannot load earlier
 shared-A checkpoints. A new matching ImageNet checkpoint is required; changing
 metadata or using `strict=False` is not a conversion.
 
+The current compatibility check still expects the ViT³-style linear DropPath
+schedule. It rejects the constant-DropPath DeiT III checkpoints even when their
+weights have compatible shapes; that adapter limitation remains to be fixed
+before using those checkpoints downstream.
+
 For new downstream training, `--backbone-checkpoint` initializes the encoder,
 drops the ImageNet classifier, and allows the new pyramid/task heads to start
 from their own initialization. ImageNet optimizer state is not a downstream
 resume. `--resume` applies to an existing checkpoint of the downstream task.
 
-The latest operator optimization was tested on SM120 with biased Ridgon shapes.
-The local verification environment did not contain timm, compiled MMCV,
-MMDetection or MMSegmentation; it did not execute a complete detector or
-segmenter. A matching compiled MMCV stack must be validated with the required
+Current operator validation targets SM80/A800; see the
+[CUDA contract](CUDA_CONTRACT.md). Adapter CPU checks do not validate a complete
+MMDetection detector or MMSegmentation segmenter. A matching compiled MMCV stack must be validated with the required
 Torch/CUDA version before launching a full run. Operator timings are not
 end-to-end throughput or evidence of COCO AP/ADE20K mIoU.
 
 ## Launch
 
 The launcher validates the CUDA/Triton runtime before MMEngine constructs
-the model. It attaches shared-core optimizer constraints before training. New downstream runs require an explicit
+the model. Delta uses the ordinary optimizer decay group, without a
+model-specific constraint or optimizer hook. New downstream runs require an explicit
 ImageNet checkpoint; they never silently train a paper result from scratch.
 The backbone verifies the checkpoint's current ImageNet contract and canonical
 digest, then checks its tier, Ridgon operator, and shared vision geometry before

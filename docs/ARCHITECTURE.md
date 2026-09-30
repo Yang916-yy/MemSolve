@@ -17,11 +17,12 @@ explicit CUDA implementation.
 There is one public operator and no mode selector. The learned core is
 sample-independent, while the key Gram and key/value memory remain
 input-dependent. The operator has no projection-local convolution or internal
-position mechanism. CPE and pooling are unchanged in this refactor.
+position mechanism. The vision encoder adds residual CPE and token-LayerNorm mean pooling.
 
 No custom native library is built or loaded. Token and normalization kernels separately
 JIT-compile through Triton on first use. CPU reference import needs no Triton.
 The shared-core LU implementation and its build/package tools have been removed.
 
 See [mathematics](CORE_CONTRACT.md), [CUDA](CUDA_CONTRACT.md) and
-[ImageNet training](IMAGENET_VIT3.md).
+[ViT³-derived ImageNet training](IMAGENET_VIT3.md) and
+[DeiT III-derived ImageNet training](IMAGENET_DEIT3.md).

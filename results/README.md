@@ -1,4 +1,4 @@
-# Published Results
+# Historical LSSO results
 
 > The current source is Ridgon, model contract 19 / CUDA contract 17.
 > The earlier model was named LSSO; archived names and measurements are unchanged.
@@ -8,7 +8,7 @@
 
 
 This directory contains the compact, machine-readable evidence behind the
-results reported in the README and paper. It publishes final per-seed test
+results reported in the earlier LSSO paper draft. It publishes final per-seed test
 metrics and enough provenance to identify the code, data, model shell, and
 runtime used by each formal panel.
 

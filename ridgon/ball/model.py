@@ -99,10 +99,6 @@ class Ridgon(nn.Module):
         error_msgs,
     ):
         contract_key = f"{prefix}_extra_state"
-        if contract_key not in state_dict:
-            error_msgs.append(
-                f"Ridgon checkpoint is missing its configuration contract ({contract_key!r})"
-            )
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -112,6 +108,12 @@ class Ridgon(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+        # Framework adapters may restore serialized metadata in a PyTorch load
+        # pre-hook. Check after those hooks; native checkpoints remain strict.
+        if contract_key not in state_dict:
+            error_msgs.append(
+                f"Ridgon checkpoint is missing its configuration contract ({contract_key!r})"
+            )
 
     @staticmethod
     def _validate_mask(valid_mask, *, batch, length, device):

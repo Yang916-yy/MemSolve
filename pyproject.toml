@@ -13,6 +13,13 @@ license-files = ["LICENSE", "NOTICE"]
 dependencies = ["torch>=2.14,<2.15", "tomli>=2; python_version < '3.11'"]
 
 [project.optional-dependencies]
+nlp = [
+    "transformers>=4.57.6,<4.58",
+    "accelerate>=1.10,<2",
+    "datasets>=4.8,<5",
+    "sentence-transformers>=5.7,<5.8",
+    "mteb>=2.21,<2.22",
+]
 assembly101 = [
     "numpy>=1.26",
     "huggingface-hub>=1,<2",
@@ -28,6 +35,7 @@ test = [
     "numpy>=1.26",
     "pillow>=10",
     "webdataset>=1,<2",
+    "wids>=0.1.11,<0.2",
 ]
 sequence = [
     "datasets>=3,<5",
@@ -38,6 +46,7 @@ vision = [
     "timm>=1.0.16,<2",
     "torchvision>=0.29,<0.30",
     "webdataset>=1,<2",
+    "wids>=0.1.11,<0.2",
 ]
 openmmlab = [
     "mmengine>=0.10,<1",

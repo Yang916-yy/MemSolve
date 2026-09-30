@@ -178,6 +178,7 @@ class RidgonViT(nn.Module):
         rank: int, patch_size: int = 16, num_classes: int = 1000,
         mlp_ratio: float = 4.0, bias: bool = True,
         implementation: _Implementation = "reference", drop_path_rate: float = 0.0,
+        drop_path_schedule: Literal["linear", "constant"] = "linear",
         norm_eps: float = 1e-6, dynamic_img_size: bool = False,
         dynamic_img_pad: bool = False,
     ) -> None:
@@ -187,6 +188,8 @@ class RidgonViT(nn.Module):
             raise ValueError("depth must be a positive integer")
         if not 0.0 <= drop_path_rate < 1.0:
             raise ValueError("drop_path_rate must be in [0, 1)")
+        if drop_path_schedule not in ("linear", "constant"):
+            raise ValueError("drop_path_schedule must be 'linear' or 'constant'")
         if norm_eps != 1e-6:
             raise ValueError("the vision scaffold requires norm_eps = 1e-6")
         if image_size <= 0 or patch_size <= 0 or image_size % patch_size:
@@ -222,6 +225,8 @@ class RidgonViT(nn.Module):
             # ViT³ residual CPE before Pre-LN. PyTorch/cuDNN owns convolution.
             def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
                 kwargs["mlp_layer"] = ConfiguredSwiGLU
+                if drop_path_schedule == "constant":
+                    kwargs["drop_path"] = drop_path_rate
                 super().__init__(dim, *args, **kwargs)
                 self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
 
@@ -302,6 +307,7 @@ def create_ridgon_vit(
     *, image_size: int, num_classes: int, embed_dim: int, depth: int, num_heads: int,
     rank: int, mlp_ratio: float, bias: bool, implementation: _Implementation = "reference",
     drop_path_rate: float = 0.0, norm_eps: float = 1e-6, patch_size: int = 16,
+    drop_path_schedule: Literal["linear", "constant"] = "linear",
     dynamic_img_size: bool = False, dynamic_img_pad: bool = False,
 ) -> RidgonViT:
     """Build the canonical Ridgon classifier or feature encoder."""
@@ -310,6 +316,7 @@ def create_ridgon_vit(
         embed_dim=embed_dim, depth=depth, num_heads=num_heads, rank=rank,
         mlp_ratio=mlp_ratio, bias=bias, implementation=implementation,
         drop_path_rate=drop_path_rate, norm_eps=norm_eps,
+        drop_path_schedule=drop_path_schedule,
         dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
     )
 

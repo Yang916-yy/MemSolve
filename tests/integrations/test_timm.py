@@ -77,6 +77,22 @@ def test_small_swiglu_width_and_packed_forward_backward():
         model.set_extra_state(old_state)
 
 
+def test_constant_droppath_and_resolution_weight_transfer():
+    kwargs = dict(patch_size=16, num_classes=10, embed_dim=192, depth=2,
+                  num_heads=6, rank=16, mlp_ratio=4, bias=True,
+                  drop_path_rate=.1, drop_path_schedule='constant')
+    source = create_ridgon_vit(image_size=192, **kwargs)
+    target = create_ridgon_vit(image_size=224, **kwargs)
+    for model in (source, target):
+        for block in model.blocks:
+            assert block.drop_path1.drop_prob == block.drop_path2.drop_prob == .1
+    target.load_state_dict(source.state_dict(), strict=True)
+    target.eval()
+    with torch.no_grad():
+        out = target(torch.randn(1, 3, 224, 224))
+    assert out.shape == (1, 10) and torch.isfinite(out).all()
+
+
 def test_vision_extra_requires_the_attn_mask_capable_timm_release() -> None:
     root = Path(__file__).resolve().parents[2]
     with (root / "pyproject.toml").open("rb") as stream:

@@ -1,4 +1,4 @@
-"""Distributed ImageNet-1K training with the plain ViT³-derived recipes.
+"""Distributed ImageNet-1K training with ViT³- and DeiT III-derived recipes.
 
 The model itself intentionally lives outside this entrypoint.  The runner calls
 ``integrations.timm.create_ridgon_vit`` so classification, detection, and
@@ -37,17 +37,23 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as functional
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_worker_info
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "experiments" / "configs" / "imagenet_vit3.toml"
+DEIT3_CONFIG = ROOT / "experiments" / "configs" / "imagenet_deit3_400.toml"
+DEIT3_CONFIGS = {
+    "deit3_400": DEIT3_CONFIG,
+    "deit3_800": ROOT / "experiments" / "configs" / "imagenet_deit3_800.toml",
+}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 OFFICIAL_VIT3_URL = (
     "https://github.com/LeapLabTHU/ViTTT/tree/"
     "e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt"
 )
+OFFICIAL_DEIT3_URL = "https://github.com/facebookresearch/deit/blob/main/README_revenge.md"
 IMAGENET_CHECKPOINT_FORMAT = 12
 IMAGENET_WDS_SOURCE = "timm/imagenet-1k-wds"
 IMAGENET_WDS_MANIFEST_SHA256 = (
@@ -90,6 +96,9 @@ def validate_checkpoint_contract(checkpoint: Mapping[str, Any]) -> dict[str, Any
         raise ValueError("checkpoint is missing its complete ImageNet contract")
     _validate_batching_contract(contract["batching"])
     _validate_webdataset_contract(contract["data"])
+    group_size = contract["batching"].get("augmentation_group_size")
+    if group_size != contract["train"].get("augmentation_group_size") or group_size != contract["data"]["streaming"].get("augmentation_group_size"):
+        raise ValueError("checkpoint virtual augmentation group is inconsistent across train, batching and data")
     digest = checkpoint.get("contract_digest")
     expected = checkpoint_contract_digest(contract)
     if not isinstance(digest, str) or digest != expected:
@@ -117,7 +126,7 @@ class DistributedState:
 
 @dataclass(frozen=True)
 class BatchingPlan:
-    """Resolved physical and optimizer-update batching contract."""
+    """Resolved physical, optional virtual-group and optimizer-update batches."""
 
     world_size: int
     physical_batch_size: int
@@ -125,6 +134,7 @@ class BatchingPlan:
     grad_accum: int
     samples_per_epoch: int
     updates_per_epoch: int
+    augmentation_group_size: int | None = None
 
     @property
     def samples_per_rank(self) -> int:
@@ -142,6 +152,8 @@ class BatchingPlan:
             "grad_accum": self.grad_accum,
             "samples_per_epoch": self.samples_per_epoch,
             "updates_per_epoch": self.updates_per_epoch,
+            **({"augmentation_group_size": self.augmentation_group_size}
+               if self.augmentation_group_size is not None else {}),
         }
 
 
@@ -203,7 +215,9 @@ class ImageNetRun:
             "operator": self.operator,
             "train": self.train,
             "overrides": list(self.overrides),
-            "official_vit3_recipe": OFFICIAL_VIT3_URL,
+            **({"official_deit3_recipe": OFFICIAL_DEIT3_URL}
+               if self.train.get("recipe") in DEIT3_CONFIGS
+               else {"official_vit3_recipe": OFFICIAL_VIT3_URL}),
             "batching": batching_plan.as_dict(),
             "data": dict(data_contract),
             "checkpoint_contract_digest": self.checkpoint_contract_digest(
@@ -215,13 +229,13 @@ class ImageNetRun:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train Ridgon with plain ViT³ T/S/B recipes on ImageNet-1K with torchrun."
+        description="Train Ridgon with ViT³ or DeiT III recipes on ImageNet-1K with torchrun."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--tier", choices=("tiny", "small", "base"), required=True)
     parser.add_argument(
         "--phase",
-        choices=("pretrain",),
+        choices=("pretrain", "finetune"),
         default="pretrain",
     )
     parser.add_argument(
@@ -243,6 +257,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--resume",
         type=Path,
         help="Resume an epoch-boundary checkpoint with its captured RNG state.",
+    )
+    parser.add_argument(
+        "--finetune", type=Path,
+        help="Initialize the 224px finetuning phase from a 192px checkpoint; reset optimizer, scheduler and RNG.",
     )
     parser.add_argument(
         "--epochs",
@@ -272,7 +290,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, help="Override the official seed.")
     parser.add_argument("--save-every", type=int, help="Checkpoint interval in epochs.")
     parser.add_argument("--execution", choices=("eager", "graph", "compile-graph"),
-                        help="Training execution; Graph modes require grad_accum=1.")
+                        help="Training execution; Graph captures a complete accumulated optimizer update.")
     parser.add_argument("--print-freq", type=int, default=50)
     parser.add_argument("--eval", action="store_true", help="Evaluate --resume without training.")
     return parser.parse_args(argv)
@@ -351,7 +369,7 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
-        "drop_path_schedule": "linear",
+        "drop_path_schedule": defaults.get("drop_path_schedule", "linear"),
         "position_encoding": defaults["position_encoding"],
         **tier_values,
     }
@@ -380,6 +398,12 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
     _validate_run(args.tier, args.phase, model, operator, train)
     if args.eval and args.resume is None:
         raise ValueError("--eval requires --resume")
+    if args.resume is not None and args.finetune is not None:
+        raise ValueError("--resume and --finetune are mutually exclusive")
+    if args.finetune is not None and args.phase != "finetune":
+        raise ValueError("--finetune requires --phase finetune")
+    if args.phase == "finetune" and args.resume is None and args.finetune is None:
+        raise ValueError("finetuning requires --finetune or --resume")
 
     return ImageNetRun(
         config_path=config_path,
@@ -399,6 +423,9 @@ def _validate_run(
     operator: Mapping[str, Any],
     train: Mapping[str, Any],
 ) -> None:
+    recipe = train.get("recipe", "vit3")
+    if recipe not in {"vit3", *DEIT3_CONFIGS}:
+        raise ValueError("recipe must be 'vit3', 'deit3_400' or 'deit3_800'")
     _require_keys(
         model,
         (
@@ -471,7 +498,7 @@ def _validate_run(
 
     for key, expected in {
         "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu", "layer_scale": False, "class_token": False,
-        "pooling": "token_ln_mean", "drop_path_schedule": "linear", "position_encoding": "cpe",
+        "pooling": "token_ln_mean", "position_encoding": "cpe",
     }.items():
         if model.get(key) != expected:
             raise ValueError(f"the vision scaffold requires {key}={expected!r}")
@@ -504,18 +531,38 @@ def _validate_run(
     _probability(train["mixup_prob"], "mixup_prob")
     _probability(train["mixup_switch_prob"], "mixup_switch_prob")
     _probability(train["label_smoothing"], "label_smoothing")
-    _positive_float(train["clip_grad"], "clip_grad")
+    if train["clip_grad"] != 0:
+        _positive_float(train["clip_grad"], "clip_grad")
     if train["mixup_mode"] != "batch":
-        raise ValueError("the plain ViT³ recipes use batch-mode Mixup/CutMix")
+        raise ValueError("the ImageNet recipes use batch-mode Mixup/CutMix")
     if train["amp_dtype"] != "bfloat16":
         raise ValueError("the current ImageNet contract requires train.amp_dtype = 'bfloat16'")
-    if train["optimizer"] != "fused_adamw":
-        raise ValueError("the current ImageNet recipe uses fused AdamW")
-    if train["augmentation"] != "rand_augment":
-        raise ValueError("plain ViT³ uses RandAugment")
-    for key in ("repeated_aug", "bce_loss", "ema"):
-        if train[key] is not False:
-            raise ValueError(f"plain ViT³ requires {key} = false")
+    if recipe == "vit3":
+        if train["optimizer"] != "fused_adamw":
+            raise ValueError("plain ViT³ uses fused AdamW")
+        if train["augmentation"] != "rand_augment":
+            raise ValueError("plain ViT³ uses RandAugment")
+        if model["drop_path_schedule"] != "linear":
+            raise ValueError("plain ViT³ requires linear DropPath")
+        for key in ("repeated_aug", "ema"):
+            if train[key] is not False:
+                raise ValueError(f"plain ViT³ requires {key} = false")
+    else:
+        group_size = _positive_int(train.get("augmentation_group_size"), "augmentation_group_size")
+        if group_size % 2 or int(train["batch_size"]) % group_size:
+            raise ValueError("DeiT III physical batch_size must be divisible by an even augmentation_group_size")
+        if model["drop_path_schedule"] != "constant":
+            raise ValueError("DeiT III requires constant DropPath across layers")
+        expected_optimizer = "fused_lamb" if phase == "pretrain" else "fused_adamw"
+        expected_augmentation = "three_augment" if phase == "pretrain" else "rand_augment"
+        if train["optimizer"] != expected_optimizer or train["augmentation"] != expected_augmentation:
+            raise ValueError(f"DeiT III {phase} requires {expected_optimizer} and {expected_augmentation}")
+        if train["repeated_aug"] is not (phase == "pretrain") or train["ema"] is not False:
+            raise ValueError("DeiT III repeats augmentation only in pretraining; this adaptation disables EMA")
+    if not isinstance(train["bce_loss"], bool):
+        raise ValueError("bce_loss must be a boolean")
+    if train["bce_loss"] and float(train["label_smoothing"]) != 0:
+        raise ValueError("DeiT III multi-label BCE requires label_smoothing = 0")
 
     expected = {
         "small": (384, 12, 6, 32),
@@ -525,8 +572,9 @@ def _validate_run(
     actual = (model["embed_dim"], model["depth"], model["num_heads"], model["rank"])
     if actual != expected:
         raise ValueError(f"{tier} geometry must be {expected}, got {actual}")
-    if phase != "pretrain" or image_size != 224:
-        raise ValueError("plain ViT³ trains at 224px in a single pretraining phase")
+    expected_size = 192 if recipe in DEIT3_CONFIGS and phase == "pretrain" else 224
+    if image_size != expected_size or (recipe == "vit3" and phase != "pretrain"):
+        raise ValueError(f"{recipe}/{phase} requires input size {expected_size}")
 
 
 def _validate_batching_contract(value: object) -> None:
@@ -570,6 +618,10 @@ def _validate_batching_contract(value: object) -> None:
         raise ValueError("checkpoint samples_per_epoch is not a whole effective batch")
     if updates_per_epoch != samples_per_epoch // effective_batch_size:
         raise ValueError("checkpoint updates_per_epoch does not match samples_per_epoch")
+    if "augmentation_group_size" in batching:
+        group = _positive_int(batching["augmentation_group_size"], "batching.augmentation_group_size")
+        if group % 2 or physical_batch_size % group:
+            raise ValueError("checkpoint physical batch is not divisible by its even augmentation group")
 
 
 def resolve_batching_plan(
@@ -612,6 +664,7 @@ def resolve_batching_plan(
         grad_accum=grad_accum,
         samples_per_epoch=updates_per_epoch * effective_batch_size,
         updates_per_epoch=updates_per_epoch,
+        augmentation_group_size=run.train.get("augmentation_group_size"),
     )
     _validate_batching_contract(plan.as_dict())
     return plan
@@ -806,9 +859,33 @@ def _restore_resume_rng_state(
         raise ValueError("resume checkpoint has an invalid RNG state") from error
 
 
+class DeiTGaussianBlur:
+    """PIL radius sampling from facebookresearch/deit augment.py (Apache-2.0)."""
+
+    def __call__(self, image: Any) -> Any:
+        from PIL import ImageFilter
+
+        return image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 2.0)))
+
+
 def build_train_transform(run: ImageNetRun) -> Any:
     train = run.train
     image_size = int(run.model["image_size"])
+    if train["augmentation"] == "three_augment":
+        from torchvision import transforms
+        from timm.data.transforms import RandomResizedCropAndInterpolation
+
+        # Official DeiT III augment.py: RRC, flip, one of grayscale /
+        # solarization / PIL blur, then color jitter and ImageNet normalization.
+        return transforms.Compose([
+            RandomResizedCropAndInterpolation(image_size, scale=(0.08, 1.0), interpolation="bicubic"),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomChoice([
+                transforms.Grayscale(3), transforms.RandomSolarize(128, p=1.0), DeiTGaussianBlur(),
+            ]),
+            transforms.ColorJitter(*([float(train["color_jitter"])] * 3)),
+            transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
     from timm.data import create_transform
 
     return create_transform(
@@ -861,7 +938,10 @@ class ImageNetWebDatasetManifest:
     train: _WebDatasetSplit
     validation: _WebDatasetSplit
 
-    def data_contract(self, *, repeated_augmentation: bool) -> dict[str, Any]:
+    def data_contract(
+        self, *, repeated_augmentation: bool, augmentation_group_size: int | None = None,
+    ) -> dict[str, Any]:
+        indexed = augmentation_group_size is not None
         return {
             "format": "webdataset-v1",
             "source": IMAGENET_WDS_SOURCE,
@@ -869,13 +949,19 @@ class ImageNetWebDatasetManifest:
             "train": self.train.contract(),
             "validation": self.validation.contract(),
             "streaming": {
-                "shard_order": "global-epoch-permutation-then-rank-stride-worker-quota",
-                "sample_shuffle": {
+                "shard_order": (
+                    "global-sample-permutation-then-virtual-group-rank-stride" if indexed
+                    else "global-epoch-permutation-then-rank-stride-worker-quota"
+                ),
+                "sample_shuffle": {"algorithm": "torch.randperm", "seed_policy": "seed-epoch-v1"} if indexed else {
                     "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
                     "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
                 },
                 "source_views": 3 if repeated_augmentation else 1,
-                "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
+                "repeated_augmentation_placement": (
+                    "global-virtual-group-repeat-then-rank-stride" if indexed else "rank-local-physical-batch-interleave"
+                ),
+                **({"augmentation_group_size": augmentation_group_size} if indexed else {}),
                 "validation_partition": "worker-stride-full-per-rank",
                 "worker_rng": "epoch-rank-worker-v1",
             },
@@ -1122,24 +1208,30 @@ def _validate_webdataset_contract(value: object) -> None:
         ),
         "checkpoint WebDataset streaming contract",
     )
-    if streaming["shard_order"] != "global-epoch-permutation-then-rank-stride-worker-quota":
+    indexed = streaming["shard_order"] == "global-sample-permutation-then-virtual-group-rank-stride"
+    if not indexed and streaming["shard_order"] != "global-epoch-permutation-then-rank-stride-worker-quota":
         raise ValueError("checkpoint WebDataset shard ordering is invalid")
     sample_shuffle = _as_mapping(
         streaming["sample_shuffle"],
         "checkpoint WebDataset sample shuffle contract",
     )
-    if sample_shuffle != {
+    expected_shuffle = {"algorithm": "torch.randperm", "seed_policy": "seed-epoch-v1"} if indexed else {
         "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
         "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
-    }:
+    }
+    if sample_shuffle != expected_shuffle:
         raise ValueError("checkpoint WebDataset sample shuffle contract is invalid")
     if streaming["source_views"] not in (1, 3):
         raise ValueError("checkpoint WebDataset source view count is invalid")
     if (
         streaming["repeated_augmentation_placement"]
-        != "rank-local-physical-batch-interleave"
+        != ("global-virtual-group-repeat-then-rank-stride" if indexed else "rank-local-physical-batch-interleave")
     ):
         raise ValueError("checkpoint WebDataset repeated-augmentation placement is invalid")
+    if indexed:
+        group_size = _positive_int(streaming.get("augmentation_group_size"), "data.augmentation_group_size")
+        if group_size % 2:
+            raise ValueError("checkpoint augmentation group size must be even")
     if streaming["validation_partition"] != "worker-stride-full-per-rank":
         raise ValueError("checkpoint WebDataset validation partition is invalid")
     if streaming["worker_rng"] != "epoch-rank-worker-v1":
@@ -1204,6 +1296,123 @@ class _WebDatasetShardSlice:
     count: int
 
 
+class _ImageNetIndexedDataset(Dataset[tuple[torch.Tensor, int]]):
+    """Local tar access owned by WIDS; persistent workers observe a shared epoch."""
+
+    def __init__(self, split: _WebDatasetSplit, *, transform: Any,
+                 state: DistributedState, seed: int, num_classes: int) -> None:
+        self.split, self.transform, self.state = split, transform, state
+        self.seed, self.num_classes = int(seed), int(num_classes)
+        self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+        self._seeded_epoch = None
+        self._reader = None
+
+    def __len__(self) -> int:
+        return self.split.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("ImageNet epoch must be non-negative")
+        self._shared_epoch.fill_(epoch)
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Spawned workers own their mmap handles; never serialize an open cache.
+        return {**self.__dict__, "_reader": None, "_seeded_epoch": None}
+
+    def _get_reader(self) -> Any:
+        if self._reader is None:
+            try:
+                from wids import ShardListDataset
+            except ImportError as error:
+                raise RuntimeError("virtual-group ImageNet loading requires wids; install the vision extra") from error
+            import resource
+            import warnings
+
+            # Uniform random sampling visits all local shards. Keep their small
+            # mmap indexes, avoiding repeated tar-header scans. Only this loader
+            # process raises its soft limit; no server-wide setting is changed.
+            required = 3 * len(self.split.paths) + 256
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft < required:
+                if hard != resource.RLIM_INFINITY and hard < required:
+                    raise RuntimeError("WIDS needs a higher per-process file-descriptor limit")
+                resource.setrlimit(resource.RLIMIT_NOFILE, (required, hard))
+            shards = [{"url": str(path.resolve()), "nsamples": count}
+                      for path, count in zip(self.split.paths, self.split.shard_lengths, strict=True)]
+            with warnings.catch_warnings():
+                # WIDS warns about >200 cached shards before checking the limit;
+                # the bound above already reserves descriptors for every shard.
+                warnings.filterwarnings("ignore", message="LRU size is very large.*")
+                self._reader = ShardListDataset(
+                    shards, transformations=[], localname=str, keep=True,
+                    lru_size=len(shards),
+                )
+        return self._reader
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        if not 0 <= index < len(self):
+            raise IndexError("ImageNet source index is outside its manifest")
+        worker = get_worker_info()
+        epoch = int(self._shared_epoch.item())
+        if worker is not None and self._seeded_epoch != epoch:
+            torch.manual_seed(_webdataset_seed(self.seed, epoch, self.state.rank, worker.id, 1))
+            _seed_worker(worker.id)
+            self._seeded_epoch = epoch
+        # Use WIDS's indexed shard primitive directly: its public dataset
+        # wrapper also adds unused metadata and a cold-cache miss heuristic
+        # meant for small, shard-local LRUs. Our cache retains every shard.
+        shard, inner_index, _ = self._get_reader().get_shard(index)
+        sample = shard[inner_index]
+        # WIDS returns BytesIO fields with dotted suffixes; the common decoder
+        # retains class validation, RGB conversion and ImageNet transforms.
+        return _decode_webdataset_sample(
+            {"jpg": sample[".jpg"].getvalue(), "cls": sample[".cls"].getvalue()},
+            transform=self.transform, num_classes=self.num_classes,
+        )
+
+
+class VirtualGroupSampler(Sampler[int]):
+    """Repeat whole source groups globally, then stride by rank.
+
+    Reuses the repository's earlier DeiT III virtual-device schedule
+    (22c89c0), following Meta RASampler's repeat-before-rank-split ordering.
+    Group members are unique; each repeated index receives a fresh transform.
+    """
+
+    def __init__(self, dataset: _ImageNetIndexedDataset, *, samples_per_rank: int,
+                 group_size: int, num_repeats: int = 3, shuffle: bool = True) -> None:
+        self.dataset = dataset
+        self.group_size = _positive_int(group_size, "augmentation_group_size")
+        self.num_repeats = _positive_int(num_repeats, "num_repeats")
+        self.num_samples = _positive_int(samples_per_rank, "samples_per_rank")
+        if self.num_samples % self.group_size:
+            raise ValueError("samples_per_rank must be divisible by augmentation_group_size")
+        self.global_groups = self.num_samples // self.group_size * dataset.state.world_size
+        self.source_samples = math.ceil(self.global_groups / self.num_repeats) * self.group_size
+        if len(dataset) < self.source_samples:
+            raise ValueError("ImageNet dataset cannot cover the unique-source virtual-group quota")
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.dataset.set_epoch(epoch)
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        if self.shuffle:
+            generator = torch.Generator().manual_seed(_webdataset_seed(self.dataset.seed, self.epoch))
+            indices = torch.randperm(len(self.dataset), generator=generator)
+        else:
+            indices = torch.arange(len(self.dataset))
+        groups = indices[:self.source_samples].reshape(-1, self.group_size)
+        repeated = torch.repeat_interleave(groups, self.num_repeats, dim=0)[:self.global_groups]
+        local = repeated[self.dataset.state.rank::self.dataset.state.world_size].reshape(-1)
+        return iter(local.tolist())
+
+
 class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
     """Finite validation and quota-controlled training ImageNet WebDataset reader."""
 
@@ -1216,14 +1425,11 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         seed: int,
         num_classes: int,
         training: bool,
-        source_views: int = 1,
         physical_batch_size: int | None = None,
         microbatches_per_epoch: int | None = None,
         worker_count: int | None = None,
     ) -> None:
         super().__init__()
-        if source_views < 1:
-            raise ValueError("WebDataset source views must be positive")
         if training:
             if (
                 physical_batch_size is None
@@ -1241,7 +1447,6 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         self.seed = int(seed)
         self.num_classes = int(num_classes)
         self.training = training
-        self.source_views = int(source_views)
         self.physical_batch_size = physical_batch_size
         self.microbatches_per_epoch = microbatches_per_epoch
         self.worker_count = worker_count
@@ -1309,48 +1514,8 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         ):
             raise RuntimeError("training WebDataset is missing its batching plan")
         total_batches = self.microbatches_per_epoch
-        full_unit = self.source_views
-        unit_count, remainder = divmod(total_batches, full_unit)
-        base, extra = divmod(unit_count, self.worker_count)
-        batches = [
-            (base + (worker_id < extra)) * full_unit
-            for worker_id in range(self.worker_count)
-        ]
-        batches[-1] += remainder
-        return tuple(batches)
-
-    def _repeated_augmentation_block(
-        self,
-        remaining_batches: int,
-    ) -> tuple[int, int]:
-        """Return source batches to cache and physical batches to emit from one block."""
-
-        if remaining_batches < 1:
-            raise ValueError("remaining batches must be positive")
-        source_window = self.source_views
-        output_window = self.source_views * source_window
-        if remaining_batches >= output_window:
-            return source_window, output_window
-        return (
-            max(
-                math.ceil(remaining_batches / self.source_views),
-                1,
-            ),
-            remaining_batches,
-        )
-
-    def _source_batch_count(self, batches: int) -> int:
-        if batches < 0:
-            raise ValueError("batch count must be non-negative")
-        if self.source_views == 1:
-            return batches
-        source_batches = 0
-        remaining = batches
-        while remaining:
-            block_sources, block_outputs = self._repeated_augmentation_block(remaining)
-            source_batches += block_sources
-            remaining -= block_outputs
-        return source_batches
+        base, extra = divmod(total_batches, self.worker_count)
+        return tuple(base + (worker_id < extra) for worker_id in range(self.worker_count))
 
     def _training_slices(
         self,
@@ -1367,7 +1532,7 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
         if not 0 <= worker_id < len(batches):
             raise RuntimeError("training WebDataset reported an invalid worker id")
         source_counts = tuple(
-            self._source_batch_count(batch_count) * self.physical_batch_size
+            batch_count * self.physical_batch_size
             for batch_count in batches
         )
         shards = self._rank_shards(epoch)
@@ -1464,42 +1629,12 @@ class _ImageNetWebDataset(IterableDataset[tuple[torch.Tensor, int]]):
                 ),
             )
         )
-        emitted_batches = 0
-        while emitted_batches < batches:
-            if self.source_views == 1:
-                source_batch_count = 1
-                output_batch_count = 1
-            else:
-                source_batch_count, output_batch_count = self._repeated_augmentation_block(
-                    batches - emitted_batches
-                )
-            source_batches = [
-                list(itertools.islice(source, self.physical_batch_size))
-                for _ in range(source_batch_count)
-            ]
-            if any(len(group) != self.physical_batch_size for group in source_batches):
-                raise RuntimeError(
-                    "WebDataset stream ended before its unique-source batch quota was produced"
-                )
-            # Buffer three input physical batches, then cycle their views across
-            # nine output physical batches. Every window, including the final
-            # partial one, keeps a source out of duplicate positions in a
-            # physical batch.
-            block_emitted = 0
-            for _ in range(self.source_views):
-                for group in source_batches:
-                    if block_emitted == output_batch_count:
-                        break
-                    for sample in group:
-                        yield self._decode(sample)
-                    block_emitted += 1
-                    emitted_batches += 1
-                if block_emitted == output_batch_count:
-                    break
-        if emitted_batches != batches:
-            raise RuntimeError(
-                "WebDataset stream ended before its unique-source batch quota was produced"
-            )
+        produced = 0
+        for sample in source:
+            yield self._decode(sample)
+            produced += 1
+        if produced != batches * self.physical_batch_size:
+            raise RuntimeError("WebDataset stream ended before its unique-source batch quota was produced")
 
     def _iter_validation(
         self,
@@ -1568,7 +1703,7 @@ def build_loaders(
 ) -> tuple[
     DataLoader[Any],
     DataLoader[Any],
-    _ImageNetWebDataset,
+    _ImageNetWebDataset | VirtualGroupSampler,
     BatchingPlan,
     LoaderRandomGenerators,
     dict[str, Any],
@@ -1587,27 +1722,35 @@ def build_loaders(
         max(1, train_workers),
         batching_plan.microbatches_per_epoch,
     )
-    if state.world_size * effective_train_workers > len(manifest.train.paths):
+    group_size = batching_plan.augmentation_group_size
+    if group_size is None and state.world_size * effective_train_workers > len(manifest.train.paths):
         raise ValueError("train worker count exceeds the available WebDataset shard partition")
     if val_workers > len(manifest.validation.paths):
         raise ValueError("validation worker count exceeds the 64 validation shards")
 
     source_views = 3 if bool(run.train["repeated_aug"]) else 1
     data_contract = manifest.data_contract(
-        repeated_augmentation=bool(run.train["repeated_aug"])
+        repeated_augmentation=bool(run.train["repeated_aug"]),
+        augmentation_group_size=group_size,
     )
-    train_dataset = _ImageNetWebDataset(
-        manifest.train,
-        transform=build_train_transform(run),
-        state=state,
-        seed=int(run.train["seed"]),
-        num_classes=int(run.model["num_classes"]),
-        training=True,
-        source_views=source_views,
-        physical_batch_size=batching_plan.physical_batch_size,
-        microbatches_per_epoch=batching_plan.microbatches_per_epoch,
-        worker_count=effective_train_workers,
-    )
+    if group_size is not None:
+        train_dataset = _ImageNetIndexedDataset(
+            manifest.train, transform=build_train_transform(run), state=state,
+            seed=int(run.train["seed"]), num_classes=int(run.model["num_classes"]),
+        )
+        epoch_controller = VirtualGroupSampler(
+            train_dataset, samples_per_rank=batching_plan.samples_per_rank,
+            group_size=group_size, num_repeats=source_views,
+        )
+    else:
+        train_dataset = _ImageNetWebDataset(
+            manifest.train, transform=build_train_transform(run), state=state,
+            seed=int(run.train["seed"]), num_classes=int(run.model["num_classes"]),
+            training=True, physical_batch_size=batching_plan.physical_batch_size,
+            microbatches_per_epoch=batching_plan.microbatches_per_epoch,
+            worker_count=effective_train_workers,
+        )
+        epoch_controller = train_dataset
     # The public DeiT command does not enable --dist-eval, so every rank scans
     # all 50k validation examples and metric reduction preserves that protocol.
     val_dataset = _ImageNetWebDataset(
@@ -1627,6 +1770,7 @@ def build_loaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batching_plan.physical_batch_size,
+        **({"sampler": epoch_controller} if group_size is not None else {}),
         drop_last=True,
         **_loader_kwargs(
             workers=0 if train_workers == 0 else effective_train_workers,
@@ -1642,7 +1786,7 @@ def build_loaders(
     return (
         train_loader,
         val_loader,
-        train_dataset,
+        epoch_controller,
         batching_plan,
         generators,
         data_contract,
@@ -1680,6 +1824,7 @@ def build_model(run: ImageNetRun) -> nn.Module:
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
         drop_path_rate=float(model["drop_path_rate"]),
+        drop_path_schedule=str(model["drop_path_schedule"]),
         norm_eps=float(model["norm_eps"]),
     )
 
@@ -1781,6 +1926,18 @@ def build_optimizer(model: nn.Module, run: ImageNetRun) -> tuple[torch.optim.Opt
         model, weight_decay=float(run.train["weight_decay"]),
         no_weight_decay_list=_no_weight_decay(model),
     )
+    if run.train["optimizer"] == "fused_lamb":
+        try:
+            from apex.optimizers import FusedLAMB
+        except ImportError as error:
+            raise RuntimeError("fused_lamb requires NVIDIA Apex with CUDA extensions; see docs/IMAGENET_DEIT3.md") from error
+        if any(p.device.type != "cuda" or p.dtype != torch.float32 for p in model.parameters()):
+            raise ValueError("fused LAMB requires CUDA FP32 parameters; BF16 autocast activations are supported")
+        return FusedLAMB(
+            groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8,
+            bias_correction=True, adam_w_mode=True, grad_averaging=True,
+            max_grad_norm=float(run.train["clip_grad"]), use_nvlamb=False,
+        ), "apex.lamb.fused"
     return (
         torch.optim.AdamW(
             groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8, fused=True,
@@ -1811,10 +1968,26 @@ def build_scheduler(
     )
 
 
+class DeiTBinaryCrossEntropy(nn.BCEWithLogitsLoss):
+    """DeiT III targets: positive membership after unsmoothed Mixup/CutMix.
+
+    Matches facebookresearch/deit engine.py (targets.gt(0)) and the default
+    BCEWithLogitsLoss reduction over both examples and classes.
+    """
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if targets.ndim == 1:
+            targets = torch.nn.functional.one_hot(targets, num_classes=logits.shape[-1])
+        targets = targets.gt(0).to(dtype=torch.float32)
+        return super().forward(logits, targets)
+
+
 def build_mixup_and_loss(run: ImageNetRun) -> tuple[Any | None, nn.Module]:
     from timm.data import Mixup
     from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
+    if run.train["bce_loss"] and float(run.train["label_smoothing"]) != 0:
+        raise ValueError("DeiT III multi-label BCE requires label_smoothing = 0")
     mixup_active = (
         float(run.train["mixup"]) > 0
         or float(run.train["cutmix"]) > 0
@@ -1831,6 +2004,8 @@ def build_mixup_and_loss(run: ImageNetRun) -> tuple[Any | None, nn.Module]:
             label_smoothing=float(run.train["label_smoothing"]),
             num_classes=int(run.model["num_classes"]),
         )
+    if run.train["bce_loss"]:
+        return mixup, DeiTBinaryCrossEntropy()
     if mixup_active:
         return mixup, SoftTargetCrossEntropy()
     if float(run.train["label_smoothing"]) > 0:
@@ -1838,6 +2013,27 @@ def build_mixup_and_loss(run: ImageNetRun) -> tuple[Any | None, nn.Module]:
             smoothing=float(run.train["label_smoothing"])
         )
     return mixup, nn.CrossEntropyLoss()
+
+
+def apply_virtual_group_mixup(
+    images: torch.Tensor, targets: torch.Tensor, mixup: Any, group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Independent timm batch-mode draws, without splitting model forwards."""
+    group_size = _positive_int(group_size, "augmentation_group_size")
+    if group_size % 2:
+        raise ValueError("Mixup/CutMix virtual groups must be even")
+    if images.shape[0] != targets.shape[0] or images.shape[0] % group_size:
+        raise ValueError("physical batch must consist of complete virtual augmentation groups")
+    labels = []
+    for start in range(0, images.shape[0], group_size):
+        stop = start + group_size
+        mixed_images, mixed_targets = mixup(images[start:stop], targets[start:stop])
+        # timm mutates the image view. Keep the adapter correct for callables
+        # returning a new tensor as well, without extra copies in the timm case.
+        if mixed_images.data_ptr() != images[start:stop].data_ptr():
+            images[start:stop].copy_(mixed_images)
+        labels.append(mixed_targets)
+    return images, torch.cat(labels, dim=0)
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -1881,6 +2077,11 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
     if execution == "compile-graph":
         from ridgon import Ridgon
         import torch._dynamo.config as dynamo_config
+        import torch._functorch.config as functorch_config
+
+        # Forward uses BF16 autocast; backward runs outside it, as recommended
+        # by PyTorch AMP. AOTAutograd must specialize for that same context.
+        functorch_config.backward_pass_autocast = "off"
 
         # timm's blocks share Python code but specialize on their per-layer
         # DropPath probabilities. Reserve train/eval variants for each block
@@ -1894,8 +2095,10 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
                 module.forward = torch.compiler.disable(module.forward)
         # One outer graph captures all compiled segments and CUDA Ridgon calls.
         # Disable Inductor's own graphs so graph pools and RNG have one owner.
+        # Preserve eager BF16 rounding between fused pointwise operations.
+        # This retains the numerical contract while removing intermediate IO.
         model.compile(backend="inductor", fullgraph=False, dynamic=False,
-                      options={"triton.cudagraphs": False})
+                      options={"triton.cudagraphs": False, "emulate_precision_casts": True})
     if state.enabled:
         if execution == "eager":
             return DistributedDataParallel(model, device_ids=[state.local_rank])
@@ -1912,7 +2115,7 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
 
 
 class ImageNetGraphStep:
-    """Fixed-shape whole-network forward/backward, including DDP collectives.
+    """Capture a complete fixed-shape accumulated update, including DDP sync.
 
     Optimizer, clipping, data augmentation and scheduling remain outside. Warmup
     never updates weights and restores RNG/buffers before the first real replay.
@@ -1920,66 +2123,89 @@ class ImageNetGraphStep:
     """
 
     def __init__(self, model: nn.Module, criterion: nn.Module, *, grad_accum: int = 1):
-        if grad_accum != 1:
-            raise ValueError("whole-network CUDA Graph requires grad_accum=1; use eager for accumulation")
+        self.grad_accum = _positive_int(grad_accum, "grad_accum")
         self.model, self.criterion = model, criterion
         self.graph = None
         self.parameters = tuple(model.parameters())
 
-    def _capture(self, images: torch.Tensor, targets: torch.Tensor) -> None:
-        if not images.is_cuda or not targets.is_cuda:
+    def _capture(self, images: tuple[torch.Tensor, ...], targets: tuple[torch.Tensor, ...]) -> None:
+        if any(not x.is_cuda for x in (*images, *targets)):
             raise ValueError("CUDA Graph requires CUDA images and targets")
-        self.images = images.clone()
-        self.targets = targets.clone()
+        self.images = tuple(x.clone() for x in images)
+        self.targets = tuple(x.clone() for x in targets)
         cpu_rng = torch.get_rng_state()
-        cuda_rng = torch.cuda.get_rng_state(images.device)
+        device = images[0].device
+        cuda_rng = torch.cuda.get_rng_state(device)
         buffers = [(b, b.clone()) for b in self.model.buffers()]
         stream = getattr(self.model, "_ridgon_graph_stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(device=images.device)
-        stream.wait_stream(torch.cuda.current_stream(images.device))
-        def forward_backward():
-            with _autocast():
-                logits = self.model(self.images)
-                loss = self.criterion(logits, self.targets)
-            loss.backward()
-            return logits, loss
+            stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        def forward_backward(*, synchronize_each: bool = False):
+            logits_batches, losses = [], []
+            for index, (image, target) in enumerate(zip(self.images, self.targets, strict=True)):
+                context = (
+                    self.model.no_sync()
+                    if isinstance(self.model, DistributedDataParallel) and index + 1 < self.grad_accum and not synchronize_each
+                    else nullcontext()
+                )
+                with context:
+                    with _autocast():
+                        logits = self.model(image)
+                        loss = self.criterion(logits, target)
+                        backward_loss = loss / self.grad_accum if self.grad_accum > 1 else loss
+                    backward_loss.backward()
+                logits_batches.append(logits)
+                losses.append(loss)
+            if self.grad_accum == 1:
+                return logits_batches[0], losses[0]
+            return torch.cat(logits_batches), torch.stack(losses).mean()
         with torch.cuda.stream(stream):
             # PyTorch requires >=11 eager DDP iterations before full capture.
-            for _ in range(11):
+            for warmup in range(11):
                 self.model.zero_grad(set_to_none=True)
-                forward_backward()
-        torch.cuda.current_stream(images.device).wait_stream(stream)
-        torch.cuda.synchronize(images.device)
+                # Static DDP must discover its graph on a synchronized first
+                # backward before no_sync accumulation (pytorch/pytorch#143580).
+                forward_backward(synchronize_each=(warmup == 0))
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.cuda.synchronize(device)
         self.model.zero_grad(set_to_none=True)
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph, stream=stream):
             self.logits, self.loss = forward_backward()
         self.gradients = tuple(p.grad for p in self.parameters)
-        torch.cuda.current_stream(images.device).wait_stream(stream)
+        torch.cuda.current_stream(device).wait_stream(stream)
         with torch.no_grad():
             for buffer, original in buffers:
                 buffer.copy_(original)
         torch.set_rng_state(cpu_rng)
-        torch.cuda.set_rng_state(cuda_rng, images.device)
+        torch.cuda.set_rng_state(cuda_rng, device)
 
     def close(self) -> None:
         # NCCL retains captured communicators until the graph is destroyed.
         # Release the graph before destroy_process_group to avoid shutdown hangs.
         if self.graph is not None:
-            torch.cuda.synchronize(self.images.device)
+            torch.cuda.synchronize(self.images[0].device)
             self.graph.reset()
             self.graph = None
             self.model.zero_grad(set_to_none=True)
             self.gradients = ()
             self.images = self.targets = self.logits = self.loss = None
 
-    def __call__(self, images: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self, images: torch.Tensor | Sequence[torch.Tensor], targets: torch.Tensor | Sequence[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.model.training:
             raise RuntimeError("training graph cannot replay in evaluation mode")
+        images = (images,) if isinstance(images, torch.Tensor) else tuple(images)
+        targets = (targets,) if isinstance(targets, torch.Tensor) else tuple(targets)
+        if len(images) != self.grad_accum or len(targets) != self.grad_accum:
+            raise ValueError("CUDA Graph requires one complete grad_accum group")
+        if any(x.shape != images[0].shape for x in images) or any(x.shape != targets[0].shape for x in targets):
+            raise ValueError("CUDA Graph microbatches must have equal shapes")
         if self.graph is None:
             self._capture(images, targets)
-        for source, destination in ((images, self.images), (targets, self.targets)):
+        for source, destination in zip((*images, *targets), (*self.images, *self.targets), strict=True):
             if source.shape != destination.shape or source.dtype != destination.dtype or source.device != destination.device:
                 raise ValueError("CUDA Graph input shape/dtype/device changed")
             destination.copy_(source, non_blocking=True)
@@ -2015,6 +2241,7 @@ def train_epoch(
     processed_steps = 0
     started = time.perf_counter()
     model.zero_grad(set_to_none=True)
+    pending_images, pending_targets, pending_metric_targets = [], [], []
     for step, (images, targets) in zip(
         range(batching_plan.microbatches_per_epoch),
         loader,
@@ -2024,8 +2251,12 @@ def train_epoch(
         targets = targets.to(state.device, non_blocking=True)
         metric_targets = targets
         if mixup is not None:
-            # ViT³ applies timm Mixup/CutMix once to the full per-GPU batch.
-            images, targets = mixup(images, targets)
+            if batching_plan.augmentation_group_size is None:
+                images, targets = mixup(images, targets)
+            else:
+                images, targets = apply_virtual_group_mixup(
+                    images, targets, mixup, batching_plan.augmentation_group_size,
+                )
 
         update_boundary = (step + 1) % batching_plan.grad_accum == 0
         sync_context = nullcontext()
@@ -2034,9 +2265,16 @@ def train_epoch(
                 raise RuntimeError("distributed ImageNet training requires DistributedDataParallel")
             sync_context = model.no_sync()
         if graph_step is not None:
-            if batching_plan.grad_accum != 1:
-                raise ValueError("whole-network Graph requires grad_accum=1")
-            logits, data_loss = graph_step(images, targets)
+            pending_images.append(images)
+            pending_targets.append(targets)
+            pending_metric_targets.append(metric_targets)
+            if not update_boundary:
+                continue
+            logits, data_loss = graph_step(pending_images, pending_targets)
+            metric_targets = torch.cat(pending_metric_targets)
+            pending_images.clear()
+            pending_targets.clear()
+            pending_metric_targets.clear()
             _assert_finite_loss(data_loss, epoch=epoch, step=step)
         else:
             with sync_context:
@@ -2047,7 +2285,9 @@ def train_epoch(
                 _assert_finite_loss(data_loss, epoch=epoch, step=step)
                 loss.backward()
         if update_boundary:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(run.train["clip_grad"]))
+            # Fused LAMB clips once internally after accumulation and DDP sync.
+            if run.train["optimizer"] != "fused_lamb" and float(run.train["clip_grad"]) > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(run.train["clip_grad"]))
             optimizer.step()
             if graph_step is None:
                 model.zero_grad(set_to_none=True)
@@ -2055,7 +2295,7 @@ def train_epoch(
             scheduler.step_update(epoch * batching_plan.updates_per_epoch + optimizer_updates)
             optimizer_updates += 1
 
-        batch = images.shape[0]
+        batch = logits.shape[0]
         metric_totals[0].add_(data_loss.detach().to(dtype=torch.float64), alpha=batch)
         if metric_targets.ndim == 1:
             correct1 = (logits.detach().argmax(dim=1) == metric_targets).sum()
@@ -2068,7 +2308,7 @@ def train_epoch(
             metric_totals[2].add_(correct5)
         metric_totals[3].add_(batch)
         processed_examples += batch
-        processed_steps += 1
+        processed_steps += batching_plan.grad_accum if graph_step is not None else 1
         if state.is_main and print_freq > 0 and (step + 1) % print_freq == 0:
             elapsed = time.perf_counter() - started
             print(
@@ -2189,6 +2429,12 @@ def _record_runtime_metadata(
         raise ValueError("metadata.json must contain an object")
     metadata["model"] = {"trainable_parameters": parameter_count}
     metadata["optimizer_resolved"] = resolved_optimizer
+    if run.train.get("execution") == "compile-graph":
+        metadata["compiler"] = {
+            "backend": "inductor", "emulate_precision_casts": True,
+            "backward_pass_autocast": "off", "inductor_cuda_graphs": False,
+            "outer_cuda_graph": True,
+        }
     metadata["recipe_fidelity"] = _recipe_fidelity(
         run,
         batching_plan=batching_plan,
@@ -2212,7 +2458,9 @@ def _recipe_fidelity(
         "execution",
     }
     # A custom TOML can alter hyperparameters without creating CLI overrides.
-    with DEFAULT_CONFIG.open("rb") as handle:
+    recipe = run.train.get("recipe", "vit3")
+    is_deit = recipe in DEIT3_CONFIGS
+    with DEIT3_CONFIGS.get(recipe, DEFAULT_CONFIG).open("rb") as handle:
         canonical = tomllib.load(handle)
     canonical_train = {
         **canonical["defaults"],
@@ -2224,13 +2472,16 @@ def _recipe_fidelity(
         for key, value in canonical_train.items()
         if key not in non_semantic_overrides
     )
+    tier_model = {key: value for key, value in canonical["tiers"][run.tier].items() if not isinstance(value, dict)}
+    matches_recipe = matches_recipe and all(run.model.get(key) == value for key, value in tier_model.items())
+    matches_recipe = matches_recipe and run.model["image_size"] == canonical["tiers"][run.tier][run.phase]["input_size"]
     if (
         matches_recipe
         and not (set(run.overrides) - non_semantic_overrides)
         and batching_plan.effective_batch_size == int(run.train["effective_batch"])
-        and resolved_optimizer == "torch.adamw.fused"
+        and resolved_optimizer == ("apex.lamb.fused" if is_deit and run.phase == "pretrain" else "torch.adamw.fused")
     ):
-        return "vit3-derived"
+        return "deit3-derived" if is_deit else "vit3-derived"
     return "explicitly-modified"
 
 
@@ -2354,6 +2605,24 @@ def _load_resume(
     return epoch + 1, float(best_acc1)
 
 
+def _load_finetune(path: Path, *, model: nn.Module, run: ImageNetRun) -> dict[str, Any]:
+    """Transfer compatible encoder weights, without training-state restoration."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("finetune checkpoint must be a mapping")
+    contract = validate_checkpoint_contract(checkpoint)
+    source_model = contract["model"]
+    differences = {"image_size", "drop_path_rate", "drop_path_schedule"}
+    if contract["tier"] != run.tier or any(
+        source_model.get(key) != value for key, value in run.model.items() if key not in differences
+    ) or contract["operator"] != run.operator:
+        raise ValueError("finetune checkpoint architecture/operator does not match this model")
+    _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint), strict=True)
+    return {"checkpoint": str(path.resolve()), "source_phase": contract["phase"],
+            "source_image_size": source_model["image_size"], "source_epoch": checkpoint.get("epoch"),
+            "source_contract_digest": checkpoint["contract_digest"]}
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     run = load_run(args)
@@ -2395,6 +2664,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         criterion.to(state.device)
         start_epoch = 0
         best_acc1 = float("-inf")
+        finetune_source = None
+        if args.finetune is not None:
+            finetune_source = _load_finetune(args.finetune, model=model, run=run)
         if args.resume is not None:
             start_epoch, best_acc1 = _load_resume(
                 args.resume,
@@ -2427,6 +2699,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 run=run,
                 batching_plan=batching_plan,
             )
+            if finetune_source is not None:
+                _append_jsonl(output / "metrics.jsonl", {"event": "finetune_initialization", **finetune_source})
             print(
                 json.dumps(
                     {
@@ -2442,6 +2716,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "physical_batch_size": batching_plan.physical_batch_size,
                         "effective_batch": batching_plan.effective_batch_size,
                         "grad_accum": batching_plan.grad_accum,
+                        **({"augmentation_group_size": batching_plan.augmentation_group_size,
+                            "augmentation_draws_per_update": batching_plan.effective_batch_size // batching_plan.augmentation_group_size}
+                           if batching_plan.augmentation_group_size is not None else {}),
                         "optimizer": resolved_optimizer,
                         "world_size": state.world_size,
                     }

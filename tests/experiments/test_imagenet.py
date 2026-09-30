@@ -93,8 +93,8 @@ def _checkpoint_batching_plan() -> BatchingPlan:
     )
 
 
-def _data_contract(*, source_views: int = 1) -> dict[str, object]:
-    return {
+def _data_contract(*, source_views: int = 1, group_size: int | None = None) -> dict[str, object]:
+    result = {
         "format": "webdataset-v1",
         "source": imagenet.IMAGENET_WDS_SOURCE,
         "manifest_sha256": imagenet.IMAGENET_WDS_MANIFEST_SHA256,
@@ -118,6 +118,14 @@ def _data_contract(*, source_views: int = 1) -> dict[str, object]:
             "worker_rng": "epoch-rank-worker-v1",
         },
     }
+    if group_size is not None:
+        result["streaming"].update(
+            shard_order="global-sample-permutation-then-virtual-group-rank-stride",
+            sample_shuffle={"algorithm": "torch.randperm", "seed_policy": "seed-epoch-v1"},
+            repeated_augmentation_placement="global-virtual-group-repeat-then-rank-stride",
+            augmentation_group_size=group_size,
+        )
+    return result
 
 
 def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
@@ -348,7 +356,7 @@ def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("webdataset")
+    pytest.importorskip("wids")
     root = _write_webdataset_root(tmp_path, monkeypatch)
     manifest = imagenet.load_imagenet_webdataset_manifest(root)
     calls: list[int] = []
@@ -357,42 +365,38 @@ def test_webdataset_train_repeats_undecoded_groups_and_replays_an_epoch(
         calls.append(len(calls))
         return torch.tensor([calls[-1]], dtype=torch.int64)
 
-    dataset = imagenet._ImageNetWebDataset(
+    dataset = imagenet._ImageNetIndexedDataset(
         manifest.train,
         transform=counting_transform,
         state=_cpu_state(),
         seed=17,
         num_classes=3,
-        training=True,
-        source_views=3,
-        physical_batch_size=4,
-        microbatches_per_epoch=2,
-        worker_count=1,
     )
-    dataset.set_epoch(4)
-    batch = next(iter(DataLoader(dataset, batch_size=4, num_workers=0, drop_last=True)))
+    sampler = imagenet.VirtualGroupSampler(dataset, samples_per_rank=12, group_size=4)
+    sampler.set_epoch(4)
+    batches = iter(DataLoader(dataset, sampler=sampler, batch_size=4, num_workers=0, drop_last=True))
+    batch = next(batches)
     assert batch[0][:, 0].tolist() == [0, 1, 2, 3]
     assert calls == [0, 1, 2, 3]
+    next_view = next(batches)
+    assert next_view[0][:, 0].tolist() == [4, 5, 6, 7]
+    assert torch.equal(batch[1], next_view[1])
 
     def stable_transform(image: object) -> torch.Tensor:
         return torch.tensor(image.getpixel((0, 0)), dtype=torch.int64)  # type: ignore[union-attr]
 
-    replayable = imagenet._ImageNetWebDataset(
+    replayable = imagenet._ImageNetIndexedDataset(
         manifest.train,
         transform=stable_transform,
         state=_cpu_state(),
         seed=17,
         num_classes=3,
-        training=True,
-        source_views=3,
-        physical_batch_size=4,
-        microbatches_per_epoch=2,
-        worker_count=1,
     )
-    replayable.set_epoch(7)
-    first = next(iter(DataLoader(replayable, batch_size=4, num_workers=0, drop_last=True)))
-    replayable.set_epoch(7)
-    second = next(iter(DataLoader(replayable, batch_size=4, num_workers=0, drop_last=True)))
+    sampler = imagenet.VirtualGroupSampler(replayable, samples_per_rank=12, group_size=4)
+    sampler.set_epoch(7)
+    first = next(iter(DataLoader(replayable, sampler=sampler, batch_size=4, num_workers=0, drop_last=True)))
+    sampler.set_epoch(7)
+    second = next(iter(DataLoader(replayable, sampler=sampler, batch_size=4, num_workers=0, drop_last=True)))
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
 
@@ -411,7 +415,6 @@ def test_webdataset_rank_partition_and_validation_are_explicit(
         seed=3,
         num_classes=3,
         training=True,
-        source_views=1,
         physical_batch_size=2,
         microbatches_per_epoch=2,
         worker_count=2,
@@ -423,7 +426,6 @@ def test_webdataset_rank_partition_and_validation_are_explicit(
         seed=3,
         num_classes=3,
         training=True,
-        source_views=1,
         physical_batch_size=2,
         microbatches_per_epoch=2,
         worker_count=2,
@@ -486,25 +488,22 @@ def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("webdataset")
+    pytest.importorskip("wids")
     root = _write_webdataset_root(tmp_path, monkeypatch, train_shards=4)
     manifest = imagenet.load_imagenet_webdataset_manifest(root)
-    dataset = imagenet._ImageNetWebDataset(
+    dataset = imagenet._ImageNetIndexedDataset(
         manifest.train,
         transform=_pixel_code_transform,
         state=_cpu_state(),
         seed=29,
         num_classes=3,
-        training=True,
-        source_views=3,
-        physical_batch_size=4,
-        microbatches_per_epoch=12,
-        worker_count=2,
     )
+    sampler = imagenet.VirtualGroupSampler(dataset, samples_per_rank=48, group_size=2)
 
     def collect() -> list[torch.Tensor]:
         loader = DataLoader(
             dataset,
+            sampler=sampler,
             batch_size=4,
             drop_last=True,
             num_workers=2,
@@ -513,9 +512,9 @@ def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
         )
         return [images.clone() for _, (images, _targets) in zip(range(12), loader)]
 
-    dataset.set_epoch(5)
+    sampler.set_epoch(5)
     first = collect()
-    dataset.set_epoch(5)
+    sampler.set_epoch(5)
     second = collect()
     assert len(first) == 12
     assert all(torch.equal(left, right) for left, right in zip(first, second, strict=True))
@@ -527,35 +526,55 @@ def test_webdataset_multiple_workers_preserve_repeat_groups_and_replay_epoch(
     ]
     assert all(len(group) == 2 for group in source_groups)
     assert all(source_groups.count(group) == 3 for group in source_groups)
-    assert all(
-        len({group for group in source_groups[index : index + 2]}) == 2
-        for index in range(0, len(source_groups), 2)
-    )
+    assert all(len(set(group)) == 2 for group in source_groups)
+    # Repeated groups can share a physical batch; members within each virtual
+    # group remain unique, and sample order is independent of loader workers.
+    reference = DataLoader(dataset, sampler=sampler, batch_size=4, num_workers=0)
+    assert all(torch.equal(a, b) for a, (b, _) in zip(first, reference, strict=True))
 
 
-@pytest.mark.parametrize("batch_size", (1, 2, 3, 4, 8))
-def test_repeated_augmentation_blocks_keep_physical_batches_source_unique(batch_size) -> None:
-    dataset = imagenet._ImageNetWebDataset(
-        imagenet._WebDatasetSplit("train", (), (), 1),
-        transform=lambda _image: torch.zeros(1), state=_cpu_state(), seed=0,
-        num_classes=1, training=True, source_views=3,
-        physical_batch_size=batch_size, microbatches_per_epoch=17, worker_count=1,
-    )
-    remaining = 17
-    next_source = 0
-    emitted = []
-    while remaining:
-        source_count, output_count = dataset._repeated_augmentation_block(remaining)
-        sources = [list(range(i * batch_size, (i + 1) * batch_size))
-                   for i in range(next_source, next_source + source_count)]
-        next_source += source_count
-        emitted.extend((sources * dataset.source_views)[:output_count])
-        remaining -= output_count
-    assert next_source == dataset._source_batch_count(17)
-    assert len(emitted) == 17
-    assert all(len(set(batch)) == batch_size for batch in emitted)
-    counts = Counter(sample for batch in emitted for sample in batch)
-    assert max(counts.values()) <= dataset.source_views
+@pytest.mark.parametrize("world_size", (1, 2, 3))
+@pytest.mark.parametrize("group_size", (1, 2, 4, 8))
+def test_virtual_ra_repeats_globally_before_rank_split(world_size, group_size):
+    split = imagenet._WebDatasetSplit("train", (), (), 256)
+    local_groups = []
+    for rank in range(world_size):
+        dataset = imagenet._ImageNetIndexedDataset(split, transform=None,
+            state=_cpu_state(world_size=world_size, rank=rank), seed=0, num_classes=1)
+        sampler = imagenet.VirtualGroupSampler(dataset, samples_per_rank=17*group_size,
+                                               group_size=group_size, shuffle=False)
+        indices = list(sampler)
+        assert len(indices) == 17*group_size
+        local_groups.append([tuple(indices[i:i+group_size]) for i in range(0, len(indices), group_size)])
+    global_groups = [local_groups[rank][i] for i in range(17) for rank in range(world_size)]
+    for index, group in enumerate(global_groups):
+        source = index // 3
+        assert group == tuple(range(source*group_size, (source+1)*group_size))
+        assert len(set(group)) == group_size
+    assert max(Counter(sample for group in global_groups for sample in group).values()) <= 3
+
+
+def test_virtual_ra_views_stay_in_the_same_or_adjacent_optimizer_update():
+    split = imagenet._WebDatasetSplit("train", (), (), 32)
+    ranks = []
+    for rank in (0, 1):
+        dataset = imagenet._ImageNetIndexedDataset(split, transform=None,
+            state=_cpu_state(world_size=2, rank=rank), seed=0, num_classes=1)
+        ranks.append(list(imagenet.VirtualGroupSampler(
+            dataset, samples_per_rank=16, group_size=2, shuffle=False)))
+    source_updates = {}
+    for update in range(2):
+        batch = [index for rank in ranks for index in rank[update*8:(update+1)*8]]
+        for source in batch:
+            source_updates.setdefault(source, set()).add(update)
+        if update == 0:
+            assert Counter(batch) == Counter({0: 3, 1: 3, 2: 3, 3: 3, 4: 2, 5: 2})
+    assert all(max(updates)-min(updates) <= 1 for updates in source_updates.values())
+    # No padding or cycling can silently fill an insufficient source quota.
+    short = imagenet._ImageNetIndexedDataset(imagenet._WebDatasetSplit("train", (), (), 3),
+        transform=None, state=_cpu_state(), seed=0, num_classes=1)
+    with pytest.raises(ValueError, match="unique-source"):
+        imagenet.VirtualGroupSampler(short, samples_per_rank=12, group_size=2)
 
 
 def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
@@ -577,7 +596,6 @@ def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
         seed=41,
         num_classes=3,
         training=True,
-        source_views=1,
         physical_batch_size=4,
         microbatches_per_epoch=3,
         worker_count=2,
@@ -602,7 +620,6 @@ def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
         seed=41,
         num_classes=3,
         training=True,
-        source_views=1,
         physical_batch_size=4,
         microbatches_per_epoch=4,
         worker_count=1,
@@ -611,23 +628,33 @@ def test_webdataset_unique_source_quotas_never_cycle_a_short_rank(
         next(iter(DataLoader(short, batch_size=4, num_workers=0, drop_last=True)))
 
 
+@pytest.mark.parametrize("virtual_groups", (False, True))
 def test_webdataset_persistent_workers_observe_epochs_and_replay_after_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, virtual_groups: bool,
 ) -> None:
     pytest.importorskip("webdataset")
+    if virtual_groups:
+        pytest.importorskip("wids")
     root = _write_webdataset_root(tmp_path, monkeypatch, train_shards=4)
     split = imagenet.load_imagenet_webdataset_manifest(root).train
 
     def make_loader():
-        dataset = imagenet._ImageNetWebDataset(
-            split, transform=_random_pixel_transform, state=_cpu_state(),
-            seed=29, num_classes=3, training=True,
-            physical_batch_size=4, microbatches_per_epoch=4, worker_count=2,
-        )
+        if virtual_groups:
+            dataset = imagenet._ImageNetIndexedDataset(
+                split, transform=_random_pixel_transform, state=_cpu_state(), seed=29, num_classes=3)
+            controller = imagenet.VirtualGroupSampler(dataset, samples_per_rank=16, group_size=2)
+        else:
+            dataset = imagenet._ImageNetWebDataset(
+                split, transform=_random_pixel_transform, state=_cpu_state(),
+                seed=29, num_classes=3, training=True,
+                physical_batch_size=4, microbatches_per_epoch=4, worker_count=2,
+            )
+            controller = dataset
         loader = DataLoader(dataset, batch_size=4, drop_last=True,
+                            **({"sampler": controller} if virtual_groups else {}),
                             **imagenet._loader_kwargs(
                                 workers=2, generator=torch.Generator().manual_seed(97)))
-        return dataset, loader
+        return controller, loader
 
     dataset, loader = make_loader()
     resumed = None
@@ -808,7 +835,8 @@ def test_recipe_fidelity_marks_diagnostic_duration(tmp_path):
                                resolved_optimizer="torch.adamw.fused") == expected
 
 
-def test_train_epoch_mixup_receives_complete_physical_batch(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("group_size", (None, 128))
+def test_train_epoch_mixup_grouping_keeps_one_physical_forward(tmp_path, monkeypatch, group_size) -> None:
     class RecordingMixup:
         def __init__(self):
             self.calls = []
@@ -826,19 +854,24 @@ def test_train_epoch_mixup_receives_complete_physical_batch(tmp_path, monkeypatc
     batch_size = 256
     dataset = TensorDataset(torch.randn(batch_size, 2), torch.arange(batch_size))
     model = torch.nn.Linear(2, batch_size)
+    forwards = []
+    model.register_forward_pre_hook(lambda _model, args: forwards.append(args[0].shape[0]))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     mixup = RecordingMixup()
     run = ImageNetRun(config_path=tmp_path / "test.toml", tier="test", phase="test",
-                      model={}, operator={}, train={"bce_loss": False, "clip_grad": 5.0},
+                      model={}, operator={}, train={"bce_loss": False, "clip_grad": 5.0, "optimizer": "sgd"},
                       overrides=())
     plan = BatchingPlan(world_size=1, physical_batch_size=batch_size,
                         effective_batch_size=batch_size, grad_accum=1,
-                        samples_per_epoch=batch_size, updates_per_epoch=1)
+                        samples_per_epoch=batch_size, updates_per_epoch=1,
+                        augmentation_group_size=group_size)
     monkeypatch.setattr(imagenet, "_autocast", lambda: nullcontext())
     train_epoch(model, DataLoader(dataset, batch_size=batch_size), SequentialSampler(dataset),
                 torch.nn.CrossEntropyLoss(), optimizer, mixup, Scheduler(),
                 epoch=0, state=_cpu_state(), run=run, batching_plan=plan, print_freq=0)
-    assert mixup.calls == [list(range(batch_size))]
+    assert mixup.calls == ([list(range(batch_size))] if group_size is None
+                          else [list(range(start, start+group_size)) for start in range(0, batch_size, group_size)])
+    assert forwards == [batch_size]
 
 
 def test_gradient_accumulation_matches_one_effective_batch(
@@ -875,7 +908,7 @@ def test_gradient_accumulation_matches_one_effective_batch(
         phase="test",
         model={},
         operator={},
-        train={"bce_loss": False, "clip_grad": 0.1},
+        train={"bce_loss": False, "clip_grad": 0.1, "optimizer": "sgd"},
         overrides=(),
     )
     batching_plan = BatchingPlan(
@@ -1222,24 +1255,168 @@ def test_vit3_transforms_and_soft_targets(tmp_path):
     assert torch.isfinite(loss(torch.zeros(2, 1000), targets))
 
 
-def test_graph_step_rejects_gradient_accumulation():
-    with pytest.raises(ValueError, match="grad_accum=1"):
-        imagenet.ImageNetGraphStep(torch.nn.Linear(2, 2), torch.nn.CrossEntropyLoss(), grad_accum=2)
+@pytest.mark.parametrize("accum", [0, -1, True])
+def test_graph_step_rejects_invalid_accumulation(accum):
+    with pytest.raises(ValueError, match="positive integer"):
+        imagenet.ImageNetGraphStep(torch.nn.Linear(2, 2), torch.nn.CrossEntropyLoss(), grad_accum=accum)
+
+
+@pytest.mark.parametrize('recipe,epochs,decay,droppath', [
+    ('deit3_400', 400, .02, .1), ('deit3_800', 800, .05, .2),
+])
+def test_deit3_and_finetune_batching(tmp_path, recipe, epochs, decay, droppath):
+    def selected(phase):
+        flags = ['--finetune', str(tmp_path / 'pretrain.pt')] if phase == 'finetune' else []
+        return load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIGS[recipe]), '--tier', 'base',
+            '--phase', phase, '--data-root', str(tmp_path), '--output', str(tmp_path / phase), *flags]))
+    pretrain, finetune = selected('pretrain'), selected('finetune')
+    state = _cpu_state(world_size=2)
+    p = resolve_batching_plan(pretrain, state, dataset_size=1_281_167, requested_grad_accum=None)
+    f = resolve_batching_plan(finetune, state, dataset_size=1_281_167, requested_grad_accum=None)
+    assert (p.physical_batch_size, p.grad_accum, p.effective_batch_size, p.updates_per_epoch) == (512, 2, 2048, 625)
+    assert (f.physical_batch_size, f.grad_accum, f.effective_batch_size, f.updates_per_epoch) == (256, 1, 512, 2502)
+    assert (p.augmentation_group_size, f.augmentation_group_size) == (256, 64)
+    assert (pretrain.model['image_size'], pretrain.train['epochs'], pretrain.train['weight_decay']) == (192, epochs, decay)
+    assert (finetune.model['image_size'], finetune.train['epochs'], finetune.train['weight_decay']) == (224, 20, .1)
+    assert pretrain.model['drop_path_schedule'] == finetune.model['drop_path_schedule'] == 'constant'
+    assert pretrain.model['drop_path_rate'] == finetune.model['drop_path_rate'] == droppath
+    assert pretrain.train['bce_loss'] and not finetune.train['bce_loss']
+    assert _recipe_fidelity(pretrain, batching_plan=p, resolved_optimizer='apex.lamb.fused') == 'deit3-derived'
+    assert _recipe_fidelity(finetune, batching_plan=f, resolved_optimizer='torch.adamw.fused') == 'deit3-derived'
+
+
+def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tmp_path):
+    run = load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIG), '--tier', 'base',
+                              '--data-root', str(tmp_path), '--output', str(tmp_path / 'run')]))
+    plan = resolve_batching_plan(run, _cpu_state(world_size=2),
+                                dataset_size=1_281_167, requested_grad_accum=None)
+    contract = run.checkpoint_contract(plan, _data_contract(source_views=3, group_size=256))
+    def envelope(value):
+        return {'format_version': imagenet.IMAGENET_CHECKPOINT_FORMAT, 'contract': value,
+                'contract_digest': checkpoint_contract_digest(value)}
+    assert imagenet.validate_checkpoint_contract(envelope(contract)) == contract
+    for section in ('train', 'batching'):
+        changed = copy.deepcopy(contract)
+        changed[section]['augmentation_group_size'] = 128
+        with pytest.raises(ValueError, match='inconsistent'):
+            imagenet.validate_checkpoint_contract(envelope(changed))
+    changed = copy.deepcopy(contract)
+    changed['data']['streaming']['augmentation_group_size'] = 128
+    with pytest.raises(ValueError, match='inconsistent'):
+        imagenet.validate_checkpoint_contract(envelope(changed))
 
 
 @pytest.mark.cuda
-def test_graph_step_preserves_warmup_rng_updates_inputs_and_reuses_gradients():
+def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    pytest.importorskip('apex.optimizers')
+    from timm.optim import param_groups_weight_decay
+    from timm.optim.lamb import Lamb
+    torch.manual_seed(17)
+    actual = torch.nn.Module()
+    actual.core_delta = torch.nn.Parameter(torch.zeros(2, 4, 4, device='cuda'))
+    actual.linear = torch.nn.Linear(8, 16, device='cuda')
+    reference = copy.deepcopy(actual)
+    run = load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIG), '--tier', 'base',
+        '--data-root', str(tmp_path), '--output', str(tmp_path / 'out')]))
+    optimizer, name = build_optimizer(actual, run)
+    expected = Lamb(param_groups_weight_decay(reference, weight_decay=.02),
+                    lr=.003, eps=1e-8, max_grad_norm=1., decoupled_decay=False)
+    assert name == 'apex.lamb.fused'
+    for _ in range(3):
+        for a, b in zip(actual.parameters(), reference.parameters()):
+            gradient = torch.randn_like(a)
+            a.grad, b.grad = gradient.clone(), gradient.clone()
+        optimizer.step()
+        expected.step()
+        for a, b in zip(actual.parameters(), reference.parameters()):
+            torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-7)
+    assert actual.core_delta.abs().sum() > 0
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("bce", [False, True])
+def test_graph_accumulation_matches_eager_updates_and_rng(bce):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    torch.manual_seed(814)
+    eager = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.Dropout(.2), torch.nn.Linear(16, 5)).cuda()
+    graphed = copy.deepcopy(eager)
+    criterion = imagenet.DeiTBinaryCrossEntropy() if bce else torch.nn.CrossEntropyLoss()
+    engine = imagenet.ImageNetGraphStep(graphed, criterion, grad_accum=2)
+    optimizers = [torch.optim.AdamW(m.parameters(), lr=1e-3, fused=True) for m in (eager, graphed)]
+    try:
+        for step in range(3):
+            images = [torch.randn(16, 8, device='cuda') + step for _ in range(2)]
+            targets = [(torch.arange(16, device='cuda') + micro + step) % 5 for micro in range(2)]
+            if bce:
+                targets = [.3 * torch.nn.functional.one_hot(t, 5).float()
+                    + .7 * torch.nn.functional.one_hot((t + 1) % 5, 5).float() for t in targets]
+            rng = torch.cuda.get_rng_state()
+            eager.zero_grad(set_to_none=True)
+            logits, losses = [], []
+            for image, target in zip(images, targets):
+                with imagenet._autocast():
+                    output = eager(image)
+                    loss = criterion(output, target)
+                (loss / 2).backward()
+                logits.append(output)
+                losses.append(loss)
+            expected_rng = torch.cuda.get_rng_state()
+            torch.cuda.set_rng_state(rng)
+            graphed.zero_grad(set_to_none=True)
+            output, loss = engine(images, targets)
+            torch.testing.assert_close(output, torch.cat(logits), rtol=0, atol=0)
+            torch.testing.assert_close(loss, torch.stack(losses).mean(), rtol=0, atol=0)
+            torch.testing.assert_close(torch.cuda.get_rng_state(), expected_rng, rtol=0, atol=0)
+            for a, b in zip(graphed.parameters(), eager.parameters()):
+                torch.testing.assert_close(a.grad, b.grad, rtol=0, atol=0)
+            for optimizer in optimizers:
+                optimizer.step()
+            for a, b in zip(graphed.parameters(), eager.parameters()):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+        with pytest.raises(ValueError, match='complete grad_accum group'):
+            engine(images[:1], targets[:1])
+    finally:
+        engine.close()
+
+
+def test_deit_bce_matches_upstream_targets_loss_and_gradients(tmp_path):
+    run = load_run(_args(tmp_path))
+    run.train.update(bce_loss=True, label_smoothing=0.)
+    _, criterion = imagenet.build_mixup_and_loss(run)
+    targets = torch.tensor([[.3, .7, 0.], [0., 0., 1.]])
+    logits = torch.tensor([[.5, -1., 2.], [-.5, 1., 0.]], requires_grad=True)
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets.gt(0).float())
+    actual = criterion(logits, targets)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(torch.autograd.grad(actual, logits)[0],
+                               torch.autograd.grad(expected, logits)[0])
+    labels = torch.tensor([0, 2])
+    torch.testing.assert_close(criterion(logits, labels),
+        torch.nn.functional.binary_cross_entropy_with_logits(logits, torch.nn.functional.one_hot(labels, 3).float()))
+    run.train["label_smoothing"] = .1
+    with pytest.raises(ValueError, match="label_smoothing = 0"):
+        imagenet.build_mixup_and_loss(run)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("bce", [False, True])
+def test_graph_step_preserves_warmup_rng_updates_inputs_and_reuses_gradients(bce):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.manual_seed(916)
     eager = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.GELU(), torch.nn.Dropout(0.2), torch.nn.Linear(16, 5)).cuda()
     graphed = copy.deepcopy(eager)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = imagenet.DeiTBinaryCrossEntropy() if bce else torch.nn.CrossEntropyLoss()
     engine = imagenet.ImageNetGraphStep(graphed, criterion)
     optimizers = [torch.optim.AdamW(m.parameters(), lr=1e-3, fused=True) for m in (eager, graphed)]
     for step in range(3):
         images = torch.randn(16, 8, device="cuda") + step * .1
         targets = (torch.arange(16, device="cuda") + step) % 5
+        if bce:
+            targets = .3 * torch.nn.functional.one_hot(targets, 5).float() + .7 * torch.nn.functional.one_hot((targets + 1) % 5, 5).float()
         rng = torch.cuda.get_rng_state()
         eager.zero_grad(set_to_none=True)
         with imagenet._autocast():

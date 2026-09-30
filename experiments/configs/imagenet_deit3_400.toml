@@ -1,0 +1,75 @@
+# DeiT III ImageNet-1K 400-epoch recipe, paper tables 1, 6, 13.
+# https://arxiv.org/abs/2204.07118
+# Local adaptations: Ridgon/SwiGLU/CPE/mean backbone, BF16, no EMA,
+# streaming WebDataset, physical batch 512 per GPU with accumulation 2.
+[defaults]
+recipe = "deit3_400"
+num_classes = 1000
+patch_size = 16
+mlp_ratio = 4.0
+norm_eps = 1.0e-6
+position_encoding = "cpe"
+drop_path_schedule = "constant"
+epochs = 400
+warmup_epochs = 5
+warmup_lr = 1.0e-6
+min_lr = 1.0e-5
+weight_decay = 0.02
+clip_grad = 1.0
+seed = 0
+train_workers = 12
+val_workers = 4
+eval_crop_ratio = 1.0
+reprob = 0.0
+mixup = 0.8
+cutmix = 1.0
+mixup_prob = 1.0
+mixup_switch_prob = 0.5
+mixup_mode = "batch"
+ema = false
+amp_dtype = "bfloat16"
+execution = "graph"
+save_every = 1
+batch_size = 512
+effective_batch = 2048
+augmentation_group_size = 256
+lr = 0.003
+optimizer = "fused_lamb"
+augmentation = "three_augment"
+color_jitter = 0.3
+auto_augment = ""
+repeated_aug = true
+bce_loss = true
+label_smoothing = 0.0
+
+[operator]
+bias = true
+implementation = "cuda"
+
+[tiers.base]
+embed_dim = 768
+depth = 12
+num_heads = 12
+rank = 48
+drop_path_rate = 0.1
+
+[tiers.base.pretrain]
+input_size = 192
+
+[tiers.base.finetune]
+input_size = 224
+epochs = 20
+batch_size = 256
+effective_batch = 512
+augmentation_group_size = 64
+optimizer = "fused_adamw"
+lr = 1.0e-5
+min_lr = 1.0e-5
+weight_decay = 0.1
+clip_grad = 0.0
+augmentation = "rand_augment"
+auto_augment = "rand-m9-mstd0.5-inc1"
+color_jitter = 0.0
+repeated_aug = false
+bce_loss = false
+label_smoothing = 0.1

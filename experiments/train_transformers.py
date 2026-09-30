@@ -1594,9 +1594,13 @@ def train(
                         parameter.grad.div_(accumulated_examples)
                 if config.grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                # GradScaler backs off on overflow, including fused AdamW's
+                # kernel-level skips. Unchanged/growing scale means an update.
+                if scaler.get_scale() >= scale_before:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_examples = 0
                 if config.pacing_file is not None:

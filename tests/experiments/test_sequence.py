@@ -1651,6 +1651,84 @@ class _TinyTokenDataset(Dataset):
         return values, self.labels[index]
 
 
+@pytest.mark.parametrize("fused", (False, True))
+@pytest.mark.parametrize("growth_interval", (1, 1000))
+@pytest.mark.parametrize("grad_accum", (1, 3))
+def test_sequence_scheduler_tracks_successful_amp_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fused: bool,
+    growth_interval: int,
+    grad_accum: int,
+) -> None:
+    """Real CPU GradScaler exercises skipped updates, including fused AdamW."""
+    torch.manual_seed(31)
+    device = torch.device("cpu")
+    loader = make_loader(
+        _TinyTokenDataset(), batch_size=1, workers=0, device=device,
+        collate_fn=functools.partial(collate_tokens, pad_token_id=0),
+        train=True, seed=31,
+    )
+    model = SequenceClassifier(_encoder("mha"), 2)
+    parameter = next(model.parameters())
+    backward_calls = 0
+
+    def overflow_first_and_third_update(gradient):
+        nonlocal backward_calls
+        backward_calls += 1
+        if backward_calls in (1, 2 * grad_accum + 1):
+            return torch.full_like(gradient, torch.inf)
+        return gradient
+
+    parameter.register_hook(overflow_first_and_third_update)
+    scaler = torch.amp.GradScaler("cpu", init_scale=2.0, growth_interval=growth_interval)
+    monkeypatch.setattr(torch.amp, "GradScaler", lambda *args, **kwargs: scaler)
+    successful_update_lrs = []
+    optimizer_calls = 0
+    adamw = torch.optim.AdamW
+
+    class RecordingAdamW(adamw):
+        def __init__(self, *args, **kwargs):
+            kwargs["fused"] = fused
+            super().__init__(*args, **kwargs)
+
+        def step(self, closure=None):
+            nonlocal optimizer_calls
+            optimizer_calls += 1
+            before = parameter.detach().clone()
+            lr = self.param_groups[0]["lr"]
+            result = super().step(closure)
+            if not torch.equal(parameter, before):
+                successful_update_lrs.append(lr)
+            return result
+
+    monkeypatch.setattr(torch.optim, "AdamW", RecordingAdamW)
+    config = TrainingConfig(
+        output=tmp_path / "run", epochs=1, lr=1e-3, weight_decay=0.0,
+        warmup_ratio=1.0, min_lr_ratio=0.0, grad_accum=grad_accum,
+        grad_clip=1.0, patience=0, early_stop_min_epochs=0,
+        early_stop_accuracy_delta=0.0, early_stop_loss_relative_delta=0.0,
+        seed=31, resume=False, validation_only=True,
+        max_train_batches=0, max_eval_batches=0, amp=True,
+    )
+    train(
+        model, loader, loader, loader, num_classes=2, config=config,
+        run_payload={"case": "amp-scheduler"}, device=device,
+    )
+    checkpoint = torch.load(config.output / "last.pt", map_location="cpu", weights_only=False)
+    attempts = math.ceil(len(loader) / grad_accum)
+    successful_updates = attempts - (2 if attempts >= 3 else 1)
+    assert backward_calls == len(loader)
+    assert checkpoint["scheduler"]["last_epoch"] == successful_updates
+    assert successful_update_lrs == pytest.approx(
+        [config.lr * (step + 1) / attempts for step in range(successful_updates)]
+    )
+    # The fused optimizer is called even when its kernel skips the update.
+    assert optimizer_calls == (attempts if fused else successful_updates)
+    for state in checkpoint["optimizer"]["state"].values():
+        assert state["step"].item() == successful_updates
+
+
 def test_pilot_epochs_caps_the_outer_loop_without_shortening_cosine(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

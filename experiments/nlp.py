@@ -1,4 +1,4 @@
-"""Shared experiment plumbing; model mathematics lives in ridgon.ball."""
+"""Shared experiment plumbing; model mathematics lives in memsolve.ball."""
 from __future__ import annotations
 
 import hashlib
@@ -173,7 +173,7 @@ def load_sentence_model(checkpoint, max_length, implementation, device):
     if max_length < 3:
         raise ValueError("max_length must leave room for text and BERT special tokens")
     path = Path(checkpoint)
-    overrides = {"ridgon_implementation": implementation} if implementation else {}
+    overrides = {"memsolve_implementation": implementation} if implementation else {}
     if (path / "modules.json").is_file():
         model = SentenceTransformer(str(path), device=device, config_kwargs=overrides)
     else:

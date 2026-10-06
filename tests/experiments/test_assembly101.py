@@ -48,14 +48,14 @@ def test_full_model_bucket_padding_preserves_real_frame_loss_and_gradients(rank,
 
 def test_execution_upgrade_does_not_bypass_data_or_core_identity():
     old = {'rank': 16, 'audit_sha256': 'data', 'sources_sha256': {
-        'experiments/assembly101.py': 'old', 'ridgon/ball/model.py': 'same'}}
+        'experiments/assembly101.py': 'old', 'memsolve/ball/model.py': 'same'}}
     new = {**old, 'execution_backend': 'graph-compile', 'graph_buckets': [4096],
            'sources_sha256': {**old['sources_sha256'], 'experiments/assembly101.py': 'new'}}
     with pytest.raises(ValueError, match='identity mismatch'):
         assembly101.check_resume_identity(old, new)
     assembly101.check_resume_identity(old, new, True)
     for changed in ({**new, 'rank': 32}, {**new, 'audit_sha256': 'other'},
-                    {**new, 'sources_sha256': {**new['sources_sha256'], 'ridgon/ball/model.py': 'other'}}):
+                    {**new, 'sources_sha256': {**new['sources_sha256'], 'memsolve/ball/model.py': 'other'}}):
         with pytest.raises(ValueError, match='identity mismatch'):
             assembly101.check_resume_identity(old, changed, True)
 
@@ -162,14 +162,14 @@ def test_stage1_replacement_preserves_local_and_refinement_modules():
     assembly101.replace_stage1(model, 16, implementation='reference')
     current = dict(model.named_modules())
     assert all(current[name] is module for name, module in preserved.items())
-    assert sum(isinstance(m, assembly101.Stage1Ridgon) for m in model.modules()) == 9
+    assert sum(isinstance(m, assembly101.Stage1MemSolve) for m in model.modules()) == 9
     assert all(layer.ltc_attn.mixer.config.rank == 16 for layer in model.stage1.layers)
 
 
 @pytest.mark.parametrize('rank', [16, 32])
 def test_stage1_padding_does_not_change_valid_outputs_or_gradients(rank):
     torch.manual_seed(0)
-    adapter = assembly101.Stage1Ridgon(64, rank, implementation='reference').double()
+    adapter = assembly101.Stage1MemSolve(64, rank, implementation='reference').double()
     original = torch.randn(1, 64, 39, dtype=torch.float64, requires_grad=True)
     padded = torch.cat([original.detach(), torch.full((1, 64, 7), float('nan'), dtype=torch.float64)], -1)
     padded.requires_grad_()

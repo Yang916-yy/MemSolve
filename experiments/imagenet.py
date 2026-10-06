@@ -1,7 +1,7 @@
-"""Distributed ImageNet-1K training with ViT³- and DeiT III-derived recipes.
+"""Distributed ImageNet-1K training with RoPE-ViT, ViT³ and DeiT III recipes.
 
 The model itself intentionally lives outside this entrypoint.  The runner calls
-``integrations.timm.create_ridgon_vit`` so classification, detection, and
+``integrations.timm.create_memsolve_vit`` so classification, detection, and
 segmentation share one backbone implementation rather than recreating model
 math in every experiment.
 """
@@ -41,12 +41,15 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "experiments" / "configs" / "imagenet_vit3.toml"
+VIT3_CONFIG = ROOT / "experiments" / "configs" / "imagenet_vit3.toml"
+ROPEVIT_CONFIG = ROOT / "experiments" / "configs" / "imagenet_ropevit_400.toml"
+DEFAULT_CONFIG = ROPEVIT_CONFIG
 DEIT3_CONFIG = ROOT / "experiments" / "configs" / "imagenet_deit3_400.toml"
 DEIT3_CONFIGS = {
     "deit3_400": DEIT3_CONFIG,
     "deit3_800": ROOT / "experiments" / "configs" / "imagenet_deit3_800.toml",
 }
+RECIPE_CONFIGS = {"vit3": VIT3_CONFIG, "ropevit_400": ROPEVIT_CONFIG, **DEIT3_CONFIGS}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 OFFICIAL_VIT3_URL = (
@@ -54,7 +57,8 @@ OFFICIAL_VIT3_URL = (
     "e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt"
 )
 OFFICIAL_DEIT3_URL = "https://github.com/facebookresearch/deit/blob/main/README_revenge.md"
-IMAGENET_CHECKPOINT_FORMAT = 12
+OFFICIAL_ROPEVIT_URL = "https://github.com/naver-ai/rope-vit/blob/main/deit/README.md"
+IMAGENET_CHECKPOINT_FORMAT = 13
 IMAGENET_WDS_SOURCE = "timm/imagenet-1k-wds"
 IMAGENET_WDS_MANIFEST_SHA256 = (
     "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f"
@@ -215,7 +219,9 @@ class ImageNetRun:
             "operator": self.operator,
             "train": self.train,
             "overrides": list(self.overrides),
-            **({"official_deit3_recipe": OFFICIAL_DEIT3_URL}
+            **({"official_ropevit_recipe": OFFICIAL_ROPEVIT_URL}
+               if self.train.get("recipe") == "ropevit_400"
+               else {"official_deit3_recipe": OFFICIAL_DEIT3_URL}
                if self.train.get("recipe") in DEIT3_CONFIGS
                else {"official_vit3_recipe": OFFICIAL_VIT3_URL}),
             "batching": batching_plan.as_dict(),
@@ -229,9 +235,11 @@ class ImageNetRun:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train Ridgon with ViT³ or DeiT III recipes on ImageNet-1K with torchrun."
+        description="Train MemSolve with RoPE-ViT, ViT³ or DeiT III recipes on ImageNet-1K with torchrun."
     )
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path,
+                        default=DEFAULT_CONFIG,
+                        help="defaults to RoPE-ViT-derived 400e training for T/S/B")
     parser.add_argument("--tier", choices=("tiny", "small", "base"), required=True)
     parser.add_argument(
         "--phase",
@@ -251,7 +259,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--implementation",
         choices=("cuda", "reference"),
-        help="Override the configured Ridgon implementation for a diagnostic run.",
+        help="Override the configured MemSolve implementation for a diagnostic run.",
     )
     parser.add_argument(
         "--resume",
@@ -342,6 +350,8 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
 
     defaults = dict(_as_mapping(raw.get("defaults"), "[defaults]"))
     operator = dict(_as_mapping(raw.get("operator"), "[operator]"))
+    operator.setdefault("qk_conv_kernel_size", 3)
+    operator.setdefault("output_gate_rank", 32)
     tiers = _as_mapping(raw.get("tiers"), "[tiers]")
     tier_values = dict(_as_mapping(tiers.get(args.tier), f"[tiers.{args.tier}]"))
     phases = {
@@ -358,6 +368,8 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
     tier_values = {
         key: value for key, value in tier_values.items() if not isinstance(value, dict)
     }
+    # Resolution fine-tuning may change regularization without changing weights.
+    drop_path_rate = phase_values.pop("drop_path_rate", tier_values["drop_path_rate"])
 
     model = {
         "image_size": phase_values["input_size"],
@@ -365,13 +377,14 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         "num_classes": defaults["num_classes"],
         "mlp_ratio": defaults["mlp_ratio"],
         "norm_eps": defaults["norm_eps"],
-        "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+        "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
         "drop_path_schedule": defaults.get("drop_path_schedule", "linear"),
         "position_encoding": defaults["position_encoding"],
         **tier_values,
+        "drop_path_rate": drop_path_rate,
     }
     train = {**defaults, **phase_values}
     train.pop("input_size")
@@ -424,8 +437,8 @@ def _validate_run(
     train: Mapping[str, Any],
 ) -> None:
     recipe = train.get("recipe", "vit3")
-    if recipe not in {"vit3", *DEIT3_CONFIGS}:
-        raise ValueError("recipe must be 'vit3', 'deit3_400' or 'deit3_800'")
+    if recipe not in RECIPE_CONFIGS:
+        raise ValueError(f"recipe must be one of {', '.join(RECIPE_CONFIGS)}")
     _require_keys(
         model,
         (
@@ -497,8 +510,8 @@ def _validate_run(
     _probability(model["drop_path_rate"], "drop_path_rate")
 
     for key, expected in {
-        "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu", "layer_scale": False, "class_token": False,
-        "pooling": "token_ln_mean", "position_encoding": "cpe",
+        "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu", "layer_scale": False, "class_token": False,
+        "pooling": "token_ln_mean", "position_encoding": "rope_2d_axial",
     }.items():
         if model.get(key) != expected:
             raise ValueError(f"the vision scaffold requires {key}={expected!r}")
@@ -507,6 +520,12 @@ def _validate_run(
 
     if "core_mode" in operator:
         raise ValueError("core_mode is not part of the QKV equilibrium contract")
+    from memsolve import MemSolveConfig
+    MemSolveConfig(
+        dim=embed_dim, num_heads=heads, rank=model["rank"], qk_conv_dim=2,
+        qk_conv_kernel_size=operator["qk_conv_kernel_size"],
+        output_gate_rank=operator["output_gate_rank"],
+    )
     if operator["bias"] is not True:
         raise ValueError("the ViT³ scaffold requires qkv/projection bias")
     if operator["implementation"] not in {"cuda", "reference"}:
@@ -537,6 +556,12 @@ def _validate_run(
         raise ValueError("the ImageNet recipes use batch-mode Mixup/CutMix")
     if train["amp_dtype"] != "bfloat16":
         raise ValueError("the current ImageNet contract requires train.amp_dtype = 'bfloat16'")
+    if not isinstance(train["ema"], bool):
+        raise ValueError("ema must be a boolean")
+    if train["ema"]:
+        decay = _probability(train.get("ema_decay"), "ema_decay")
+        if decay >= 1:
+            raise ValueError("ema_decay must be less than one")
     if recipe == "vit3":
         if train["optimizer"] != "fused_adamw":
             raise ValueError("plain ViT³ uses fused AdamW")
@@ -548,17 +573,20 @@ def _validate_run(
             if train[key] is not False:
                 raise ValueError(f"plain ViT³ requires {key} = false")
     else:
+        family = "RoPE-ViT" if recipe == "ropevit_400" else "DeiT III"
         group_size = _positive_int(train.get("augmentation_group_size"), "augmentation_group_size")
         if group_size % 2 or int(train["batch_size"]) % group_size:
-            raise ValueError("DeiT III physical batch_size must be divisible by an even augmentation_group_size")
+            raise ValueError(f"{family} physical batch_size must be divisible by an even augmentation_group_size")
         if model["drop_path_schedule"] != "constant":
-            raise ValueError("DeiT III requires constant DropPath across layers")
+            raise ValueError(f"{family} requires constant DropPath across layers")
         expected_optimizer = "fused_lamb" if phase == "pretrain" else "fused_adamw"
         expected_augmentation = "three_augment" if phase == "pretrain" else "rand_augment"
         if train["optimizer"] != expected_optimizer or train["augmentation"] != expected_augmentation:
-            raise ValueError(f"DeiT III {phase} requires {expected_optimizer} and {expected_augmentation}")
-        if train["repeated_aug"] is not (phase == "pretrain") or train["ema"] is not False:
-            raise ValueError("DeiT III repeats augmentation only in pretraining; this adaptation disables EMA")
+            raise ValueError(f"{family} {phase} requires {expected_optimizer} and {expected_augmentation}")
+        if train["repeated_aug"] is not (phase == "pretrain"):
+            raise ValueError(f"{family} repeats augmentation only in pretraining")
+        if recipe in DEIT3_CONFIGS and train["ema"] is not False:
+            raise ValueError("the explicit DeiT III adaptations disable EMA")
     if not isinstance(train["bce_loss"], bool):
         raise ValueError("bce_loss must be a boolean")
     if train["bce_loss"] and float(train["label_smoothing"]) != 0:
@@ -572,7 +600,10 @@ def _validate_run(
     actual = (model["embed_dim"], model["depth"], model["num_heads"], model["rank"])
     if actual != expected:
         raise ValueError(f"{tier} geometry must be {expected}, got {actual}")
-    expected_size = 192 if recipe in DEIT3_CONFIGS and phase == "pretrain" else 224
+    low_resolution_pretrain = phase == "pretrain" and (
+        recipe in DEIT3_CONFIGS or (recipe == "ropevit_400" and tier == "base")
+    )
+    expected_size = 192 if low_resolution_pretrain else 224
     if image_size != expected_size or (recipe == "vit3" and phase != "pretrain"):
         raise ValueError(f"{recipe}/{phase} requires input size {expected_size}")
 
@@ -1795,24 +1826,24 @@ def build_loaders(
 
 def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
     if run.operator["implementation"] == "cuda":
-        from ridgon.ball import cuda
+        from memsolve.ball import cuda
 
         cuda.load(device=device)
 
 
 def build_model(run: ImageNetRun) -> nn.Module:
-    """Call the shared ViT³-style Ridgon backbone factory owned by integrations."""
+    """Call the shared ViT³-style MemSolve backbone factory owned by integrations."""
 
     try:
-        from integrations.timm import create_ridgon_vit
+        from integrations.timm import create_memsolve_vit
     except ImportError as error:
         raise RuntimeError(
-            "ImageNet training requires integrations.timm.create_ridgon_vit; "
+            "ImageNet training requires integrations.timm.create_memsolve_vit; "
             "the shared ViT³-style backbone adapter is not available."
         ) from error
 
     model = run.model
-    return create_ridgon_vit(
+    return create_memsolve_vit(
         image_size=int(model["image_size"]),
         patch_size=int(model["patch_size"]),
         num_classes=int(model["num_classes"]),
@@ -1820,6 +1851,8 @@ def build_model(run: ImageNetRun) -> nn.Module:
         depth=int(model["depth"]),
         num_heads=int(model["num_heads"]),
         rank=int(model["rank"]),
+        qk_conv_kernel_size=run.operator["qk_conv_kernel_size"],
+        output_gate_rank=run.operator["output_gate_rank"],
         mlp_ratio=float(model["mlp_ratio"]),
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
@@ -1829,8 +1862,28 @@ def build_model(run: ImageNetRun) -> nn.Module:
     )
 
 
-def _checkpoint_model_state(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
-    state = checkpoint.get("model")
+def build_model_ema(model: nn.Module, run: ImageNetRun) -> Any | None:
+    """Create upstream's constant-decay shadow before compilation/wrapping.
+
+    timm V3 provides foreach updates. Parameter iteration handles MemSolve's
+    non-tensor extra state; buffers are copied (this backbone has no running
+    statistics). Call update without a step to retain the constant decay from
+    the first optimizer update, as in RoPE-ViT's ModelEma.
+    """
+    if not run.train["ema"]:
+        return None
+    from timm.utils import ModelEmaV3
+
+    ema = ModelEmaV3(_unwrap_model(model), decay=float(run.train["ema_decay"]),
+                     use_warmup=False, foreach=True, exclude_buffers=True)
+    ema.module.requires_grad_(False)
+    return ema
+
+
+def _checkpoint_model_state(checkpoint: Mapping[str, Any], *, weights: str = "model") -> dict[str, Any]:
+    if weights not in {"model", "model_ema"}:
+        raise ValueError("checkpoint weights must be model or model_ema")
+    state = checkpoint.get(weights)
     if not isinstance(state, dict) or not all(
         isinstance(key, str)
         and (
@@ -1840,7 +1893,7 @@ def _checkpoint_model_state(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in state.items()
     ):
         raise ValueError(
-            "checkpoint must contain tensor model state and Ridgon _extra_state contracts"
+            "checkpoint must contain tensor model state and MemSolve _extra_state contracts"
         )
     return copy.deepcopy(state)
 
@@ -2071,11 +2124,11 @@ def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
 
 
 def prepare_training_model(model: nn.Module, state: DistributedState, execution: str) -> nn.Module:
-    """Compile surrounding vision blocks; retain the tested Ridgon CUDA boundary."""
+    """Compile surrounding vision blocks; retain the tested MemSolve CUDA boundary."""
     if execution not in {"eager", "graph", "compile-graph"}:
         raise ValueError(f"unsupported training execution: {execution}")
     if execution == "compile-graph":
-        from ridgon import Ridgon
+        from memsolve import MemSolve
         import torch._dynamo.config as dynamo_config
         import torch._functorch.config as functorch_config
 
@@ -2086,14 +2139,15 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
         # timm's blocks share Python code but specialize on their per-layer
         # DropPath probabilities. Reserve train/eval variants for each block
         # instead of hitting Dynamo's default eight-variant eager fallback.
-        mixer_count = sum(isinstance(module, Ridgon) for module in model.modules())
+        mixer_count = sum(isinstance(module, MemSolve) for module in model.modules())
         dynamo_config.recompile_limit = max(
             dynamo_config.recompile_limit, 2 * mixer_count + 4
         )
         for module in model.modules():
-            if isinstance(module, Ridgon):
+            if isinstance(module, MemSolve):
                 module.forward = torch.compiler.disable(module.forward)
-        # One outer graph captures all compiled segments and CUDA Ridgon calls.
+                # The CUDA mixer already fuses normalization and its gate.
+        # One outer graph captures all compiled segments and CUDA MemSolve calls.
         # Disable Inductor's own graphs so graph pools and RNG have one owner.
         # Preserve eager BF16 rounding between fused pointwise operations.
         # This retains the numerical contract while removing intermediate IO.
@@ -2110,7 +2164,7 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
                 gradient_as_bucket_view=True,
             )
         torch.cuda.current_stream(state.device).wait_stream(stream)
-        model._ridgon_graph_stream = stream
+        model._memsolve_graph_stream = stream
     return model
 
 
@@ -2137,7 +2191,7 @@ class ImageNetGraphStep:
         device = images[0].device
         cuda_rng = torch.cuda.get_rng_state(device)
         buffers = [(b, b.clone()) for b in self.model.buffers()]
-        stream = getattr(self.model, "_ridgon_graph_stream", None)
+        stream = getattr(self.model, "_memsolve_graph_stream", None)
         if stream is None:
             stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
@@ -2231,6 +2285,7 @@ def train_epoch(
     batching_plan: BatchingPlan,
     print_freq: int,
     graph_step: ImageNetGraphStep | None = None,
+    model_ema: Any | None = None,
 ) -> tuple[float, float, float]:
     if hasattr(epoch_controller, "set_epoch"):
         epoch_controller.set_epoch(epoch)
@@ -2289,6 +2344,8 @@ def train_epoch(
             if run.train["optimizer"] != "fused_lamb" and float(run.train["clip_grad"]) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(run.train["clip_grad"]))
             optimizer.step()
+            if model_ema is not None:
+                model_ema.update(_unwrap_model(model))
             if graph_step is None:
                 model.zero_grad(set_to_none=True)
             # Match upstream zero-based update indexing, once per accumulated batch.
@@ -2341,27 +2398,43 @@ def evaluate(
     *,
     state: DistributedState,
 ) -> tuple[float, float, float]:
-    model.eval()
+    metrics = evaluate_models(model, loader, state=state)
+    return metrics["val_loss"], metrics["val_acc1"], metrics["val_acc5"]
+
+
+@torch.no_grad()
+def evaluate_models(
+    model: nn.Module,
+    loader: DataLoader[Any],
+    *,
+    state: DistributedState,
+    model_ema: Any | None = None,
+) -> dict[str, float]:
+    """Evaluate both weight sets on the same decoded validation batches."""
+    models = {"val": model}
+    if model_ema is not None:
+        models["ema_val"] = model_ema.module
+    for variant in models.values():
+        variant.eval()
     criterion = nn.CrossEntropyLoss()
-    metric_totals = torch.zeros(4, device=state.device, dtype=torch.float64)
+    totals = {key: torch.zeros(4, device=state.device, dtype=torch.float64) for key in models}
     for images, targets in loader:
         images = images.to(state.device, non_blocking=True)
         targets = targets.to(state.device, non_blocking=True)
-        with _autocast():
-            logits = model(images)
-            loss = criterion(logits, targets)
-        batch = images.shape[0]
-        correct1 = (logits.argmax(dim=1) == targets).sum()
-        correct5 = (
-            logits.topk(k=min(5, logits.shape[1]), dim=1).indices.eq(
-                targets[:, None]
-            ).any(dim=1).sum().to(dtype=torch.float64)
-        )
-        metric_totals[0].add_(loss.detach().to(dtype=torch.float64), alpha=batch)
-        metric_totals[1].add_(correct1.to(dtype=torch.float64))
-        metric_totals[2].add_(correct5)
-        metric_totals[3].add_(batch)
-    return _reduce_metrics(metric_totals, state)
+        for key, variant in models.items():
+            with _autocast():
+                logits = variant(images)
+                loss = criterion(logits, targets)
+            batch = images.shape[0]
+            correct1 = (logits.argmax(dim=1) == targets).sum()
+            correct5 = logits.topk(k=min(5, logits.shape[1]), dim=1).indices.eq(
+                targets[:, None]).any(dim=1).sum()
+            totals[key][0].add_(loss.detach().to(dtype=torch.float64), alpha=batch)
+            totals[key][1].add_(correct1.to(dtype=torch.float64))
+            totals[key][2].add_(correct5.to(dtype=torch.float64))
+            totals[key][3].add_(batch)
+    return {f"{key}_{name}": value for key, total in totals.items()
+            for name, value in zip(("loss", "acc1", "acc5"), _reduce_metrics(total, state), strict=True)}
 
 
 def _source_revision() -> dict[str, str | bool | None]:
@@ -2429,6 +2502,7 @@ def _record_runtime_metadata(
         raise ValueError("metadata.json must contain an object")
     metadata["model"] = {"trainable_parameters": parameter_count}
     metadata["optimizer_resolved"] = resolved_optimizer
+    metadata["validation_weights"] = ["model", "model_ema"] if run.train["ema"] else ["model"]
     if run.train.get("execution") == "compile-graph":
         metadata["compiler"] = {
             "backend": "inductor", "emulate_precision_casts": True,
@@ -2460,27 +2534,32 @@ def _recipe_fidelity(
     # A custom TOML can alter hyperparameters without creating CLI overrides.
     recipe = run.train.get("recipe", "vit3")
     is_deit = recipe in DEIT3_CONFIGS
-    with DEIT3_CONFIGS.get(recipe, DEFAULT_CONFIG).open("rb") as handle:
+    with RECIPE_CONFIGS[recipe].open("rb") as handle:
         canonical = tomllib.load(handle)
     canonical_train = {
         **canonical["defaults"],
         **canonical["tiers"][run.tier][run.phase],
     }
     canonical_train.pop("input_size")
+    phase_drop_path = canonical_train.pop("drop_path_rate", None)
     matches_recipe = all(
         run.train.get(key) == value
         for key, value in canonical_train.items()
         if key not in non_semantic_overrides
     )
     tier_model = {key: value for key, value in canonical["tiers"][run.tier].items() if not isinstance(value, dict)}
+    if phase_drop_path is not None:
+        tier_model["drop_path_rate"] = phase_drop_path
     matches_recipe = matches_recipe and all(run.model.get(key) == value for key, value in tier_model.items())
     matches_recipe = matches_recipe and run.model["image_size"] == canonical["tiers"][run.tier][run.phase]["input_size"]
     if (
         matches_recipe
         and not (set(run.overrides) - non_semantic_overrides)
         and batching_plan.effective_batch_size == int(run.train["effective_batch"])
-        and resolved_optimizer == ("apex.lamb.fused" if is_deit and run.phase == "pretrain" else "torch.adamw.fused")
+        and resolved_optimizer == ("apex.lamb.fused" if canonical_train["optimizer"] == "fused_lamb" else "torch.adamw.fused")
     ):
+        if recipe == "ropevit_400":
+            return "ropevit-derived"
         return "deit3-derived" if is_deit else "vit3-derived"
     return "explicitly-modified"
 
@@ -2552,15 +2631,24 @@ def _checkpoint(
     data_contract: Mapping[str, Any],
     best_acc1: float,
     rng: Mapping[str, Any],
+    model_ema: Any | None = None,
+    best_ema_acc1: float | None = None,
 ) -> dict[str, Any]:
+    if (model_ema is not None) != run.train["ema"]:
+        raise ValueError("EMA instance does not match the checkpoint training contract")
+    if model_ema is not None and best_ema_acc1 is None:
+        raise ValueError("EMA checkpoint requires best_ema_acc1")
     contract = run.checkpoint_contract(batching_plan, data_contract)
     return {
         "format_version": IMAGENET_CHECKPOINT_FORMAT,
         "epoch": epoch,
         "best_acc1": best_acc1,
+        "best_ema_acc1": best_ema_acc1,
+        "selected_weights": "model",
         "contract": contract,
         "contract_digest": checkpoint_contract_digest(contract),
         "model": _unwrap_model(model).state_dict(),
+        **({"model_ema": model_ema.module.state_dict()} if model_ema is not None else {}),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "rng": dict(rng),
@@ -2578,7 +2666,8 @@ def _load_resume(
     data_contract: Mapping[str, Any],
     state: DistributedState,
     generators: LoaderRandomGenerators,
-) -> tuple[int, float]:
+    model_ema: Any | None = None,
+) -> tuple[int, float, float | None]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
         raise ValueError("resume checkpoint must be a mapping")
@@ -2587,6 +2676,15 @@ def _load_resume(
         data_contract,
     ):
         raise ValueError("resume checkpoint contract does not match the requested run")
+    if (model_ema is not None) != run.train["ema"]:
+        raise ValueError("EMA instance does not match the resume training contract")
+    best_ema_acc1 = checkpoint.get("best_ema_acc1")
+    if model_ema is not None:
+        if not isinstance(checkpoint.get("model_ema"), dict):
+            raise ValueError("resume checkpoint is missing model_ema")
+        if not isinstance(best_ema_acc1, (float, int)) or not math.isfinite(best_ema_acc1):
+            raise ValueError("resume checkpoint has an invalid best_ema_acc1")
+        model_ema.module.load_state_dict(checkpoint["model_ema"], strict=True)
     rng_state = checkpoint.get("rng")
     _resume_rng_state_for_rank(rng_state, state=state)
     _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint), strict=True)
@@ -2602,7 +2700,7 @@ def _load_resume(
     if not isinstance(best_acc1, (float, int)):
         raise ValueError("resume checkpoint has an invalid best_acc1")
     _restore_resume_rng_state(rng_state, state=state, generators=generators)
-    return epoch + 1, float(best_acc1)
+    return epoch + 1, float(best_acc1), float(best_ema_acc1) if model_ema is not None else None
 
 
 def _load_finetune(path: Path, *, model: nn.Module, run: ImageNetRun) -> dict[str, Any]:
@@ -2617,8 +2715,10 @@ def _load_finetune(path: Path, *, model: nn.Module, run: ImageNetRun) -> dict[st
         source_model.get(key) != value for key, value in run.model.items() if key not in differences
     ) or contract["operator"] != run.operator:
         raise ValueError("finetune checkpoint architecture/operator does not match this model")
-    _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint), strict=True)
+    weights = checkpoint.get("selected_weights", "model")
+    _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint, weights=weights), strict=True)
     return {"checkpoint": str(path.resolve()), "source_phase": contract["phase"],
+            "source_weights": weights,
             "source_image_size": source_model["image_size"], "source_epoch": checkpoint.get("epoch"),
             "source_contract_digest": checkpoint["contract_digest"]}
 
@@ -2653,7 +2753,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         model = build_model(run)
         model.to(state.device)
         model_without_ddp = model
+        finetune_source = None
+        if args.finetune is not None:
+            finetune_source = _load_finetune(args.finetune, model=model, run=run)
+        # Copy before compile installs bound forward wrappers: deepcopy of those
+        # closures could leave the EMA mixer reading the ordinary model weights.
+        model_ema = build_model_ema(model_without_ddp, run)
         model = prepare_training_model(model, state, execution)
+        if model_ema is not None and state.enabled:
+            # DDP has now synchronized the differently seeded rank initializations.
+            model_ema.module.load_state_dict(model_without_ddp.state_dict(), strict=True)
 
         optimizer, resolved_optimizer = build_optimizer(
             model_without_ddp,
@@ -2664,11 +2773,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         criterion.to(state.device)
         start_epoch = 0
         best_acc1 = float("-inf")
-        finetune_source = None
-        if args.finetune is not None:
-            finetune_source = _load_finetune(args.finetune, model=model, run=run)
+        best_ema_acc1 = float("-inf") if model_ema is not None else None
         if args.resume is not None:
-            start_epoch, best_acc1 = _load_resume(
+            start_epoch, best_acc1, best_ema_acc1 = _load_resume(
                 args.resume,
                 model=model,
                 optimizer=optimizer,
@@ -2678,6 +2785,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 data_contract=data_contract,
                 state=state,
                 generators=generators,
+                model_ema=model_ema,
             )
 
         output = _prepare_output(
@@ -2720,20 +2828,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "augmentation_draws_per_update": batching_plan.effective_batch_size // batching_plan.augmentation_group_size}
                            if batching_plan.augmentation_group_size is not None else {}),
                         "optimizer": resolved_optimizer,
+                        "ema": model_ema is not None,
+                        "ema_decay": run.train.get("ema_decay") if model_ema is not None else None,
+                        "validation_weights": ["model", "model_ema"] if model_ema is not None else ["model"],
                         "world_size": state.world_size,
                     }
                 ),
                 flush=True,
             )
         if args.eval:
-            val_loss, val_acc1, val_acc5 = evaluate(model, val_loader, state=state)
+            validation = evaluate_models(model, val_loader, state=state, model_ema=model_ema)
             if state.is_main:
                 record = {
                     "event": "evaluation",
                     "checkpoint": str(args.resume),
-                    "val_loss": val_loss,
-                    "val_acc1": val_acc1,
-                    "val_acc5": val_acc5,
+                    **validation,
                 }
                 _append_jsonl(output / "metrics.jsonl", record)
                 print(json.dumps(record), flush=True)
@@ -2763,39 +2872,45 @@ def main(argv: Sequence[str] | None = None) -> None:
                 batching_plan=batching_plan,
                 print_freq=args.print_freq,
                 graph_step=graph_step,
+                model_ema=model_ema,
             )
-            val_loss, val_acc1, val_acc5 = evaluate(model, val_loader, state=state)
+            validation = evaluate_models(model, val_loader, state=state, model_ema=model_ema)
             record = {
                 "event": "epoch",
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "train_acc1": train_acc1,
                 "train_acc5": train_acc5,
-                "val_loss": val_loss,
-                "val_acc1": val_acc1,
-                "val_acc5": val_acc5,
+                **validation,
                 "lr": optimizer.param_groups[0]["lr"],
                 "seconds": time.perf_counter() - epoch_started,
             }
             is_best = False
+            is_best_ema = False
             if state.is_main:
-                is_best = val_acc1 > best_acc1
+                is_best = validation["val_acc1"] > best_acc1
                 if is_best:
-                    best_acc1 = val_acc1
+                    best_acc1 = validation["val_acc1"]
+                if best_ema_acc1 is not None:
+                    is_best_ema = validation["ema_val_acc1"] > best_ema_acc1
+                    if is_best_ema:
+                        best_ema_acc1 = validation["ema_val_acc1"]
             if state.enabled:
-                best_payload: list[Any] = [is_best, best_acc1]
+                best_payload: list[Any] = [is_best, best_acc1, is_best_ema, best_ema_acc1]
                 dist.broadcast_object_list(best_payload, src=0)
                 is_best = bool(best_payload[0])
                 best_acc1 = float(best_payload[1])
+                is_best_ema = bool(best_payload[2])
+                best_ema_acc1 = best_payload[3]
             save_last = (epoch + 1) % int(run.train["save_every"]) == 0
             rng_state = (
                 _capture_resume_rng_state(state, generators)
-                if save_last or is_best
+                if save_last or is_best or is_best_ema
                 else None
             )
             checkpoint_failure: str | None = None
             if state.is_main:
-                if save_last or is_best:
+                if save_last or is_best or is_best_ema:
                     try:
                         if rng_state is None:
                             raise RuntimeError("checkpoint RNG state was not collected")
@@ -2809,11 +2924,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                             data_contract=data_contract,
                             best_acc1=best_acc1,
                             rng=rng_state,
+                            model_ema=model_ema,
+                            best_ema_acc1=best_ema_acc1,
                         )
                         if save_last:
                             _atomic_torch_save(checkpoint, output / "checkpoint_last.pt")
                         if is_best:
                             _atomic_torch_save(checkpoint, output / "checkpoint_best.pt")
+                        if is_best_ema:
+                            _atomic_torch_save({**checkpoint, "selected_weights": "model_ema"},
+                                               output / "checkpoint_best_ema.pt")
                     except Exception as error:
                         checkpoint_failure = f"{type(error).__name__}: {error}"
             if state.enabled:
@@ -2824,11 +2944,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise RuntimeError(f"unable to save ImageNet checkpoint: {checkpoint_failure}")
             if state.is_main:
                 record["best_val_acc1"] = best_acc1
+                if best_ema_acc1 is not None:
+                    record["best_ema_val_acc1"] = best_ema_acc1
                 _append_jsonl(output / "metrics.jsonl", record)
                 print(json.dumps(record), flush=True)
             _barrier(state)
         if state.is_main:
-            print(json.dumps({"event": "complete", "best_val_acc1": best_acc1}), flush=True)
+            print(json.dumps({"event": "complete", "best_val_acc1": best_acc1,
+                              **({"best_ema_val_acc1": best_ema_acc1} if best_ema_acc1 is not None else {})}), flush=True)
     finally:
         if graph_step is not None:
             graph_step.close()

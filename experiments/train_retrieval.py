@@ -1,4 +1,4 @@
-"""Mean-pooled retrieval fine-tuning with Sentence Transformers cached MNR loss."""
+"""MemSolve-BERT mean-pooled retrieval fine-tuning with Sentence Transformers cached MNR loss."""
 from __future__ import annotations
 
 import argparse
@@ -93,7 +93,7 @@ def train(recipe, checkpoint, output, local_data=None, resume=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="experiments/configs/ridgon_bert_retrieval.json")
+    parser.add_argument("--config", default="experiments/configs/memsolve_bert_retrieval.json")
     parser.add_argument("--checkpoint", required=True, help="Exported MLM or Sentence Transformer directory")
     parser.add_argument("--output", required=True)
     parser.add_argument("--data", help="Optional HF save_to_disk triplet dataset")

@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler, TensorDatas
 import experiments.imagenet as imagenet
 from experiments.imagenet import (
     BatchingPlan,
-    DEFAULT_CONFIG,
+    VIT3_CONFIG,
     DistributedState,
     ImageNetRun,
     LoaderRandomGenerators,
@@ -50,7 +50,7 @@ def test_direct_imagenet_launcher_imports_repository_modules() -> None:
     try:
         namespace = runpy.run_path(
             str(root / "experiments" / "train_imagenet.py"),
-            run_name="ridgon_direct_launcher_test",
+            run_name="memsolve_direct_launcher_test",
         )
     finally:
         sys.path[:] = original_path
@@ -61,7 +61,7 @@ def _args(tmp_path: Path, *extra: str):
     return parse_args(
         [
             "--config",
-            str(DEFAULT_CONFIG),
+            str(VIT3_CONFIG),
             "--tier",
             "small",
             "--data-root",
@@ -254,7 +254,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "patch_size": 16,
         "num_classes": 1000,
         "mlp_ratio": 4.0,
-        "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+        "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
@@ -265,7 +265,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "rank": 32,
         "drop_path_rate": 0.1,
         "drop_path_schedule": "linear",
-        "position_encoding": "cpe",
+        "position_encoding": "rope_2d_axial",
     }
     assert (run.train["epochs"], run.train["optimizer"], run.train["augmentation"]) == (
         300,
@@ -280,7 +280,8 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
     ) == (512, 1024)
     assert (run.train["train_workers"], run.train["val_workers"]) == (12, 4)
     assert run.operator == {
-
+        "qk_conv_kernel_size": 3,
+        "output_gate_rank": 32,
         "bias": True,
         "implementation": "cuda",
     }
@@ -908,7 +909,8 @@ def test_gradient_accumulation_matches_one_effective_batch(
         phase="test",
         model={},
         operator={},
-        train={"bce_loss": False, "clip_grad": 0.1, "optimizer": "sgd"},
+        train={"bce_loss": False, "clip_grad": 0.1, "optimizer": "sgd",
+               "ema": True, "ema_decay": 0.99996},
         overrides=(),
     )
     batching_plan = BatchingPlan(
@@ -920,6 +922,14 @@ def test_gradient_accumulation_matches_one_effective_batch(
         updates_per_epoch=1,
     )
     monkeypatch.setattr(imagenet, "_autocast", lambda: nullcontext())
+    model_ema = imagenet.build_model_ema(model, run)
+    initial_weight = model.weight.detach().clone()
+    ema_updates = []
+    original_update = model_ema.update
+    def record_update(source):
+        ema_updates.append(1)
+        original_update(source)
+    monkeypatch.setattr(model_ema, "update", record_update)
     train_epoch(
         model,
         DataLoader(dataset, batch_size=2),
@@ -933,23 +943,27 @@ def test_gradient_accumulation_matches_one_effective_batch(
         run=run,
         batching_plan=batching_plan,
         print_freq=0,
+        model_ema=model_ema,
     )
     torch.testing.assert_close(model.weight, reference.weight)
     assert scheduler.updates == 1
+    assert len(ema_updates) == 1
+    torch.testing.assert_close(model_ema.module.weight,
+        initial_weight.lerp(model.weight.detach(), 1 - .99996), rtol=0, atol=0)
 
 
-def test_checkpoint_model_state_preserves_ridgon_contract_entries() -> None:
-    from ridgon import Ridgon, RidgonConfig
+def test_checkpoint_model_state_preserves_memsolve_contract_entries() -> None:
+    from memsolve import MemSolve, MemSolveConfig
 
-    source = Ridgon(RidgonConfig(16, 2, rank=4))
+    source = MemSolve(MemSolveConfig(16, 2, rank=4))
     restored = _checkpoint_model_state({"model": source.state_dict()})
     assert isinstance(restored["_extra_state"], dict)
 
-    target = Ridgon(RidgonConfig(16, 2, rank=4))
+    target = MemSolve(MemSolveConfig(16, 2, rank=4))
     target.load_state_dict(restored, strict=True)
     torch.testing.assert_close(target.core_delta, source.core_delta)
 
-    with pytest.raises(ValueError, match="Ridgon _extra_state"):
+    with pytest.raises(ValueError, match="MemSolve _extra_state"):
         _checkpoint_model_state({"model": {"unexpected": {}}})
 
 
@@ -973,6 +987,83 @@ def test_evaluate_preserves_weighted_metrics_across_batches(
     assert loss == pytest.approx(expected_loss)
     assert accuracy1 == 100.0
     assert accuracy5 == 100.0
+
+
+def test_dual_evaluation_uses_distinct_weights_and_one_data_pass(monkeypatch):
+    from types import SimpleNamespace
+    model = torch.nn.Linear(2, 2, bias=False)
+    shadow = copy.deepcopy(model)
+    with torch.no_grad():
+        model.weight.copy_(torch.eye(2))
+        shadow.weight.copy_(-torch.eye(2))
+    features = torch.tensor(((4., 0.), (0., 4.), (-4., 0.)))
+    targets = torch.tensor((0, 1, 1))
+    seen = []
+    def batches():
+        for start in (0, 2):
+            seen.append(start)
+            yield features[start:start+2], targets[start:start+2]
+    monkeypatch.setattr(imagenet, '_autocast', lambda: nullcontext())
+    results = imagenet.evaluate_models(model, batches(), state=_cpu_state(),
+                                       model_ema=SimpleNamespace(module=shadow))
+    assert seen == [0, 2]
+    assert results['val_acc1'] == 100. and results['ema_val_acc1'] == 0.
+    assert results['val_acc5'] == results['ema_val_acc5'] == 100.
+    for key, variant in [('val', model), ('ema_val', shadow)]:
+        assert results[f'{key}_loss'] == pytest.approx(
+            torch.nn.functional.cross_entropy(variant(features), targets).item())
+
+
+def test_main_selects_independent_raw_and_ema_best(tmp_path, monkeypatch):
+    state = _cpu_state()
+    output = tmp_path / 'run'
+    args = ['--tier', 'tiny', '--data-root', str(tmp_path), '--output', str(output),
+            '--epochs', '3', '--execution', 'eager']
+    run = load_run(parse_args(args))
+    plan = resolve_batching_plan(run, state, dataset_size=1_281_167, requested_grad_accum=None)
+    monkeypatch.setattr(imagenet, 'initialize_distributed', lambda: state)
+    monkeypatch.setattr(imagenet, 'prepare_operator_backend', lambda *args: None)
+    monkeypatch.setattr(imagenet, 'build_loaders', lambda *args, **kwargs:
+        ([], [], None, plan, _loader_generators(), _data_contract(source_views=3, group_size=256)))
+    monkeypatch.setattr(imagenet, 'build_model', lambda run: torch.nn.Linear(2, 2))
+    def prepare(model, *args):
+        # Simulate compile's bound forward closure. EMA must be copied before it.
+        original = model.forward
+        model.forward = lambda x: original(x)
+        return model
+    monkeypatch.setattr(imagenet, 'prepare_training_model', prepare)
+    monkeypatch.setattr(imagenet, 'build_optimizer', lambda model, run:
+        (torch.optim.SGD(model.parameters(), lr=.1), 'apex.lamb.fused'))
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda *args: 'test-cpu')
+    def train(model, *args, epoch, model_ema, **kwargs):
+        with torch.no_grad():
+            model.weight.fill_(epoch+1)
+            model_ema.module.weight.fill_(10*(epoch+1))
+        return 1., 50., 100.
+    def validate(model, *args, model_ema, **kwargs):
+        assert model_ema.module.forward.__self__ is model_ema.module
+        epoch = int(model.weight[0, 0].item()) - 1
+        assert model_ema.module.weight[0, 0].item() == 10*(epoch+1)
+        return {'val_acc1': [80., 79., 81.][epoch], 'val_loss': 1., 'val_acc5': 95.,
+                'ema_val_acc1': [75., 82., 80.][epoch], 'ema_val_loss': .9, 'ema_val_acc5': 96.}
+    monkeypatch.setattr(imagenet, 'train_epoch', train)
+    monkeypatch.setattr(imagenet, 'evaluate_models', validate)
+    imagenet.main(args)
+    raw = torch.load(output / 'checkpoint_best.pt', weights_only=False)
+    ema = torch.load(output / 'checkpoint_best_ema.pt', weights_only=False)
+    last = torch.load(output / 'checkpoint_last.pt', weights_only=False)
+    assert (raw['epoch'], ema['epoch'], last['epoch']) == (2, 1, 2)
+    assert raw['selected_weights'] == 'model' and ema['selected_weights'] == 'model_ema'
+    assert raw['model']['weight'][0, 0] == 3 and ema['model_ema']['weight'][0, 0] == 20
+    assert (last['best_acc1'], last['best_ema_acc1']) == (81., 82.)
+    records = [json.loads(line) for line in (output / 'metrics.jsonl').read_text().splitlines()]
+    assert records[-1]['best_val_acc1'] == 81. and records[-1]['best_ema_val_acc1'] == 82.
+    assert records[-1]['ema_val_acc1'] == 80.
+    # Eval-only reports both loaded weight sets, without stepping the optimizer.
+    imagenet.main([*args, '--resume', str(output / 'checkpoint_last.pt'), '--eval'])
+    record = json.loads((output / 'metrics.jsonl').read_text().splitlines()[-1])
+    assert record['event'] == 'evaluation'
+    assert record['val_acc1'] == 81. and record['ema_val_acc1'] == 80.
 
 
 def test_checkpoint_round_trip_has_no_ema(
@@ -1007,7 +1098,7 @@ def test_checkpoint_round_trip_has_no_ema(
     target_optimizer = torch.optim.SGD(target.parameters(), lr=0.1)
     target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=3)
     target_generators = _loader_generators(47)
-    start_epoch, best_acc1 = _load_resume(
+    start_epoch, best_acc1, best_ema_acc1 = _load_resume(
         path,
         model=target,
         optimizer=target_optimizer,
@@ -1019,6 +1110,7 @@ def test_checkpoint_round_trip_has_no_ema(
         generators=target_generators,
     )
     assert (start_epoch, best_acc1) == (5, 73.5)
+    assert best_ema_acc1 is None
     for source_parameter, target_parameter in zip(
         source.parameters(),
         target.parameters(),
@@ -1064,6 +1156,76 @@ def test_checkpoint_round_trip_has_no_ema(
             state=_cpu_state(),
             generators=target_generators,
         )
+
+
+def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
+    from integrations.timm import create_memsolve_vit
+
+    run = load_run(parse_args(['--tier', 'base', '--data-root', str(tmp_path),
+                              '--output', str(tmp_path / 'run')]))
+    assert run.train['ema'] is True and run.train['ema_decay'] == .99996
+    model = create_memsolve_vit(image_size=16, num_classes=2, embed_dim=32,
+        depth=1, num_heads=2, rank=16, mlp_ratio=4., bias=True)
+    initial = copy.deepcopy(model)
+    ema = imagenet.build_model_ema(model, run)
+    assert not ema.module.training
+    assert not any(p.requires_grad for p in ema.module.parameters())
+    assert not list(model.buffers())  # No running statistics to average.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(.125)
+    ema.update(model)
+    for shadow, before, current in zip(ema.module.parameters(), initial.parameters(), model.parameters()):
+        torch.testing.assert_close(shadow, before.detach().lerp(current.detach(), 1 - .99996),
+                                   rtol=0, atol=0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3)
+    state, generators = _cpu_state(), _loader_generators(23)
+    plan = resolve_batching_plan(run, state, dataset_size=1_281_167, requested_grad_accum=None)
+    data = _data_contract(source_views=3, group_size=256)
+    payload = _checkpoint(epoch=4, model=model, optimizer=optimizer, scheduler=scheduler,
+        run=run, batching_plan=plan, data_contract=data, best_acc1=73.5,
+        rng=_capture_resume_rng_state(state, generators), model_ema=ema, best_ema_acc1=72.0)
+    path = tmp_path / 'checkpoint.pt'
+    torch.save(payload, path)
+    target = copy.deepcopy(initial)
+    target_ema = imagenet.build_model_ema(target, run)
+    target_optimizer = torch.optim.SGD(target.parameters(), lr=.1)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=3)
+    kwargs = dict(model=target, optimizer=target_optimizer, scheduler=target_scheduler,
+        run=run, batching_plan=plan, data_contract=data, state=state,
+        generators=generators, model_ema=target_ema)
+    assert _load_resume(path, **kwargs) == (5, 73.5, 72.0)
+    for key, value in ema.module.state_dict().items():
+        restored = target_ema.module.state_dict()[key]
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(restored, value, rtol=0, atol=0)
+        else:
+            assert restored == value  # Non-tensor operator/architecture contracts.
+    for a, b in zip(target.parameters(), model.parameters()):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    # Finetuning starts EMA from the loaded ordinary weights, not the old shadow.
+    ft = load_run(parse_args(['--tier', 'base', '--phase', 'finetune', '--finetune', str(path),
+                             '--data-root', str(tmp_path), '--output', str(tmp_path / 'ft')]))
+    fresh = copy.deepcopy(initial)
+    imagenet._load_finetune(path, model=fresh, run=ft)
+    fresh_ema = imagenet.build_model_ema(fresh, ft)
+    for shadow, current in zip(fresh_ema.module.parameters(), model.parameters()):
+        torch.testing.assert_close(shadow, current, rtol=0, atol=0)
+    payload['selected_weights'] = 'model_ema'
+    torch.save(payload, path)
+    source = imagenet._load_finetune(path, model=fresh, run=ft)
+    assert source['source_weights'] == 'model_ema'
+    for loaded, shadow in zip(fresh.parameters(), ema.module.parameters()):
+        torch.testing.assert_close(loaded, shadow, rtol=0, atol=0)
+    # Resume always restores raw optimizer-owned weights, even from EMA best.
+    assert _load_resume(path, **kwargs) == (5, 73.5, 72.0)
+    for loaded, raw in zip(target.parameters(), model.parameters()):
+        torch.testing.assert_close(loaded, raw, rtol=0, atol=0)
+    del payload['model_ema']
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match='missing model_ema'):
+        _load_resume(path, **kwargs)
 
 
 def test_resume_rng_state_replays_python_numpy_torch_and_loader_generators() -> None:
@@ -1216,8 +1378,8 @@ def test_adamw_parameters_and_weight_decay_exclusions(tmp_path):
 
 
 def test_imagenet_optimizer_uses_plain_fused_adamw_with_delta_weight_decay(tmp_path):
-    from ridgon import Ridgon, RidgonConfig
-    model = Ridgon(RidgonConfig(16, 2, rank=4))
+    from memsolve import MemSolve, MemSolveConfig
+    model = MemSolve(MemSolveConfig(16, 2, rank=4))
     optimizer, _ = build_optimizer(model, load_run(_args(tmp_path)))
     assert type(optimizer) is torch.optim.AdamW
     assert optimizer.defaults["fused"] is True
@@ -1285,6 +1447,66 @@ def test_deit3_and_finetune_batching(tmp_path, recipe, epochs, decay, droppath):
     assert _recipe_fidelity(finetune, batching_plan=f, resolved_optimizer='torch.adamw.fused') == 'deit3-derived'
 
 
+@pytest.mark.parametrize('tier', ['tiny', 'small'])
+def test_default_ts_lamb_recipe_batches_augments_and_records_provenance(tmp_path, tier):
+    from PIL import Image
+    run = load_run(parse_args(['--tier', tier, '--data-root', str(tmp_path),
+                              '--output', str(tmp_path / tier)]))
+    plan = resolve_batching_plan(run, _cpu_state(world_size=2),
+                                dataset_size=1_281_167, requested_grad_accum=None)
+    assert run.config_path == imagenet.ROPEVIT_CONFIG
+    assert run.train['ema'] is True and run.train['ema_decay'] == .99996
+    assert (run.train['epochs'], run.train['lr'], run.train['weight_decay']) == (400, .004, .03)
+    assert run.model['drop_path_rate'] == 0 and run.model['drop_path_schedule'] == 'constant'
+    assert (plan.physical_batch_size, plan.effective_batch_size, plan.grad_accum) == (512, 2048, 2)
+    assert (plan.augmentation_group_size, plan.updates_per_epoch) == (256, 625)
+    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer='apex.lamb.fused') == 'ropevit-derived'
+    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer='torch.adamw.fused') == 'explicitly-modified'
+    transform = imagenet.build_train_transform(run)
+    assert transform(Image.new('RGB', (300, 280))).shape == (3, 224, 224)
+    mixup, loss = imagenet.build_mixup_and_loss(run)
+    _, targets = mixup(torch.zeros(256, 3, 4, 4), torch.arange(256))
+    assert (targets > 0).sum(1).max() <= 2  # No smoothing before membership BCE.
+    assert isinstance(loss, imagenet.DeiTBinaryCrossEntropy)
+    assert torch.isfinite(loss(torch.zeros(256, 1000), targets))
+    metadata = run.as_dict(plan, _data_contract(source_views=3, group_size=256))
+    assert metadata['official_ropevit_recipe'] == imagenet.OFFICIAL_ROPEVIT_URL
+    assert 'official_vit3_recipe' not in metadata and 'official_deit3_recipe' not in metadata
+    run.train['epochs'] = 30
+    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer='apex.lamb.fused') == 'explicitly-modified'
+
+
+@pytest.mark.parametrize('phase', ['pretrain', 'finetune'])
+def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_path, phase):
+    flags = ['--finetune', str(tmp_path / 'pretrain.pt')] if phase == 'finetune' else []
+    run = load_run(parse_args(['--tier', 'base', '--phase', phase, '--data-root', str(tmp_path),
+                              '--output', str(tmp_path / phase), *flags]))
+    plan = resolve_batching_plan(run, _cpu_state(world_size=2),
+                                dataset_size=1_281_167, requested_grad_accum=None)
+    assert run.config_path == imagenet.ROPEVIT_CONFIG
+    if phase == 'pretrain':
+        assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (192, 400, .003)
+        assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.1, .03)
+        assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (512, 2, 2048)
+        assert (plan.augmentation_group_size, plan.updates_per_epoch) == (256, 625)
+        assert run.train['bce_loss'] and run.train['label_smoothing'] == 0
+        assert run.train['repeated_aug'] and run.train['augmentation'] == 'three_augment'
+        optimizer = 'apex.lamb.fused'
+    else:
+        assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (224, 20, 1e-5)
+        assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.2, .1)
+        assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (256, 1, 512)
+        assert (plan.augmentation_group_size, plan.updates_per_epoch) == (64, 2502)
+        assert not run.train['bce_loss'] and run.train['label_smoothing'] == .1
+        assert not run.train['repeated_aug'] and run.train['augmentation'] == 'rand_augment'
+        assert 'drop_path_rate' not in run.train  # The phase override belongs to the model.
+        optimizer = 'torch.adamw.fused'
+    assert run.model['drop_path_schedule'] == 'constant'
+    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer=optimizer) == 'ropevit-derived'
+    run.model['drop_path_rate'] = .3
+    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer=optimizer) == 'explicitly-modified'
+
+
 def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tmp_path):
     run = load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIG), '--tier', 'base',
                               '--data-root', str(tmp_path), '--output', str(tmp_path / 'run')]))
@@ -1307,7 +1529,8 @@ def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tm
 
 
 @pytest.mark.cuda
-def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path):
+@pytest.mark.parametrize('tier,config', [('base', imagenet.DEIT3_CONFIG), ('small', imagenet.ROPEVIT_CONFIG)])
+def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path, tier, config):
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     pytest.importorskip('apex.optimizers')
@@ -1318,11 +1541,11 @@ def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path):
     actual.core_delta = torch.nn.Parameter(torch.zeros(2, 4, 4, device='cuda'))
     actual.linear = torch.nn.Linear(8, 16, device='cuda')
     reference = copy.deepcopy(actual)
-    run = load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIG), '--tier', 'base',
+    run = load_run(parse_args(['--config', str(config), '--tier', tier,
         '--data-root', str(tmp_path), '--output', str(tmp_path / 'out')]))
     optimizer, name = build_optimizer(actual, run)
-    expected = Lamb(param_groups_weight_decay(reference, weight_decay=.02),
-                    lr=.003, eps=1e-8, max_grad_norm=1., decoupled_decay=False)
+    expected = Lamb(param_groups_weight_decay(reference, weight_decay=run.train['weight_decay']),
+                    lr=run.train['lr'], eps=1e-8, max_grad_norm=1., decoupled_decay=False)
     assert name == 'apex.lamb.fused'
     for _ in range(3):
         for a, b in zip(actual.parameters(), reference.parameters()):

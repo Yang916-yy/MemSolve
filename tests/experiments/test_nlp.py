@@ -65,7 +65,7 @@ def test_fixed_mask_and_token_weighted_loss(tokenizer):
 
 def test_lion_recipe_schedule_and_decay_conversion():
     from transformers import get_scheduler
-    recipe = read_json(Path(__file__).resolve().parents[2] / "experiments/configs/ridgon_bert_mlm.json")
+    recipe = read_json(Path(__file__).resolve().parents[2] / "experiments/configs/memsolve_bert_mlm.json")
     settings = recipe["training"]
     peak = settings["learning_rate"]
     parameter = torch.nn.Parameter(torch.ones(1))
@@ -127,14 +127,17 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
               "save_steps": 1, "logging_steps": 1, "disable_tqdm": True, "seed": 17}
     recipe = {"model": {"vocab_size": len(tokenizer[0]), "hidden_size": 64,
               "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 128,
-              "max_position_embeddings": 32, "ridgon_rank": 16,
-              "ridgon_implementation": "reference"}, "global_batch_size": 8,
+              "max_position_embeddings": 32, "memsolve_rank": 16,
+              "memsolve_implementation": "reference"}, "global_batch_size": 8,
               "train_mask_probability": 0.3,
               "training": {**common, "remove_unused_columns": False,
                            "average_tokens_across_devices": True}}
     mlm = tmp_path / "mlm"
     metrics = train_mlm(recipe, prepared, mlm)
     assert np.isfinite(metrics["eval_masked_nll"])
+    exported = read_json(mlm / "final" / "config.json")
+    assert exported["model_type"] == "memsolve_bert"
+    assert exported["architectures"] == ["MemSolveBertForMaskedLM"]
     metrics = train_mlm(recipe, prepared, mlm, str(mlm / "checkpoint-1"))
     assert read_json(mlm / "trainer_state.json")["global_step"] == 2
     encoder = load_sentence_model(mlm / "final", 16, "reference", "cpu")
@@ -169,7 +172,7 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
     from mteb.abstasks import AbsTaskRetrieval
     class LocalRetrieval(AbsTaskRetrieval):
         metadata = mteb.get_task("LEMBNarrativeQARetrieval").metadata.model_copy(update={
-            "name": "RidgonLocalRetrievalFixture", "dataset": {"path": "local-fixture", "revision": "test"}})
+            "name": "MemSolveLocalRetrievalFixture", "dataset": {"path": "local-fixture", "revision": "test"}})
 
         def load_data(self, **kwargs):
             self.corpus = {"test": {key: {"text": text} for key, text in fixture["corpus"].items()}}
@@ -180,5 +183,5 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
     monkeypatch.setattr(evaluation, "select_tasks", lambda *args: [LocalRetrieval()])
     result = evaluation.evaluate(str(retrieval / "final"), tmp_path / "mteb", max_length=16,
              implementation="reference", device="cpu", bf16=False)
-    assert list((result / "cache").rglob("RidgonLocalRetrievalFixture.json"))
+    assert list((result / "cache").rglob("MemSolveLocalRetrievalFixture.json"))
     assert (result / "evaluation.json").is_file()

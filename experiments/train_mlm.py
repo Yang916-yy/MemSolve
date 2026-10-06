@@ -1,4 +1,4 @@
-"""C4 MLM training with HF Trainer, DDP, AMP, token-weighted loss and resume."""
+"""MemSolve-BERT C4 MLM training with HF Trainer, DDP, AMP, token-weighted loss and resume."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ from pathlib import Path
 
 from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
 
-from integrations.transformers import RidgonBertConfig, RidgonBertForMaskedLM
+from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
 from experiments.nlp import (MLMCollator, accumulation_steps, check_training_precision,
     load_prepared, masked_loss, masked_metrics, masked_statistics, read_json,
     record_run, tokenizer_digest, versions)
@@ -18,7 +18,7 @@ def train(recipe, data_root, output, resume=None):
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
     if tokenizer_digest(tokenizer) != manifests["train"][0]["tokenizer_hash"]:
         raise ValueError("Saved tokenizer does not match data preparation")
-    config = RidgonBertConfig(**recipe["model"])
+    config = MemSolveBertConfig(**recipe["model"])
     if len(tokenizer) != config.vocab_size or tokenizer.pad_token_id != config.pad_token_id:
         raise ValueError("Tokenizer vocabulary/PAD id and model configuration differ")
     if manifests["train"][0]["max_length"] > config.max_position_embeddings:
@@ -27,10 +27,10 @@ def train(recipe, data_root, output, resume=None):
     settings["gradient_accumulation_steps"] = accumulation_steps(
         recipe["global_batch_size"], settings["per_device_train_batch_size"],
         int(os.environ.get("WORLD_SIZE", "1")))
-    check_training_precision(settings, config.ridgon_implementation)
+    check_training_precision(settings, config.memsolve_implementation)
     args = TrainingArguments(output_dir=str(output), **settings)
     set_seed(args.seed)
-    model = RidgonBertForMaskedLM(config)
+    model = MemSolveBertForMaskedLM(config)
     record_run(output, {"experiment": {"kind": "mlm", "recipe": recipe,
                "data": manifests, "world_size": args.world_size,
                "dataloader_drop_last": args.dataloader_drop_last,
@@ -52,7 +52,7 @@ def train(recipe, data_root, output, resume=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="experiments/configs/ridgon_bert_mlm.json")
+    parser.add_argument("--config", default="experiments/configs/memsolve_bert_mlm.json")
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--resume", help="Explicit checkpoint-N directory in this run")

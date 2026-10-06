@@ -1,7 +1,7 @@
 """Shared PyTorch sequence runner for GenomicBenchmarks and Long Range Arena.
 
-The runner intentionally owns no Ridgon mathematics.  It uses the public
-``Ridgon`` module for the current operator and a matched PyTorch MHA block for
+The runner intentionally owns no MemSolve mathematics.  It uses the public
+``MemSolve`` module for the current operator and a matched PyTorch MHA block for
 baselines, while data/tokenization contracts live in ``sequence_data.py``.
 """
 
@@ -30,8 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ridgon import Ridgon, RidgonConfig
-from ridgon.ball import cuda as cuda_backend
+from memsolve import MemSolve, MemSolveConfig
+from memsolve.ball import cuda as cuda_backend
 
 from experiments.sequence_data import (
     DatasetBundle,
@@ -129,7 +129,7 @@ FROZEN_DNA_MIXERS = frozenset({"nystromformer", "rebased"})
 MixerName = Literal[
     "mha",
     "mha_rope",
-    "ridgon",
+    "memsolve",
     "linear_transformer",
     "performer",
     "nystromformer",
@@ -139,7 +139,7 @@ MixerName = Literal[
 
 
 class MaskedMultiheadAttention(nn.Module):
-    """Bidirectional MHA baseline with the same valid-token contract as Ridgon."""
+    """Bidirectional MHA baseline with the same valid-token contract as MemSolve."""
 
     def __init__(self, dim: int, num_heads: int, *, bias: bool, rope: bool = False) -> None:
         super().__init__()
@@ -527,18 +527,22 @@ class SequenceBlock(nn.Module):
         mlp_ratio: float,
         dropout: float,
         bias: bool,
+        qk_conv_kernel_size: int = 3,
+        output_gate_rank: int = 32,
     ) -> None:
         super().__init__()
         self.mixer_kind = mixer
         self.implementation = implementation
         self.norm1 = nn.LayerNorm(dim)
-        if mixer == "ridgon":
-            self.mixer: nn.Module = Ridgon(
-                RidgonConfig(
+        if mixer == "memsolve":
+            self.mixer: nn.Module = MemSolve(
+                MemSolveConfig(
                     dim=dim,
                     num_heads=num_heads,
                     rank=rank,
                     bias=bias,
+                    qk_conv_kernel_size=qk_conv_kernel_size,
+                    output_gate_rank=output_gate_rank,
                 )
             )
         elif mixer in ("mha", "mha_rope"):
@@ -569,11 +573,11 @@ class SequenceBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         normalized = self.norm1(x)
-        if self.mixer_kind == "ridgon":
+        if self.mixer_kind == "memsolve":
             if normalized.device.type == "cuda" and torch.is_autocast_enabled():
                 amp_dtype = torch.get_autocast_dtype("cuda")
                 if self.implementation == "cuda" and amp_dtype not in (torch.float16, torch.bfloat16):
-                    raise TypeError("the CUDA Ridgon sequence path supports FP16 or BF16 AMP")
+                    raise TypeError("the CUDA MemSolve sequence path supports FP16 or BF16 AMP")
                 normalized = normalized.to(dtype=amp_dtype)
             mixed = self.mixer(  # type: ignore[operator]
                 normalized,
@@ -591,7 +595,7 @@ class SequenceBlock(nn.Module):
 class SequenceEncoder(nn.Module):
     """Learned absolute coordinate features plus current mixer blocks.
 
-    Learned position embeddings are shared by MHA and Ridgon. Ridgon itself
+    Learned position embeddings are shared by MHA and MemSolve. MemSolve itself
     has no position-dependent feature rotation.
     """
 
@@ -612,6 +616,8 @@ class SequenceEncoder(nn.Module):
         dropout: float,
         bias: bool,
         grid_shape: tuple[int, int] | None = None,
+        qk_conv_kernel_size: int = 3,
+        output_gate_rank: int = 32,
     ) -> None:
         super().__init__()
         if max_length <= 0:
@@ -620,7 +626,7 @@ class SequenceEncoder(nn.Module):
             raise ValueError("depth must be positive")
         self.input_kind = input_kind
         self.max_length = max_length
-        self._cuda_ridgon = mixer == "ridgon" and implementation == "cuda"
+        self._cuda_memsolve = mixer == "memsolve" and implementation == "cuda"
         if input_kind == "tokens":
             if vocab_size is None or pad_token_id is None:
                 raise ValueError("token models require vocab_size and pad_token_id")
@@ -658,6 +664,8 @@ class SequenceEncoder(nn.Module):
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 bias=bias,
+                qk_conv_kernel_size=qk_conv_kernel_size,
+                output_gate_rank=output_gate_rank,
             )
             for _ in range(depth)
         )
@@ -702,8 +710,8 @@ class SequenceEncoder(nn.Module):
         )[None]
         if inputs.device.type == "cuda" and torch.is_autocast_enabled():
             amp_dtype = torch.get_autocast_dtype("cuda")
-            if self._cuda_ridgon and amp_dtype not in (torch.float16, torch.bfloat16):
-                raise TypeError("the CUDA Ridgon sequence path supports FP16 or BF16 AMP")
+            if self._cuda_memsolve and amp_dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("the CUDA MemSolve sequence path supports FP16 or BF16 AMP")
             x = x.to(dtype=amp_dtype)
         x = self.embedding_dropout(x)
         x = torch.where(valid_mask[:, :, None], x, torch.zeros_like(x))
@@ -874,19 +882,21 @@ def _make_parser() -> argparse.ArgumentParser:
         choices=(
             "mha",
             "mha_rope",
-            "ridgon",
+            "memsolve",
             "linear_transformer",
             "performer",
             "nystromformer",
             "cosformer",
             "rebased",
         ),
-        default="ridgon",
+        default="memsolve",
     )
     parser.add_argument("--implementation", choices=("reference", "cuda"), default="cuda")
 
 
     parser.add_argument("--rank", type=int)
+    parser.add_argument("--qk-conv-kernel-size", type=int, default=3)
+    parser.add_argument("--output-gate-rank", type=int, default=32)
     parser.add_argument("--dim", type=int)
     parser.add_argument("--depth", type=int)
     parser.add_argument("--heads", type=int)
@@ -1100,9 +1110,9 @@ def _validate_resolved_args(args: argparse.Namespace) -> None:
         raise ValueError("early_stop_accuracy_delta must be non-negative")
     if not 0.0 <= args.early_stop_loss_relative_delta < 1.0:
         raise ValueError("early_stop_loss_relative_delta must be in [0, 1)")
-    if args.implementation == "cuda" and args.mixer == "ridgon":
+    if args.implementation == "cuda" and args.mixer == "memsolve":
         if args.rank not in (16, 32, 48, 64):
-            raise ValueError("CUDA supports Ridgon rank in {16, 32, 48, 64}")
+            raise ValueError("CUDA supports MemSolve rank in {16, 32, 48, 64}")
 
 
 def _validate_formal_data_source(args: argparse.Namespace) -> None:
@@ -1165,6 +1175,8 @@ def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
         dropout=args.dropout,
         bias=args.bias,
         grid_shape=grid_shape,
+        qk_conv_kernel_size=args.qk_conv_kernel_size,
+        output_gate_rank=args.output_gate_rank,
     )
     if bundle.paired:
         if args.pooling != "mean":
@@ -1281,7 +1293,7 @@ def _runtime_metadata(device: torch.device, *, cuda_enabled: bool) -> dict[str, 
             }
         )
     if cuda_enabled:
-        metadata["ridgon_cuda_contract"] = cuda_backend._CUDA_CONTRACT_VERSION
+        metadata["memsolve_cuda_contract"] = cuda_backend._CUDA_CONTRACT_VERSION
     return metadata
 
 
@@ -1444,7 +1456,7 @@ def _build_run_payload(
             "pooling": args.pooling,
             "implementation": (
                 args.implementation
-                if args.mixer == "ridgon"
+                if args.mixer == "memsolve"
                 else {
                     "mha": "torch-sdpa",
                     "mha_rope": "torch-sdpa-roformer-qk-adjacent-pairs-base10000",
@@ -1735,9 +1747,9 @@ def main(argv: list[str] | None = None) -> None:
     args = resolve_args(parse_args(argv))
     _seed_all(args.seed)
     device = _choose_device(args.device)
-    if args.mixer == "ridgon" and args.implementation == "cuda":
+    if args.mixer == "memsolve" and args.implementation == "cuda":
         if device.type != "cuda":
-            raise RuntimeError("Ridgon CUDA implementation requires a CUDA device")
+            raise RuntimeError("MemSolve CUDA implementation requires a CUDA device")
         cuda_backend.load(device=device)
     if args.formal:
         revision = _source_revision()
@@ -1757,7 +1769,7 @@ def main(argv: list[str] | None = None) -> None:
         sizes,
         model,
         device,
-        cuda_enabled=args.mixer == "ridgon" and args.implementation == "cuda",
+        cuda_enabled=args.mixer == "memsolve" and args.implementation == "cuda",
     )
     if args.prepare_only:
         print(json.dumps(run_payload, indent=2, sort_keys=True, default=str), flush=True)

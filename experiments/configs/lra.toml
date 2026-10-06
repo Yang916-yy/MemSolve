@@ -5,5 +5,5 @@ data_root = "data/lra"
 cache_root = "data/sequence_cache"
 
 [model]
-mixer = "ridgon"
+mixer = "memsolve"
 implementation = "cuda"

@@ -1,7 +1,7 @@
 """ADE20K UperNet 160k downstream protocol.
 
 This is the current MMSegmentation 1.x expression of the DeiT III paper and
-public XCiT UperNet downstream recipe.  The Ridgon leaf configs only choose the
+public XCiT UperNet downstream recipe.  The MemSolve leaf configs only choose the
 DeiT III scale, rank, and decoder width.
 """
 
@@ -12,7 +12,7 @@ crop_size = (512, 512)
 norm_cfg = dict(type="SyncBN", requires_grad=True)
 
 model = dict(
-    type="RidgonEncoderDecoder",
+    type="MemSolveEncoderDecoder",
     data_preprocessor=dict(
         type="SegDataPreProcessor",
         mean=[123.675, 116.28, 103.53],
@@ -23,7 +23,7 @@ model = dict(
         seg_pad_val=255,
     ),
     backbone=dict(
-        type="RidgonViTBackbone",
+        type="MemSolveViTBackbone",
     ),
     decode_head=dict(
         type="UPerHead",

@@ -1,13 +1,13 @@
 # Plain ViT³ training, official commit e3477587d099e6b9e83e9e7c80b1b999e0989a20.
 # Selected global batch 1024 / LR .001, following upstream linear LR scaling.
-# The Ridgon backbone is retained; ranks are Ridgon choices, not ViT³ parameters.
+# The MemSolve backbone is retained; ranks are MemSolve choices, not ViT³ parameters.
 # Mixup/CutMix operates on each complete physical per-GPU batch.
 [defaults]
 num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
 norm_eps = 1.0e-6
-position_encoding = "cpe"
+position_encoding = "rope_2d_axial"
 epochs = 300
 warmup_epochs = 20
 warmup_lr = 1.0e-6
@@ -40,6 +40,8 @@ bce_loss = false
 label_smoothing = 0.1
 
 [operator]
+qk_conv_kernel_size = 3
+output_gate_rank = 32
 bias = true
 implementation = "cuda"
 
@@ -53,7 +55,7 @@ drop_path_rate = 0.0
 input_size = 224
 
 [tiers.small]
-# SwiGLU gate width 1024 (packed input projection 2048): 20,327,272 parameters with head.
+# SwiGLU gate width 1024 (packed input projection 2048): 20,622,184 parameters with head.
 # Inherits mlp_ratio=4.0: gate width = (8/3) * embed_dim.
 embed_dim = 384
 depth = 12

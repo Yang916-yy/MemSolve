@@ -1,4 +1,4 @@
-"""COCO 2017 Mask R-CNN + FPN 3x, Ridgon DeiT III Small."""
+"""COCO 2017 Mask R-CNN + FPN 3x, MemSolve DeiT III Small."""
 
 _base_ = "./_base_/coco_mask_rcnn_fpn_3x.py"
 
@@ -9,7 +9,7 @@ custom_imports = dict(
 
 model = dict(
     backbone=dict(
-        type="RidgonViTBackbone",
+        type="MemSolveViTBackbone",
         variant="small",
         rank=32,
         out_indices=(3, 5, 7, 11),

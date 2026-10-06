@@ -1,6 +1,6 @@
-"""ADE20K UperNet 160k, Ridgon DeiT III Large."""
+"""COCO 2017 Mask R-CNN + FPN 3x, MemSolve DeiT III Large."""
 
-_base_ = "./_base_/ade20k_upernet_160k.py"
+_base_ = "./_base_/coco_mask_rcnn_fpn_3x.py"
 
 custom_imports = dict(
     imports=["integrations.openmmlab"],
@@ -9,12 +9,11 @@ custom_imports = dict(
 
 model = dict(
     backbone=dict(
-        type="RidgonViTBackbone",
+        type="MemSolveViTBackbone",
         variant="large",
         rank=64,
         out_indices=(7, 11, 15, 23),
         implementation="cuda",
     ),
-    decode_head=dict(in_channels=[1024, 1024, 1024, 1024], channels=512),
-    auxiliary_head=dict(in_channels=1024),
+    neck=dict(in_channels=[1024, 1024, 1024, 1024]),
 )

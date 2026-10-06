@@ -1,4 +1,4 @@
-"""Short Food-101 training using the shared Ridgon vision adapter.
+"""Short Food-101 training using the shared MemSolve vision adapter.
 
 Train on the official training split; report the official test curve and the
 fixed final epoch, without test-based checkpoint selection or early stopping.
@@ -25,13 +25,13 @@ from experiments.imagenet import (
     IMAGENET_MEAN, IMAGENET_STD, _append_jsonl, _atomic_json,
     _atomic_torch_save, _no_weight_decay,
 )
-from integrations.timm import RidgonViT
+from integrations.timm import MemSolveViT
 
 
 def build_model(*, seed: int = 0, implementation: str = "reference") -> nn.Module:
     torch.manual_seed(seed)
-    # Same no-CLS, no-LayerScale CPE scaffold as ImageNet.
-    return RidgonViT(
+    # Same Q/K convolution + 2D RoPE scaffold as ImageNet, no CLS or LayerScale.
+    return MemSolveViT(
         image_size=224, patch_size=16, num_classes=101,
         embed_dim=384, depth=12, num_heads=6, rank=32,
         implementation=implementation, drop_path_rate=0.1, mlp_ratio=4.0,
@@ -117,7 +117,7 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     if args.implementation == "cuda":
-        from ridgon.ball import cuda
+        from memsolve.ball import cuda
         cuda.load()
     model = build_model(seed=args.seed, implementation=args.implementation).cuda()
     # Reset stochastic-depth RNG identically after model construction.
@@ -135,8 +135,8 @@ def main() -> None:
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     contract = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "resume"}
-    contract.update(ffn="swiglu", gate_width=1024, architecture="Ridgon-S/16", dim=384, depth=12, heads=6, rank=32,
-                    position_encoding="residual-cpe-3x3-token-ln-mean-no-cls",
+    contract.update(ffn="swiglu", gate_width=1024, architecture="MemSolve-S/16", dim=384, depth=12, heads=6, rank=32,
+                    position_encoding="qk-dwconv-3x3-rope2d-axial-theta100-token-ln-mean-no-cls",
                     precision="bf16-autocast-fp32-core", implementation=args.implementation,
                     pretrained=False, weight_decay=0.05, label_smoothing=0.1,
                     warmup_epochs=min(3, args.epochs), evaluation="official-test-curve-fixed-final-epoch",

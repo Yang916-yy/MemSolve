@@ -1,6 +1,6 @@
 # DeiT III ImageNet-1K 400-epoch recipe, paper tables 1, 6, 13.
 # https://arxiv.org/abs/2204.07118
-# Local adaptations: Ridgon/SwiGLU/CPE/mean backbone, BF16, no EMA,
+# Local adaptations: MemSolve/SwiGLU/QK-conv/RoPE/mean backbone, BF16, no EMA,
 # streaming WebDataset, physical batch 512 per GPU with accumulation 2.
 [defaults]
 recipe = "deit3_400"
@@ -8,7 +8,7 @@ num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
 norm_eps = 1.0e-6
-position_encoding = "cpe"
+position_encoding = "rope_2d_axial"
 drop_path_schedule = "constant"
 epochs = 400
 warmup_epochs = 5
@@ -43,6 +43,8 @@ bce_loss = true
 label_smoothing = 0.0
 
 [operator]
+qk_conv_kernel_size = 3
+output_gate_rank = 32
 bias = true
 implementation = "cuda"
 

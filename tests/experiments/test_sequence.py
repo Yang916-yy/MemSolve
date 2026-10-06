@@ -46,7 +46,7 @@ from experiments.train_transformers import (
     train,
 )
 from experiments.sequence_data import make_loader
-from ridgon.ball import cuda
+from memsolve.ball import cuda
 
 
 pytestmark = pytest.mark.experiment
@@ -222,7 +222,7 @@ def test_pathx_full_length_reference_forward_and_backward_are_finite() -> None:
         depth=1,
         num_heads=2,
         rank=4,
-        mixer="ridgon",
+        mixer="memsolve",
         implementation="reference",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -249,7 +249,7 @@ def test_byte_vocabulary_preserves_utf8_bytes_and_eos() -> None:
 
 def test_cuda_runtime_metadata_records_the_current_native_contract() -> None:
     metadata = _runtime_metadata(torch.device("cpu"), cuda_enabled=True)
-    assert metadata["ridgon_cuda_contract"] == cuda._CUDA_CONTRACT_VERSION
+    assert metadata["memsolve_cuda_contract"] == cuda._CUDA_CONTRACT_VERSION
 
 
 def test_nucleotide_tokenizer_does_not_confuse_unknown_with_padding() -> None:
@@ -290,7 +290,7 @@ def test_collate_uses_lengths_not_the_token_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "mixer", ("mha", "ridgon", "linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
+    "mixer", ("mha", "memsolve", "linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
 )
 @pytest.mark.parametrize("pooling", ("mean", "meanmax"))
 def test_sequence_classifier_masks_padding_for_both_mixers(
@@ -304,7 +304,7 @@ def test_sequence_classifier_masks_padding_for_both_mixers(
     torch.testing.assert_close(model(first, mask), model(second, mask), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mixer", ("mha", "ridgon"))
+@pytest.mark.parametrize("mixer", ("mha", "memsolve"))
 def test_factorized_grid_positions_mask_invalid_pixels_for_both_mixers(mixer: str) -> None:
     torch.manual_seed(17)
     model = SequenceClassifier(_grid_encoder(mixer), 3, pooling="meanmax").eval()  # type: ignore[arg-type]
@@ -761,7 +761,7 @@ def test_dna_baseline_metadata_records_implementation(mixer: str, implementation
     )
     assert payload["model"]["mixer"] == mixer
     assert payload["model"]["implementation"] == implementation
-    assert "ridgon_cuda_contract" not in payload["runtime"]
+    assert "memsolve_cuda_contract" not in payload["runtime"]
 
 
 def test_meanmax_readout_handles_an_empty_valid_set() -> None:
@@ -782,7 +782,7 @@ def test_mean_readout_keeps_the_existing_parameterization() -> None:
 
 
 def test_pair_classifier_accepts_independent_lengths() -> None:
-    model = SequencePairClassifier(_encoder("ridgon"), 2).eval()
+    model = SequencePairClassifier(_encoder("memsolve"), 2).eval()
     first = torch.tensor([[2, 3, 0], [4, 0, 0]])
     second = torch.tensor([[7, 6, 5], [3, 2, 0]])
     first_mask = first.ne(0)
@@ -833,7 +833,7 @@ def test_mha_baseline_accepts_fp16_autocast_with_padding() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_ridgon_meanmax_readout_is_finite_with_masked_values() -> None:
+def test_cuda_memsolve_meanmax_readout_is_finite_with_masked_values() -> None:
     cuda.load()
     encoder = SequenceEncoder(
         input_kind="values",
@@ -844,7 +844,7 @@ def test_cuda_ridgon_meanmax_readout_is_finite_with_masked_values() -> None:
         depth=1,
         num_heads=2,
         rank=16,
-        mixer="ridgon",
+        mixer="memsolve",
         implementation="cuda",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -870,7 +870,7 @@ def test_cuda_ridgon_meanmax_readout_is_finite_with_masked_values() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_ridgon_sequence_path_receives_fp16_amp_activations() -> None:
+def test_cuda_memsolve_sequence_path_receives_fp16_amp_activations() -> None:
     cuda.load()
     encoder = SequenceEncoder(
         input_kind="tokens",
@@ -881,7 +881,7 @@ def test_cuda_ridgon_sequence_path_receives_fp16_amp_activations() -> None:
         depth=1,
         num_heads=2,
         rank=16,
-        mixer="ridgon",
+        mixer="memsolve",
         implementation="cuda",
         mlp_ratio=2.0,
         dropout=0.0,
@@ -901,7 +901,7 @@ def test_cuda_ridgon_sequence_path_receives_fp16_amp_activations() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_ridgon_sequence_path_accepts_bf16_amp() -> None:
+def test_cuda_memsolve_sequence_path_accepts_bf16_amp() -> None:
     cuda.load()
     encoder = SequenceEncoder(
         input_kind="tokens",
@@ -912,7 +912,7 @@ def test_cuda_ridgon_sequence_path_accepts_bf16_amp() -> None:
         depth=1,
         num_heads=2,
         rank=16,
-        mixer="ridgon",
+        mixer="memsolve",
         implementation="cuda",
         mlp_ratio=2.0,
         dropout=0.0,

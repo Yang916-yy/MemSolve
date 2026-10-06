@@ -7,7 +7,7 @@ split_seed = 2026
 validation_fraction = 0.1
 
 [model]
-mixer = "ridgon"
+mixer = "memsolve"
 implementation = "cuda"
 dim = 128
 depth = 4

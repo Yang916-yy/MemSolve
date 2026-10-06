@@ -1,4 +1,4 @@
-"""ADE20K UperNet 160k, Ridgon DeiT III Base."""
+"""ADE20K UperNet 160k, MemSolve DeiT III Base."""
 
 _base_ = "./_base_/ade20k_upernet_160k.py"
 
@@ -9,7 +9,7 @@ custom_imports = dict(
 
 model = dict(
     backbone=dict(
-        type="RidgonViTBackbone",
+        type="MemSolveViTBackbone",
         variant="base",
         rank=48,
         out_indices=(3, 5, 7, 11),

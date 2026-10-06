@@ -1,20 +1,21 @@
-# DeiT III ImageNet-1K 800-epoch Base recipe, official README_revenge commands.
-# https://github.com/facebookresearch/deit/blob/main/README_revenge.md
-# Local adaptations: MemSolve/SwiGLU/QK-conv/RoPE/mean backbone, BF16, no EMA,
-# local indexed WebDataset, virtual augmentation groups and accumulation 2.
+# MemSolve-ViT-T/S/B: RoPE-ViT's 400-epoch training recipes.
+# https://github.com/naver-ai/rope-vit/blob/main/deit/README.md
+# Official effective batches, learning rates and EMA. Local adaptations: BF16,
+# update-based cosine schedule and indexed WebDataset with virtual RA groups.
+# Tiny borrows the Small recipe; upstream does not list a Tiny training command.
 [defaults]
-recipe = "deit3_800"
+recipe = "ropevit_400"
 num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
 norm_eps = 1.0e-6
 position_encoding = "rope_2d_axial"
 drop_path_schedule = "constant"
-epochs = 800
+epochs = 400
 warmup_epochs = 5
 warmup_lr = 1.0e-6
 min_lr = 1.0e-5
-weight_decay = 0.05
+weight_decay = 0.03
 clip_grad = 1.0
 seed = 0
 train_workers = 12
@@ -26,14 +27,16 @@ cutmix = 1.0
 mixup_prob = 1.0
 mixup_switch_prob = 0.5
 mixup_mode = "batch"
-ema = false
+ema = true
+ema_decay = 0.99996
 amp_dtype = "bfloat16"
 execution = "compile-graph"
 save_every = 1
 batch_size = 512
 effective_batch = 2048
+# Eight independent Mixup/CutMix draws per update with the existing RA schedule.
 augmentation_group_size = 256
-lr = 0.003
+lr = 0.004
 optimizer = "fused_lamb"
 augmentation = "three_augment"
 color_jitter = 0.3
@@ -48,19 +51,38 @@ output_gate_rank = 32
 bias = true
 implementation = "cuda"
 
+[tiers.tiny]
+embed_dim = 192
+depth = 12
+num_heads = 6
+rank = 16
+drop_path_rate = 0.0
+[tiers.tiny.pretrain]
+input_size = 224
+
+[tiers.small]
+embed_dim = 384
+depth = 12
+num_heads = 6
+rank = 32
+drop_path_rate = 0.0
+[tiers.small.pretrain]
+input_size = 224
+
 [tiers.base]
 embed_dim = 768
 depth = 12
 num_heads = 12
 rank = 48
-drop_path_rate = 0.2
-
+drop_path_rate = 0.1
 [tiers.base.pretrain]
 input_size = 192
+lr = 0.003
 
 [tiers.base.finetune]
 input_size = 224
 epochs = 20
+drop_path_rate = 0.2
 batch_size = 256
 effective_batch = 512
 augmentation_group_size = 64
@@ -71,7 +93,7 @@ weight_decay = 0.1
 clip_grad = 0.0
 augmentation = "rand_augment"
 auto_augment = "rand-m9-mstd0.5-inc1"
-color_jitter = 0.0
+color_jitter = 0.3
 repeated_aug = false
 bce_loss = false
 label_smoothing = 0.1

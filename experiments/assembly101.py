@@ -1,4 +1,4 @@
-"""Assembly101 data audit, stage-1 Ridgon training and LTContext evaluation.
+"""Assembly101 data audit, stage-1 MemSolve training and LTContext evaluation.
 
 The external LTContext checkout owns data alignment and metric definitions.
 No upstream code or operator mathematics is copied into this module.
@@ -24,23 +24,23 @@ from functools import partial
 import numpy as np
 import torch
 
-from ridgon import Ridgon, RidgonConfig
+from memsolve import MemSolve, MemSolveConfig
 
 LTC_REVISION = 'ac74722b00b52b7eb9eb3d6fa8600c762e6f369b'
 METRICS = ('MoF', 'Edit', 'F1@10', 'F1@25', 'F1@50')
 
 
-class Stage1Ridgon(torch.nn.Module):
-    """Adapt LTContext's channel-first self-attention interface to public Ridgon."""
+class Stage1MemSolve(torch.nn.Module):
+    """Adapt LTContext's channel-first self-attention interface to public MemSolve."""
 
     def __init__(self, dim: int, rank: int, implementation: str = 'cuda'):
         super().__init__()
-        self.mixer = Ridgon(RidgonConfig(dim=dim, num_heads=1, rank=rank, bias=True))
+        self.mixer = MemSolve(MemSolveConfig(dim=dim, num_heads=1, rank=rank, bias=True))
         self.implementation = implementation
 
     def forward(self, qk, v=None, masks=None):
         if v is not None:
-            raise ValueError('Stage1Ridgon replaces stage-1 self-attention only')
+            raise ValueError('Stage1MemSolve replaces stage-1 self-attention only')
         valid = None if masks is None else masks[:, 0, :]
         inputs = qk.transpose(1, 2).contiguous()
         # Native activations are BF16; upstream layers and all parameters stay FP32.
@@ -85,7 +85,7 @@ def replace_stage1(model, rank: int, implementation: str = 'cuda'):
     """Replace only the nine stage-1 long-range branches, in place."""
     for layer in model.stage1.layers:
         dim = layer.out_linear.in_channels
-        layer.ltc_attn = Stage1Ridgon(dim, rank, implementation)
+        layer.ltc_attn = Stage1MemSolve(dim, rank, implementation)
     return model
 
 
@@ -155,7 +155,7 @@ class BucketExecution:
             torch._dynamo.config.accumulated_recompile_limit = max(
                 torch._dynamo.config.accumulated_recompile_limit, 1024)
             # Fuse convolution/GELU/masking while retaining the efficient eager
-            # implementations of overlapping-window attention and native Ridgon.
+            # implementations of overlapping-window attention and native MemSolve.
             # Compiling whole attention blocks increased compile time and did
             # not consistently improve replay throughput on the target GPU.
             for stage in (model.stage1, *model.stages):
@@ -196,7 +196,7 @@ def write_json(path: Path, value):
 
 def local_lock(path: Path):
     """Coordinate this host without depending on the NFS lock manager."""
-    directory = Path(tempfile.gettempdir()) / 'ridgon-assembly101-locks'
+    directory = Path(tempfile.gettempdir()) / 'memsolve-assembly101-locks'
     directory.mkdir(exist_ok=True)
     name = hashlib.sha256(str(path.resolve()).encode()).hexdigest()
     return (directory / name).open('w')
@@ -495,7 +495,7 @@ def train(args):
     from ltc.model.optimizer import construct_optimizer, construct_lr_scheduler
     from ltc.dataset.utils import sequence_collate
     from torch.utils.data import DataLoader, RandomSampler, Subset
-    from ridgon.ball import cuda as cuda_backend
+    from memsolve.ball import cuda as cuda_backend
 
     args.output.mkdir(parents=True, exist_ok=True)
     lock = local_lock(args.output / 'run.lock')
@@ -540,12 +540,12 @@ def train(args):
         if names != [r['video_name'] for r in audit['splits'][split]['records']]:
             raise ValueError(f'{split} data order differs from audit')
 
-    sources = [Path(__file__).resolve(), *sorted((root / 'ridgon').rglob('*.py'))]
+    sources = [Path(__file__).resolve(), *sorted((root / 'memsolve').rglob('*.py'))]
     identity = {'rank': args.rank, 'seed': args.seed, 'audit_sha256': sha256(args.audit),
                 'ltcontext_revision': LTC_REVISION, 'config': cfg.dump(),
                 'sources_sha256': {str(p.relative_to(root)): sha256(p) for p in sources},
                 'cuda_contract': cuda_backend._CUDA_CONTRACT_VERSION,
-                'precision': 'FP32 upstream and parameters; BF16 native Ridgon activations',
+                'precision': 'FP32 upstream and parameters; BF16 native MemSolve activations',
                 'torch': torch.__version__, 'cuda': torch.version.cuda,
                 'attention_backend': attention_backend,
                 'execution_backend': execution_backend,

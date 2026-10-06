@@ -1,21 +1,22 @@
 # Optional dense downstream adapters
 
 Detection and segmentation are outside the current experimental scope. The
-adapters below are retained for development; no current Ridgon downstream
+adapters below are retained for development; no current MemSolve downstream
 accuracy or complete detector/segmenter validation is claimed.
 
-> Current source uses model contract 19 and CUDA contract 17. External position
+> Current source uses model contract 23 and CUDA contract 19. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
 
-The optional dense adapters share the current RidgonViT encoder used by ImageNet:
-residual CPE, Pre-LN, no CLS and no LayerScale. CPE uses the actual patch grid,
+The optional dense adapters share the current MemSolveViT encoder used by ImageNet:
+Q/K convolution followed by axial 2D RoPE, Pre-LN, no CLS and no LayerScale.
+Both local convolution and RoPE use the actual patch grid,
 including rectangular padded images; the mixer consumes patch features and the
 validity mask. Updating this shared adapter does not constitute a new detection
 or segmentation experiment.
 
-| Scale | Width | Depth | Heads | Ridgon rank | Feature taps |
+| Scale | Width | Depth | Heads | MemSolve rank | Feature taps |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Small | 384 | 12 | 6 | 32 | `(3, 5, 7, 11)` |
 | Base | 768 | 12 | 12 | 48 | `(3, 5, 7, 11)` |
@@ -28,7 +29,7 @@ The external FPN or UperNet head then consumes those four maps.
 
 The OpenMMLab wrappers derive an image-validity mask from each sample's
 `img_shape`, zero padded pixels before patch embedding, and pass the resulting
-token mask to every global Ridgon mix. This prevents another image's batch
+token mask to every global MemSolve mix. This prevents another image's batch
 padding, including padding that partially overlaps an edge patch, from affecting
 valid outputs.
 
@@ -106,8 +107,8 @@ backbone; the launch examples below use Base.
 
 ## Pretrained checkpoint compatibility
 
-Current loading validates ImageNet envelope **12**, Ridgon model contract **19**
-and CUDA contract **17**. The independent-QKV architecture cannot load earlier
+Current loading validates ImageNet envelope **12**, MemSolve model contract **23**
+and CUDA contract **19**. The independent-QKV architecture cannot load earlier
 shared-A checkpoints. A new matching ImageNet checkpoint is required; changing
 metadata or using `strict=False` is not a conversion.
 
@@ -134,25 +135,25 @@ the model. Delta uses the ordinary optimizer decay group, without a
 model-specific constraint or optimizer hook. New downstream runs require an explicit
 ImageNet checkpoint; they never silently train a paper result from scratch.
 The backbone verifies the checkpoint's current ImageNet contract and canonical
-digest, then checks its tier, Ridgon operator, and shared vision geometry before
-accepting any pretrained tensor. CPE convolution weights transfer across patch
-grid sizes without a learned position table to interpolate. Config filenames
-containing `deit3` are historical paths; their registered backbone is RidgonViTBackbone.
+digest, then checks its tier, MemSolve operator, and shared vision geometry before
+accepting any pretrained tensor. Q/K convolution weights transfer across patch
+grid sizes; RoPE tables are regenerated without position-table interpolation. Config filenames
+containing `deit3` are historical paths; their registered backbone is MemSolveViTBackbone.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_openmmlab.py \
-  experiments/openmmlab/configs/coco_mask_rcnn_ridgon_deit3_base_3x.py \
+  experiments/openmmlab/configs/coco_mask_rcnn_memsolve_deit3_base_3x.py \
   --data-root /datasets/coco \
   --backbone-checkpoint runs/imagenet/deit3_base_224/checkpoint_best.pt \
-  --work-dir runs/coco/ridgon_deit3_base_3x --launcher pytorch
+  --work-dir runs/coco/memsolve_deit3_base_3x --launcher pytorch
 ```
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_openmmlab.py \
-  experiments/openmmlab/configs/ade20k_upernet_ridgon_deit3_base_160k.py \
+  experiments/openmmlab/configs/ade20k_upernet_memsolve_deit3_base_160k.py \
   --data-root /datasets/ADEChallengeData2016 \
   --backbone-checkpoint runs/imagenet/deit3_base_224/checkpoint_best.pt \
-  --work-dir runs/ade20k/ridgon_deit3_base_160k --launcher pytorch
+  --work-dir runs/ade20k/memsolve_deit3_base_160k --launcher pytorch
 ```
 
 Use `--resume` for a downstream checkpoint, `--resume auto` for the latest

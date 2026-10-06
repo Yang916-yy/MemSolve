@@ -1,9 +1,9 @@
 # Food-101 runner
 
-`python -m experiments.food101` trains a Ridgon-S/16 classifier from scratch.
+`python -m experiments.food101` trains a MemSolve-ViT-S/16 classifier from scratch.
 The current QKV ridge-query model uses width 384,
 depth 12, six heads, rank 32, SwiGLU gate width 1024 (MLP budget ratio 4.0) and 224-pixel inputs. It shares the
-ImageNet residual CPE, no-CLS/no-LayerScale scaffold, token-LN mean pooling and
+ImageNet Q/K-convolution-plus-2D-RoPE, no-CLS/no-LayerScale scaffold, token-LN mean pooling and
 linear DropPath up to 0.1. Initialization is deterministic for a fixed seed. Old Dynamic/Static/Zero
 measurements belong to their recorded source contracts.
 The runner defaults to `--implementation cuda`; `reference` is also available.

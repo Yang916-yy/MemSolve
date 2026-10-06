@@ -45,8 +45,11 @@ Before the 2026-09-12 main publication, the full suite passed 342 tests with
 6 skips; only SM120 was executed. This is a dated verification record, not a
 promise that all optional stacks or architectures were exercised.
 
-The current model contract 19 / CUDA contract 17 has a known failing
-single-valid-token FP64 oracle check: the near-zero core gradient exceeds
-the unchanged absolute tolerance. See the range-audit TODO in
-[CUDA contract](../docs/CUDA_CONTRACT.md). This case also fails before the
-identity-plus-delta parameterization; it must not be reported as passing.
+Model contract 23 / CUDA contract 19 retains the original single-valid-token
+FP64 oracle tolerance. Its former near-zero core-gradient failure is fixed by
+residual-compensated readout and coefficient-adjoint products. The suite also
+checks fused sigmoid gates, native centered convolution with fused packing,
+RoPE/masks, all parameter gradients and CUDA Graph replay. The FP16 readout/Wo
+forward path is compared with an FP64 oracle; upstream scales down to 1e-9
+check that backward does not inherit a half-precision gradient edge. See the
+[CUDA contract](../docs/CUDA_CONTRACT.md) for precision boundaries.

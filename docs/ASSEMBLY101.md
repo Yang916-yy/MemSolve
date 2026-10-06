@@ -1,6 +1,6 @@
 # Assembly101 data and evaluation protocol
 
-> Current source uses model contract 19 and CUDA contract 17. External position
+> Current source uses model contract 23 and CUDA contract 19. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -8,18 +8,18 @@
 This workflow prepares the official TSM features and evaluates saved predictions
 with the original LTContext data alignment and metrics. The same entrypoint
 trains a hybrid that replaces only the nine stage-1 long-range branches with
-full-sequence Ridgon; the upstream local modules and stages 2–4 are retained.
+full-sequence MemSolve; the upstream local modules and stages 2–4 are retained.
 
 ## Sources and environment
 
 Use the official [LTContext checkout](https://github.com/LTContext/LTContext)
 at `ac74722b00b52b7eb9eb3d6fa8600c762e6f369b`. The audit/evaluation commands
 reject another revision or tracked changes to its model, dataset, or metric code.
-Upstream code is imported from that external checkout, not vendored into Ridgon.
+Upstream code is imported from that external checkout, not vendored into MemSolve.
 LTContext and Assembly101 have their own CC BY-NC 4.0 licenses.
 
 Install data dependencies with `python3 -m pip install -e '.[assembly101]'`.
-The Ridgon CUDA environment is documented in [CUDA_CONTRACT.md](CUDA_CONTRACT.md).
+The MemSolve CUDA environment is documented in [CUDA_CONTRACT.md](CUDA_CONTRACT.md).
 Do not install LTContext's old torch 2.0 environment over it. Training additionally
 uses upstream loss, optimizer, scheduler, dataset, collation and metric code.
 The runner owns checkpoint bookkeeping and does not require upstream plotting.
@@ -32,7 +32,7 @@ DINOv2 features, hand poses, and fine-grained labels are not needed here.
 
 ## Preparation
 
-Run from the Ridgon checkout. Example persistent data root: `/path/to/assembly101`.
+Run from the MemSolve checkout. Example persistent data root: `/path/to/assembly101`.
 
 ```bash
 python3 -m experiments.assembly101 download --data-root /path/to/assembly101
@@ -116,15 +116,15 @@ config field name this is not a linear warmup. `USE_INSTANCE_NORM=True` creates
 Identity in the pinned code; retain that actual behavior in both arms.
 
 The experimental arms replace the nine `stage1.layers[i].ltc_attn`
-modules with full-sequence Ridgon, dim=64, heads=1, rank=16 or 32, bias=True,
+modules with full-sequence MemSolve, dim=64, heads=1, rank=16 or 32, bias=True,
 using the current independent Q/K/V operator. Historical experiments used the
 previous Dynamic operator. Later stages and local operations remain upstream-owned.
 This changes both the long-term mixer and its connectivity: original LTContext
-uses 64 interleaved subsequences; full-sequence Ridgon mixes all timestamps.
+uses 64 interleaved subsequences; full-sequence MemSolve mixes all timestamps.
 Report parameter counts and acknowledge differing internal projections,
-activation/dropout structure, and precision boundaries. The adapter uses Ridgon's
+activation/dropout structure, and precision boundaries. The adapter uses MemSolve's
 own projections and readout without adding an attention-weight dropout. The
-block's surrounding residual and dropout remain upstream-owned. Native Ridgon
+block's surrounding residual and dropout remain upstream-owned. Native MemSolve
 activations are BF16; upstream layers, loss and all parameters remain FP32.
 No whole-model AMP, gradient clipping, cropping or downsampling is introduced.
 Use identical seeds and data/selection rules for both ranks.
@@ -170,7 +170,7 @@ parameters. Graph warmup does not step the optimizer, and warmup/capture restore
 the CPU/CUDA RNG states. Graphs are reconstructed after resume. Deterministic
 PyTorch algorithms and `CUBLAS_WORKSPACE_CONFIG=:4096:8` are used for this path;
 the selected settings are recorded in checkpoint identity. Adam and finite-value
-checks remain outside the graph. Native Ridgon and attention remain outside
+checks remain outside the graph. Native MemSolve and attention remain outside
 Inductor and are captured by CUDA Graph without changing their implementation.
 
 Convolution regions use separate compilation caches and automatic dynamic-shape

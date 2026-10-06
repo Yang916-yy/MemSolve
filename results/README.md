@@ -1,6 +1,6 @@
 # Historical LSSO results
 
-> The current source is Ridgon, model contract 19 / CUDA contract 17.
+> The current source is MemSolve, model contract 22 / CUDA contract 18.
 > The earlier model was named LSSO; archived names and measurements are unchanged.
 > All measurements in this directory retain their original operator and source
 > contracts. None is a trained result or contraction certificate for the new
@@ -34,8 +34,9 @@ comparison values in the paper remain attributed to their original sources.
 ## Historical evidence versus current source
 
 The published CUDA metadata records native contract **6**. Current source uses
-CUDA contract **17** and model contract **19**, with an identity-plus-delta
-query map and no custom native extension. These source updates do not rewrite the
+CUDA contract **18** and model contract **22**, with an identity-plus-delta
+query map, centered Q/K filters, vision RoPE, and a low-rank sigmoid output gate. There is no custom native
+extension. These source updates do not rewrite the
 CSV measurements or establish new task results. Consult each panel's metadata
 for its actual runtime and protocol; do not label historical tables as current
 source benchmarks.

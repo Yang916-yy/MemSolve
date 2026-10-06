@@ -1,8 +1,100 @@
-# Ridgon-B with the DeiT III training recipes
+# MemSolve-ViT with LAMB and 3-Augment
+
+## Default: RoPE-ViT-derived 400-epoch training
+
+`experiments/configs/imagenet_ropevit_400.toml` is the default for all T/S/B
+tiers. Training duration, global batch, learning rate, decay, DropPath,
+loss and augmentations follow the Small and Base commands in the
+[official RoPE-ViT README](https://github.com/naver-ai/rope-vit/blob/main/deit/README.md).
+Tiny borrows the Small recipe; upstream does not list a Tiny training command.
+
+| Setting | T/S pretraining | Base pretraining | Base resolution fine-tuning |
+| --- | --- | --- | --- |
+| Resolution / epochs | 224 × 224 / 400 | 192 × 192 / 400 | 224 × 224 / 20 |
+| Global effective batch | 2048 | 2048 | 512 |
+| Physical batch per GPU, two GPUs | 512 | 512 | 256 |
+| Gradient accumulation | 2 | 2 | 1 |
+| Optimizer | Apex fused LAMB | Apex fused LAMB | PyTorch fused AdamW |
+| Peak LR | 0.004 | 0.003 | 1e-5 |
+| Minimum LR | 1e-5 | 1e-5 | 1e-5 |
+| Warmup | 5 epochs, start 1e-6 | 5 epochs, start 1e-6 | 5 epochs, start 1e-6 |
+| Weight decay | 0.03 | 0.03 | 0.1 |
+| Uniform DropPath | 0 | 0.1 | 0.2 |
+| Loss / smoothing | DeiT BCE / 0 | DeiT BCE / 0 | Soft-target CE / 0.1 |
+| Augmentation | 3-Augment | 3-Augment | RandAugment m9 |
+| Repeated augmentation | Enabled | Enabled | Disabled |
+| Color jitter argument | 0.3 | 0.3 | 0.3 |
+| Mixup / CutMix | 0.8 / 1.0 | 0.8 / 1.0 | 0.8 / 1.0 |
+| Virtual augmentation group | 256 | 256 | 64 |
+| Gradient clipping | LAMB internal norm 1 | LAMB internal norm 1 | Disabled |
+| Random erasing / eval crop ratio | 0 / 1.0 | 0 / 1.0 | 0 / 1.0 |
+| EMA decay, no warmup | 0.99996 | 0.99996 | 0.99996 |
+
+All optimizers use β=(0.9, 0.999), ε=1e-8. The LR is the official value for
+the effective batch; no additional LR scaling is applied. A pretraining
+optimizer update consumes `2 GPUs × 512 images × 2 microbatches = 2048`.
+Fine-tuning consumes `2 × 256 = 512`. Base therefore uses 420 epochs in total.
+Its phase-specific DropPath is passed to the actual backbone, stored in the
+model contract and checked on resume.
+
+EMA follows the upstream [main.py](https://github.com/naver-ai/rope-vit/blob/main/deit/main.py)
+and [engine.py](https://github.com/naver-ai/rope-vit/blob/main/deit/engine.py):
+initialize a shadow from the starting model, update it after each optimizer step
+with constant decay 0.99996, and save it as `model_ema`. Unlike the upstream entrypoint,
+our validation evaluates both weight sets on the same decoded batches. Metrics
+`val_loss/acc1/acc5` describe ordinary weights; `ema_val_loss/acc1/acc5` describe EMA.
+`checkpoint_best.pt` and `checkpoint_best_ema.pt` are selected independently by their
+respective top-1 accuracy; `checkpoint_last.pt` follows the save interval.
+All files contain ordinary weights, EMA weights, optimizer state and both best scores.
+EMA-best files declare `selected_weights = "model_ema"`; the other files select `model`.
+Resume restores both weight sets and their best scores, always keeping optimizer
+state paired with ordinary weights. Resolution fine-tuning loads the file's selected
+weights and initializes a fresh EMA shadow. `--eval --resume ...` reports both sets.
+The implementation uses timm ModelEmaV3's foreach parameter updates, without EMA
+warmup. It copies buffers instead of averaging them; the MemSolve-ViT backbone
+has no running-statistics buffers. Extra-state architecture metadata is preserved.
+EMA stays outside the CUDA Graph and updates once per accumulated optimizer step.
+The shadow is copied before compile installs bound forward wrappers and synchronized
+after DDP initialization, so its evaluation reads its own parameters on every rank.
+
+The MemSolve backbone, BF16 AMP with FP32 parameters, per-update cosine scheduling
+and indexed WebDataset, plus dual ordinary/EMA validation, are local adaptations.
+Upstream steps its scheduler per
+epoch. These differences make this a **RoPE-ViT-derived protocol**.
+
+The virtual groups use the repeat-before-rank-split sampler described below,
+with eight independent Mixup/CutMix draws per effective update. The model
+receives complete physical batches. Pretraining schedules 1,280,000 transformed
+images and 625 optimizer updates per epoch; repeated augmentation does not
+triple its length. Fine-tuning schedules 1,281,024 images and 2,502 updates.
+Train/validation workers remain persistent (12/4 per GPU); `compile-graph`
+retains the outer CUDA Graph and PyTorch fusion. Language recipes are unchanged.
+
+```bash
+# T/S: use --tier tiny or --tier small; Base pretraining is shown here.
+torchrun --standalone --nproc_per_node=2 experiments/train_imagenet.py \
+  --tier base --phase pretrain --data-root /datasets/imagenet-1k-wds \
+  --output runs/imagenet/memsolve_b_ropevit400
+
+# A separate launch after the 400-epoch pretraining run.
+torchrun --standalone --nproc_per_node=2 experiments/train_imagenet.py \
+  --tier base --phase finetune --data-root /datasets/imagenet-1k-wds \
+  --finetune runs/imagenet/memsolve_b_ropevit400/checkpoint_best.pt \
+  --output runs/imagenet/memsolve_b_ropevit224
+```
+
+The notebook selects the same default configuration and exposes `PHASE` and
+`FINETUNE_CHECKPOINT` for the Base transition. The selected TOML and adaptations
+are recorded in checkpoint metadata as `ropevit-derived`. Fine-tuning loads
+compatible weights with a fresh optimizer and schedule. Use `--resume` only to
+continue the same phase and contract; an 800-epoch checkpoint cannot be resumed
+under the new 400-epoch schedule.
+
+## Optional explicit DeiT III Base configurations
 
 `experiments/configs/imagenet_deit3_400.toml` adapts the ImageNet-1K recipe in
 [DeiT III](https://arxiv.org/abs/2204.07118), tables 1, 6 and 13. The backbone
-retains Ridgon-B/r48, packed SwiGLU, per-layer residual CPE, token-LN mean
+retains MemSolve-ViT-B/r48, packed SwiGLU, Q/K convolution followed by axial 2D RoPE, token-LN mean
 pooling, no CLS and no LayerScale. BF16 AMP, no EMA, local indexed WebDataset and
 physical-batch gradient accumulation are local adaptations. This is a
 **DeiT III-derived training protocol**, not the original ViT architecture or
@@ -13,7 +105,7 @@ from the [official training and fine-tuning commands](https://github.com/faceboo
 It trains at 192px for 800 epochs with weight decay 0.05 and uniform DropPath
 0.2, followed by 20 epochs at 224px with weight decay 0.1 and DropPath 0.2.
 It defaults to `compile-graph`: PyTorch Inductor fuses the surrounding vision
-operations while the outer CUDA Graph also captures the Ridgon kernels and
+operations while the outer CUDA Graph also captures the MemSolve kernels and
 accumulated DDP backward. The operator mathematics and precision contract
 remain the same. Select `--execution graph` to measure the uncompiled graph.
 
@@ -121,7 +213,7 @@ regular decay group, without a model-specific optimizer hook.
 ```
 
 Fine-tuning strictly loads compatible model weights into a fresh 224px model.
-CPE has no resolution-dependent learned position table to interpolate. The
+RoPE tables are regenerated for the actual patch grid; no learned position table is interpolated. The
 optimizer, schedule, epoch counter, best metric and random streams start anew;
 the source checkpoint is recorded in `metrics.jsonl`. Use `--resume` for an
 interrupted run within the same phase. `--resume` and `--finetune` are mutually
@@ -148,7 +240,7 @@ following [PyTorch issue 143580](https://github.com/pytorch/pytorch/issues/14358
 Warmup updates no weights, and capture restores RNG state and model buffers.
 The graph is reused across epochs and reset before distributed shutdown. Both
 `graph` and `compile-graph` support accumulation; the latter also compiles the
-surrounding vision blocks while retaining the Ridgon CUDA boundary.
+surrounding vision blocks while retaining the MemSolve CUDA boundary.
 
 Compiled execution preserves eager BF16 rounding through Inductor's
 [`emulate_precision_casts`](https://github.com/pytorch/pytorch/blob/main/torch/_inductor/config.py)

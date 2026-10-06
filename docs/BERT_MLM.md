@@ -1,6 +1,13 @@
-# Ridgon BERT integration
+# MemSolve-BERT integration
 
-`integrations/transformers.py` adapts the current Ridgon operator to Hugging Face
+**MemSolve** names the operator, **MemSolve-ViT** the visual family, and
+**MemSolve-BERT** the text model. Python follows the framework's class naming:
+`MemSolveBertConfig`, `MemSolveBertModel` and `MemSolveBertForMaskedLM`.
+Saved HF configurations use `model_type="memsolve_bert"` and the corresponding
+class name in `architectures`; the MLM and retrieval launchers use
+`experiments/configs/memsolve_bert_{mlm,retrieval}.json`.
+
+`integrations/transformers.py` adapts the current MemSolve operator to Hugging Face
 BERT. It reuses Transformers' embeddings, encoder layers, residual output
 modules and tied MLM head, with packed SwiGLU in the encoder FFNs. It does not
 implement a second attention operator.
@@ -8,15 +15,24 @@ implement a second attention operator.
 Each layer computes:
 
 \[
-h=\mathrm{LayerNorm}(x+\mathrm{Dropout}(\mathrm{Ridgon}(x))),\qquad
+h=\mathrm{LayerNorm}(x+\mathrm{Dropout}(\mathrm{MemSolve}(x))),\qquad
 y=\mathrm{LayerNorm}(h+\mathrm{Dropout}(\mathrm{FFN}(h))).
 \]
 
-Ridgon includes its packed QKV projection, per-head output RMSNorm with shared
-channel gain, and output projection. BERT's attention output dense layer becomes
+MemSolve includes its packed QKV projection, per-head output RMSNorm with shared
+channel gain, a low-rank sigmoid channel gate, and output projection. BERT's attention output dense layer becomes
 an identity, avoiding a duplicate output projection. The attention residual
-dropout and LayerNorm remain. No additional mixer LayerNorm, Q/K convolution,
-RoPE, CPE or LayerScale is added.
+dropout and LayerNorm remain. Projected Q/K pass through centered width-3
+depthwise convolutions, with no bias or activation and identity initialization.
+V remains tokenwise. Padding is masked before and after convolution. No additional
+mixer LayerNorm, RoPE, CPE or LayerScale is added.
+
+`memsolve_qk_conv_kernel_size` controls the odd centered 1D kernel width (default 3).
+`memsolve_output_gate_rank` controls the gate bottleneck (default 32), independently
+of `memsolve_rank`. Both are serialized in the HF configuration and checked against
+the core checkpoint contract. The gate receives the same input as QKV and acts
+after output RMSNorm, before Wo; its two factors use HF's normal initialization
+and its output bias starts at zero.
 
 The FFN uses `silu(gate) * up`, with gate and up packed into one linear
 projection. BERT's FFN output module retains the down projection, dropout,
@@ -32,20 +48,20 @@ prediction transform (GELU); the encoder FFN is always SwiGLU.
 | Setting | Value |
 | --- | --- |
 | Encoder depth / width / heads | 12 / 768 / 12 |
-| Ridgon rank | 32 (initial NLP configuration, not a tuned choice) |
+| MemSolve rank | 32 (initial NLP configuration, not a tuned choice) |
 | FFN | SwiGLU, 2048 per branch, 4096 packed gate/up |
 | Position embedding | BERT learned absolute, 512 positions |
 | Vocabulary / token types | 30522 / 2 |
 | Embedding and residual dropout | 0.1 |
 | Attention probability dropout | 0; this operator does not materialize probabilities |
 | BERT LayerNorm epsilon | 1e-12 |
-| Ridgon head RMSNorm epsilon | 1e-6, owned by the core |
-| MLM parameters, tied weights counted once | r32: 102,587,706; r48: 106,315,578 |
+| MemSolve head RMSNorm epsilon | 1e-6, owned by the core |
+| MLM parameters, tied weights counted once | r32: 103,214,394; r48: 106,956,090 |
 
 HF's normal initialization (std 0.02, zero linear biases) applies to the BERT
-scaffold and Ridgon Q/V/output projections. After child linear initialization,
-the core restores its K fan-in initialization. Delta starts at zero, so T starts
-at identity; RMSNorm gain starts at one. The MLM decoder shares the word
+scaffold and MemSolve Q/V/output projections. After child linear initialization,
+the core restores its K fan-in and identity Q/K filter initialization. Delta
+starts at zero, so T starts at identity; RMSNorm gain starts at one. The MLM decoder shares the word
 embedding weight. There is no trained CLS pooler in the MLM model or the default
 base encoder.
 
@@ -69,11 +85,11 @@ modules, as with the timm integration):
 ```python
 import torch
 from transformers import AutoModel, AutoModelForMaskedLM
-from integrations.transformers import RidgonBertConfig, RidgonBertForMaskedLM
+from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
 
-model = RidgonBertForMaskedLM(RidgonBertConfig(
-    ridgon_rank=32,
-    ridgon_implementation="cuda",  # choose "reference" explicitly for CPU
+model = MemSolveBertForMaskedLM(MemSolveBertConfig(
+    memsolve_rank=32,
+    memsolve_implementation="cuda",  # choose "reference" explicitly for CPU
 )).cuda()
 
 # batch contains input_ids, binary attention_mask, and MLM labels.
@@ -82,14 +98,14 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
     loss = model(**batch).loss
 loss.backward()
 
-model.save_pretrained("/path/to/ridgon-bert")
-restored = AutoModelForMaskedLM.from_pretrained("/path/to/ridgon-bert")
-encoder = AutoModel.from_pretrained("/path/to/ridgon-bert")
+model.save_pretrained("/path/to/memsolve-bert")
+restored = AutoModelForMaskedLM.from_pretrained("/path/to/memsolve-bert")
+encoder = AutoModel.from_pretrained("/path/to/memsolve-bert")
 ```
 
 Import `integrations.transformers` before using Auto classes in a fresh process;
-it registers `ridgon_bert`, the encoder and the MLM model. CPU loading does not
-execute the CUDA backend; choose `ridgon_implementation="reference"` explicitly
+it registers `memsolve_bert`, the encoder and the MLM model. CPU loading does not
+execute the CUDA backend; choose `memsolve_implementation="reference"` explicitly
 when loading for CPU forward. Do not cast CUDA model parameters to BF16/FP16:
 the operator requires FP32 parameters and uses its existing mixed precision
 internally. Plain CUDA inference casts mixer activations to BF16; whole-model
@@ -118,13 +134,13 @@ No C4 download or formal pretraining is started by this integration.
 - Pairwise/block masks, causal decoding, cross attention, KV caching, head
   pruning and attention-probability output are unsupported and fail explicitly.
   Do not concatenate independent documents and expect masked isolation.
-- HF safetensors contain tensors only; `config.json` carries `ridgon_contract`,
+- HF safetensors contain tensors only; `config.json` carries `memsolve_contract`,
   validated against the actual core on construction. PyTorch load pre-hooks
   restore that validated metadata for the core's strict checkpoint check.
   Save and transfer config and weights together via `save_pretrained`.
 - The config must declare `ffn_type="swiglu"`. The earlier GELU adapter checkpoint
   format is not retained or silently reinterpreted.
-- Native standalone Ridgon checkpoints still require their extra-state contract.
+- Native standalone MemSolve checkpoints still require their extra-state contract.
   Missing or incompatible HF contracts and missing mixer weights are rejected.
   Loading LION/Hydra or stock BERT weights is not a checkpoint conversion path.
 
@@ -134,9 +150,9 @@ The scaffold follows the operator replacement boundary in
 [LION's BERT implementation](https://github.com/LIONS-EPFL/LION/blob/32a0136431dea54a634394df756365919635fe9d/Masked_Language_Modeling/src/bert_layers.py).
 The public LION YAML `hf_bert` route and its `linear_attention` / `nova` names
 do not match the custom `bert` factory and `lion-lit` / `lion-d` / `lion-s`
-branches in that checkout. We register the Ridgon model explicitly instead of
+branches in that checkout. We register the MemSolve model explicitly instead of
 copying those configuration switches. LION-Lit's optional output LayerNorm is
-not added on top of Ridgon's output RMSNorm. These are architecture differences,
+not added on top of MemSolve's output RMSNorm. These are architecture differences,
 not an exact reproduction of LION training.
 
 The implementation imports the Apache-2.0
@@ -227,9 +243,9 @@ tokens to configuration/logs.
 ```bash
 /cywang/ridgon-nlp-venv/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=2 -m experiments.train_mlm \
-  --config experiments/configs/ridgon_bert_mlm.json \
-  --data /path/to/c4-tokenized --output /path/to/ridgon-mlm
-# Resume: repeat the command with --resume /path/to/ridgon-mlm/checkpoint-1000
+  --config experiments/configs/memsolve_bert_mlm.json \
+  --data /path/to/c4-tokenized --output /path/to/memsolve-mlm
+# Resume: repeat the command with --resume /path/to/memsolve-mlm/checkpoint-1000
 ```
 
 The checked-in r32/SwiGLU configuration is **LION-derived**, not an exact LION
@@ -247,7 +263,7 @@ PyTorch multiplies by `1 - lr_t * wd_torch`; therefore the equivalent coefficien
 is `1e-5 / 8e-4 = 0.0125`. This conversion follows
 [Composer's optimizer implementation](https://docs.mosaicml.com/projects/composer/en/latest/_modules/composer/optim/decoupled_weight_decay.html).
 If changing peak LR while preserving Composer's decay, recompute that ratio.
-HF's standard norm/bias exclusions are retained. SwiGLU/Ridgon, fixed evaluation
+HF's standard norm/bias exclusions are retained. SwiGLU/MemSolve, fixed evaluation
 masks, the selected validation subset, gradient clipping at 1.0 and HF optimizer
 grouping must be disclosed when comparing against LION; this is not a claim of
 identical training protocols.
@@ -274,8 +290,8 @@ Exported HF model/tokenizer files are in `final/`.
 ```bash
 /cywang/ridgon-nlp-venv/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=2 -m experiments.train_retrieval \
-  --config experiments/configs/ridgon_bert_retrieval.json \
-  --checkpoint /path/to/ridgon-mlm/final --output /path/to/ridgon-retrieval
+  --config experiments/configs/memsolve_bert_retrieval.json \
+  --checkpoint /path/to/memsolve-mlm/final --output /path/to/memsolve-retrieval
 ```
 
 This imports Sentence Transformers' `Transformer`, masked `Pooling(mean)`,
@@ -295,7 +311,7 @@ but each query sees candidates from its local batch. Gradient accumulation does
 not enlarge the negative pool. The cached loss reduces activation memory and
 adds recomputation. Ettin uses cache mini-batches of 256; our initial 32 was
 the Sentence Transformers default, not a measured optimum. With the 102M
-parameter Ridgon BERT and all 512 tokens valid, a local BF16 forward/backward
+parameter MemSolve-BERT and all 512 tokens valid, a local BF16 forward/backward
 probe on an A800 used 25.3 GiB at 128. A 256-row probe exceeded a 48%-of-card
 process memory cap set to preserve room for the concurrent ImageNet run; that
 does not establish that 256 would fail on an otherwise empty A800. The default
@@ -313,10 +329,10 @@ The unneeded MLM prediction head is discarded. Resume uses `--resume` as above.
 
 ```bash
 /cywang/ridgon-nlp-venv/bin/python -m experiments.evaluate_embeddings \
-  --checkpoint /path/to/ridgon-retrieval/final --output /path/to/mteb-results \
+  --checkpoint /path/to/memsolve-retrieval/final --output /path/to/mteb-results \
   --suite mteb-eng-v2 --max-length 512 --batch-size 32
 /cywang/ridgon-nlp-venv/bin/python -m experiments.evaluate_embeddings \
-  --checkpoint /path/to/ridgon-retrieval/final --output /path/to/longembed-results \
+  --checkpoint /path/to/memsolve-retrieval/final --output /path/to/longembed-results \
   --suite longembed --max-length 512 --batch-size 16
 ```
 

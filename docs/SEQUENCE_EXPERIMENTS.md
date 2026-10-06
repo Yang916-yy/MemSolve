@@ -1,6 +1,6 @@
 # Sequence Experiments
 
-> Current source uses model contract 19 and CUDA contract 17. External position
+> Current source uses model contract 23 and CUDA contract 19. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -11,10 +11,15 @@ owns data preparation, the shared encoder shell, validation-based checkpoint
 selection, and the one-time held-out test evaluation.
 
 The current operator uses independent Q/K/V, a learned sample-independent
-core and direct normalized readout. It has no core-mode or complement switches.
+core and direct normalized readout. Q/K additionally use centered width-3
+depthwise convolution with identity initialization; V remains tokenwise.
+It has no core-mode or complement switches.
 The shared encoder retains learned absolute position embeddings initialized
-from `Normal(0, 0.02)`. CUDA contract 17 accepts FP16 and BF16 inputs; sequence
-recipes still default to FP16. Current model checkpoints use contract 19.
+from `Normal(0, 0.02)`. CUDA contract 19 accepts FP16 and BF16 inputs; sequence
+recipes still default to FP16. Current model checkpoints use contract 23.
+The output uses a low-rank sigmoid channel gate after head RMSNorm.
+`--qk-conv-kernel-size` selects an odd centered 1D kernel width (default 3);
+`--output-gate-rank` sets the independent output gate bottleneck (default 32).
 
 Historical results below used earlier operator and numerical contracts,
 including internal relation-feature preprocessing absent from current source.
@@ -242,7 +247,7 @@ The formal LRA panel excludes all exploratory artifacts. In particular:
 ## Reproducing the Panels
 
 Place the prepared datasets at explicit roots, load the published or locally
-built Ridgon CUDA runtime, and run from a clean committed checkout. The formal
+built MemSolve CUDA runtime, and run from a clean committed checkout. The formal
 runner records the actual source fingerprints, so changing the shell variables
 below does not change dataset identity when the contents are the same.
 
@@ -267,7 +272,7 @@ for task in "${genomic_tasks[@]}"; do
   if [[ "$task" == dummy_mouse_enhancers_ensembl ]]; then
     batch_args=(--batch-size 64 --grad-accum 2)
   fi
-  for mixer in mha ridgon; do
+  for mixer in mha memsolve; do
     for seed in 0 1 2; do
       python -m experiments.train_transformers \
         --config experiments/configs/genomic.toml \
@@ -283,9 +288,9 @@ for task in listops text retrieval pathfinder; do
   for seed in 0 1 2; do
     python -m experiments.train_transformers \
       --config experiments/configs/lra.toml \
-      --task "$task" --mixer ridgon --seed "$seed" --formal \
+      --task "$task" --mixer memsolve --seed "$seed" --formal \
       --data-root "$LRA_DATA_ROOT" --cache-root "$SEQUENCE_CACHE" \
-      --output "$RUN_ROOT/lra/$task/ridgon/s$seed"
+      --output "$RUN_ROOT/lra/$task/memsolve/s$seed"
   done
 done
 ~~~
@@ -335,6 +340,6 @@ initialization, and retains the encoder's learned absolute position embeddings.
 It applies standard RoFormer adjacent-pair rotation to Q and K only, across the
 full head dimension, with base 10000 and token indices starting at zero. V is
 unchanged. Source: https://github.com/ZhuiyiTechnology/roformer . This is a
-standard MHA RoPE control; Ridgon does not use it.
+standard MHA RoPE control; the sequence MemSolve model does not use it.
 Explicit rotation-matrix forward/input-gradient oracles cover padding and empty
 examples, and the position-zero case agrees with ordinary MHA.

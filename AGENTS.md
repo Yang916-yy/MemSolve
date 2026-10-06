@@ -3,7 +3,7 @@
 This file defines the repository contract for contributors who use coding
 agents, large language models, or other AI-assisted development tools. It
 governs proposed changes and review evidence; it does not affect installation,
-runtime behavior, or ordinary use of Ridgon.
+runtime behavior, or ordinary use of MemSolve.
 
 The human contributor remains responsible for the scope, correctness,
 provenance, testing, and reviewability of every submitted change. AI-generated
@@ -28,13 +28,13 @@ informed.
 
 ## Core Ownership
 
-- `ridgon/ball/reference.py` is the only owner of operator mathematics and the
+- `memsolve/ball/reference.py` is the only owner of operator mathematics and the
   canonical numerical contract.
-- `ridgon/ball/model.py` is the only owner of parameters and `nn.Module` behavior.
-- `ridgon/ball/config.py` is the only owner of public variants and validation.
+- `memsolve/ball/model.py` is the only owner of parameters and `nn.Module` behavior.
+- `memsolve/ball/config.py` is the only owner of public variants and validation.
 - Do not add compatibility aliases, legacy imports, duplicate model classes, or
   a second reference implementation.
-- Do not add files under `ridgon/ball/` without maintainer approval.
+- Do not add files under `memsolve/ball/` without maintainer approval.
 
 ## Equivalent Implementations
 

@@ -24,7 +24,7 @@ from experiments.imagenet import (
     interpolate_position_embedding,
 )
 from experiments.train_openmmlab import _configure_checkpoint
-from integrations.timm import VisionSpec, RidgonViT
+from integrations.timm import VisionSpec, MemSolveViT
 
 
 pytestmark = pytest.mark.integration
@@ -36,7 +36,7 @@ CONFIG_ROOT = (
 
 
 def _tiny_imagenet_checkpoint(
-    source: RidgonViT,
+    source: MemSolveViT,
     *,
     image_size: int = 32,
 ) -> dict[str, object]:
@@ -48,11 +48,11 @@ def _tiny_imagenet_checkpoint(
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+            "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
             "class_token": False,
             "layer_scale": False,
             "pooling": "token_ln_mean",
-            "position_encoding": "cpe",
+            "position_encoding": "rope_2d_axial",
             "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": 32,
@@ -62,7 +62,8 @@ def _tiny_imagenet_checkpoint(
             "drop_path_rate": 0.0,
         },
         "operator": {
-
+            "qk_conv_kernel_size": 3,
+            "output_gate_rank": 32,
             "bias": True,
             "implementation": "reference",
         },
@@ -109,7 +110,7 @@ def _tiny_imagenet_checkpoint(
 
 
 @pytest.fixture
-def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.RidgonViTBackbone:
+def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.MemSolveViTBackbone:
     """Build the real downstream adapter with a CPU-sized DeiT-shaped encoder."""
 
     spec = VisionSpec(
@@ -119,7 +120,7 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.RidgonViTBackbon
         drop_path_rate=0.0,
     )
     monkeypatch.setattr(openmmlab, "vision_spec", lambda variant: spec)
-    model = openmmlab.RidgonViTBackbone(
+    model = openmmlab.MemSolveViTBackbone(
         variant="small",
         image_size=32,
         rank=4,
@@ -131,7 +132,7 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.RidgonViTBackbon
 
 
 def test_backbone_emits_xcit_style_four_level_pyramid(
-    tiny_backbone: openmmlab.RidgonViTBackbone,
+    tiny_backbone: openmmlab.MemSolveViTBackbone,
 ) -> None:
     """A plain ViT grid must become strides 4, 8, 16, and 32 for OpenMMLab."""
 
@@ -152,9 +153,9 @@ def test_backbone_emits_xcit_style_four_level_pyramid(
 
 
 def test_backbone_masks_padded_pixels_before_global_mixing(
-    tiny_backbone: openmmlab.RidgonViTBackbone,
+    tiny_backbone: openmmlab.MemSolveViTBackbone,
 ) -> None:
-    """Padding must neither enter Ridgon nor leak back through the pyramid."""
+    """Padding must neither enter MemSolve nor leak back through the pyramid."""
 
     torch.manual_seed(102)
     valid_mask = torch.zeros(1, 48, 48, dtype=torch.bool)
@@ -191,7 +192,7 @@ def test_backbone_masks_padded_pixels_before_global_mixing(
 
 
 def test_backbone_zeros_partial_patch_padding_before_embedding(
-    tiny_backbone: openmmlab.RidgonViTBackbone,
+    tiny_backbone: openmmlab.MemSolveViTBackbone,
 ) -> None:
     """A valid edge patch must not retain arbitrary pixel-padding values."""
 
@@ -219,12 +220,12 @@ def test_backbone_zeros_partial_patch_padding_before_embedding(
 
 
 def test_backbone_accepts_the_imagenet_checkpoint_contract(
-    tiny_backbone: openmmlab.RidgonViTBackbone,
+    tiny_backbone: openmmlab.MemSolveViTBackbone,
     tmp_path: Path,
 ) -> None:
     """The downstream backbone consumes the classifier checkpoint verbatim."""
 
-    source = RidgonViT(
+    source = MemSolveViT(
         image_size=32,
         patch_size=16,
         num_classes=1000,
@@ -251,8 +252,8 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
     )
 
 
-def test_backbone_reuses_cpe_weights_at_a_larger_resolution(
-    tiny_backbone: openmmlab.RidgonViTBackbone,
+def test_backbone_reuses_qk_filters_and_rebuilds_rope_at_a_larger_resolution(
+    tiny_backbone: openmmlab.MemSolveViTBackbone,
     tmp_path: Path,
 ) -> None:
     target = type(tiny_backbone)(
@@ -262,7 +263,7 @@ def test_backbone_reuses_cpe_weights_at_a_larger_resolution(
         out_indices=(0, 1, 2, 3),
         implementation="reference",
     ).eval()
-    source = RidgonViT(
+    source = MemSolveViT(
         image_size=32,
         patch_size=16,
         num_classes=1000,
@@ -279,14 +280,17 @@ def test_backbone_reuses_cpe_weights_at_a_larger_resolution(
 
     target.load_pretrained(checkpoint)
     assert target.encoder.pos_embed is None
-    torch.testing.assert_close(target.blocks[0].cpe.weight, source.blocks[0].cpe.weight)
+    torch.testing.assert_close(target.blocks[0].attn.mixer.qk_conv.weight,
+                               source.blocks[0].attn.mixer.qk_conv.weight)
+    with torch.no_grad():
+        assert all(torch.isfinite(f).all() for f in target(torch.randn(1, 3, 48, 48)))
 
 
 def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
-    tiny_backbone: openmmlab.RidgonViTBackbone,
+    tiny_backbone: openmmlab.MemSolveViTBackbone,
     tmp_path: Path,
 ) -> None:
-    source = RidgonViT(
+    source = MemSolveViT(
         image_size=32,
         patch_size=16,
         num_classes=1000,
@@ -330,7 +334,7 @@ def test_launcher_places_new_run_checkpoint_on_backbone(tmp_path: Path) -> None:
 
 
 def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
-    """COCO leaves should vary only the Ridgon DeiT III scale and rank."""
+    """COCO leaves should vary only the MemSolve DeiT III scale and rank."""
 
     expected = {
         "small": (32, 384, (3, 5, 7, 11)),
@@ -338,7 +342,7 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
         "large": (64, 1024, (7, 11, 15, 23)),
     }
     for variant, (rank, channels, out_indices) in expected.items():
-        path = CONFIG_ROOT / f"coco_mask_rcnn_ridgon_deit3_{variant}_3x.py"
+        path = CONFIG_ROOT / f"coco_mask_rcnn_memsolve_deit3_{variant}_3x.py"
         config = runpy.run_path(str(path))
         backbone = config["model"]["backbone"]
         assert config["_base_"] == "./_base_/coco_mask_rcnn_fpn_3x.py"
@@ -347,7 +351,7 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
             "allow_failed_imports": False,
         }
         assert backbone == {
-            "type": "RidgonViTBackbone",
+            "type": "MemSolveViTBackbone",
             "variant": variant,
             "rank": rank,
             "out_indices": out_indices,
@@ -358,7 +362,7 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
         }
 
     base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "coco_mask_rcnn_fpn_3x.py"))
-    assert base["model"]["type"] == "RidgonMaskRCNN"
+    assert base["model"]["type"] == "MemSolveMaskRCNN"
     assert "init_cfg" not in base["model"]["backbone"]
     assert base["model"]["neck"]["type"] == "FPN"
     assert base["model"]["neck"]["num_outs"] == 5
@@ -380,7 +384,7 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         "large": (64, 1024, (7, 11, 15, 23), 512),
     }
     for variant, (rank, channels, out_indices, decoder_channels) in expected.items():
-        path = CONFIG_ROOT / f"ade20k_upernet_ridgon_deit3_{variant}_160k.py"
+        path = CONFIG_ROOT / f"ade20k_upernet_memsolve_deit3_{variant}_160k.py"
         config = runpy.run_path(str(path))
         backbone = config["model"]["backbone"]
         assert config["_base_"] == "./_base_/ade20k_upernet_160k.py"
@@ -396,7 +400,7 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         assert config["model"]["auxiliary_head"] == {"in_channels": channels}
 
     base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "ade20k_upernet_160k.py"))
-    assert base["model"]["type"] == "RidgonEncoderDecoder"
+    assert base["model"]["type"] == "MemSolveEncoderDecoder"
     assert "init_cfg" not in base["model"]["backbone"]
     assert base["model"]["decode_head"]["type"] == "UPerHead"
     assert base["crop_size"] == (512, 512)

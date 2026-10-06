@@ -11,8 +11,8 @@ pytest.importorskip("transformers", minversion="4.57.6")
 
 from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM, BertConfig, BertForMaskedLM
 
-from integrations.transformers import RidgonBertConfig, RidgonBertForMaskedLM, RidgonBertModel
-from ridgon import Ridgon
+from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM, MemSolveBertModel
+from memsolve import MemSolve
 
 
 pytestmark = pytest.mark.integration
@@ -22,9 +22,9 @@ def config(**kwargs):
     values = dict(
         vocab_size=43, hidden_size=64, num_hidden_layers=2,
         num_attention_heads=2, intermediate_size=128,
-        max_position_embeddings=32, ridgon_rank=16, hidden_dropout_prob=0,
+        max_position_embeddings=32, memsolve_rank=16, hidden_dropout_prob=0,
     )
-    return RidgonBertConfig(**(values | kwargs))
+    return MemSolveBertConfig(**(values | kwargs))
 
 
 def batch(device="cpu"):
@@ -38,14 +38,18 @@ def batch(device="cpu"):
 
 def test_scaffold_initialization_and_weight_tying():
     torch.manual_seed(7)
-    model = RidgonBertForMaskedLM(config(hidden_size=192, num_attention_heads=6))
+    model = MemSolveBertForMaskedLM(config(hidden_size=192, num_attention_heads=6))
     assert model.bert.pooler is None
     assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
-    assert len([m for m in model.modules() if isinstance(m, Ridgon)]) == 2
-    assert not any(isinstance(m, nn.Conv1d) for m in model.modules())
+    assert len([m for m in model.modules() if isinstance(m, MemSolve)]) == 2
+    assert sum(isinstance(m, nn.Conv1d) for m in model.modules()) == 2
     for block in model.bert.encoder.layer:
         assert isinstance(block.attention.output.dense, nn.Identity)
         core = block.attention.mixer
+        assert core.config.qk_conv_dim == 1
+        expected = torch.zeros_like(core.qk_conv.weight)
+        expected[:, 0, 1] = 1
+        torch.testing.assert_close(core.qk_conv.weight, expected, rtol=0, atol=0)
         offset = core.config.num_heads * core.config.rank
         q, k, v = core.w_qkv.weight.split((offset, offset, 192))
         assert abs(k.std().item() * 192**0.5 - 1) < 0.05
@@ -56,9 +60,9 @@ def test_scaffold_initialization_and_weight_tying():
 
 
 def test_swiglu_width_and_packed_projection_gradients():
-    assert RidgonBertConfig().intermediate_size == 2048
-    assert RidgonBertConfig(hidden_size=384).intermediate_size == 1024
-    model = RidgonBertForMaskedLM(config()).double()
+    assert MemSolveBertConfig().intermediate_size == 2048
+    assert MemSolveBertConfig(hidden_size=384).intermediate_size == 1024
+    model = MemSolveBertForMaskedLM(config()).double()
     block = model.bert.encoder.layer[0]
     intermediate = block.intermediate
     x = torch.randn(2, 7, 64, dtype=torch.float64, requires_grad=True)
@@ -80,7 +84,7 @@ def test_swiglu_width_and_packed_projection_gradients():
 
 
 def test_checkpoint_requires_swiglu_architecture_metadata(tmp_path):
-    RidgonBertForMaskedLM(config()).save_pretrained(tmp_path)
+    MemSolveBertForMaskedLM(config()).save_pretrained(tmp_path)
     path = tmp_path / "config.json"
     saved = json.loads(path.read_text())
     del saved["ffn_type"]
@@ -91,19 +95,23 @@ def test_checkpoint_requires_swiglu_architecture_metadata(tmp_path):
 
 def test_checkpoint_requires_swiglu_weights_even_with_explicit_config(tmp_path):
     from safetensors.torch import load_file, save_file
-    model = RidgonBertForMaskedLM(config())
+    model = MemSolveBertForMaskedLM(config())
     model.save_pretrained(tmp_path)
     path = tmp_path / "model.safetensors"
     weights = load_file(path)
     weights = {k: v for k, v in weights.items() if "gate_up_proj" not in k}
     save_file(weights, path, metadata={"format": "pt"})
     with pytest.raises(RuntimeError, match="missing SwiGLU"):
-        RidgonBertForMaskedLM.from_pretrained(tmp_path, config=model.config)
+        MemSolveBertForMaskedLM.from_pretrained(tmp_path, config=model.config)
 
 
 def test_padding_is_excluded_but_mlm_tokens_are_valid():
     torch.manual_seed(12)
-    model = RidgonBertForMaskedLM(config()).eval()
+    model = MemSolveBertForMaskedLM(config()).eval()
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, MemSolve):
+                module.qk_conv.weight.add_(torch.randn_like(module.qk_conv.weight) * .1)
     data = batch()
     original = model(**data)
     changed = dict(data, input_ids=data["input_ids"].clone())
@@ -122,7 +130,7 @@ def test_padding_is_excluded_but_mlm_tokens_are_valid():
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_mlm_backward_and_gradient_checkpointing(checkpointing):
     torch.manual_seed(21)
-    model = RidgonBertForMaskedLM(config()).train()
+    model = MemSolveBertForMaskedLM(config()).train()
     if checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     output = model(**batch())
@@ -140,41 +148,48 @@ def test_mlm_backward_and_gradient_checkpointing(checkpointing):
 @pytest.mark.parametrize("max_shard_size", ["5GB", "20KB"])
 def test_hf_checkpoint_roundtrip_and_encoder_extraction(tmp_path, max_shard_size):
     torch.manual_seed(31)
-    model = RidgonBertForMaskedLM(config()).eval()
+    model = MemSolveBertForMaskedLM(config(memsolve_qk_conv_kernel_size=5,
+                                        memsolve_output_gate_rank=8)).eval()
     with torch.no_grad():
         model.bert.encoder.layer[0].attention.mixer.core_delta.normal_(std=0.1)
     model.save_pretrained(tmp_path, max_shard_size=max_shard_size)
-    assert isinstance(AutoConfig.from_pretrained(tmp_path), RidgonBertConfig)
+    saved_config = json.loads((tmp_path / "config.json").read_text())
+    assert saved_config["model_type"] == "memsolve_bert"
+    assert saved_config["architectures"] == ["MemSolveBertForMaskedLM"]
+    assert isinstance(AutoConfig.from_pretrained(tmp_path), MemSolveBertConfig)
     loaded, info = AutoModelForMaskedLM.from_pretrained(tmp_path, output_loading_info=True)
+    assert loaded.config.memsolve_qk_conv_kernel_size == 5
+    assert loaded.config.memsolve_output_gate_rank == 8
     assert info == dict(missing_keys=[], unexpected_keys=[], mismatched_keys=[], error_msgs=[])
     assert loaded.get_input_embeddings().weight is loaded.get_output_embeddings().weight
     torch.testing.assert_close(loaded(**batch()).logits, model(**batch()).logits, rtol=0, atol=0)
     encoder = AutoModel.from_pretrained(tmp_path)
-    assert isinstance(encoder, RidgonBertModel)
+    assert isinstance(encoder, MemSolveBertModel)
     inputs = {k: v for k, v in batch().items() if k != "labels"}
     torch.testing.assert_close(encoder(**inputs).last_hidden_state, model.bert(**inputs).last_hidden_state, rtol=0, atol=0)
     # The base encoder itself is also a standalone HF checkpoint.
     encoder.save_pretrained(tmp_path / "encoder")
+    assert json.loads((tmp_path / "encoder" / "config.json").read_text())["architectures"] == ["MemSolveBertModel"]
     restored = AutoModel.from_pretrained(tmp_path / "encoder")
     torch.testing.assert_close(restored(**inputs).last_hidden_state, encoder(**inputs).last_hidden_state, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("missing", [False, True])
 def test_hf_checkpoint_rejects_bad_operator_contract(tmp_path, missing):
-    model = RidgonBertForMaskedLM(config())
+    model = MemSolveBertForMaskedLM(config())
     model.save_pretrained(tmp_path)
     path = tmp_path / "config.json"
     saved = json.loads(path.read_text())
     if missing:
-        del saved["ridgon_contract"]
+        del saved["memsolve_contract"]
     else:
-        saved["ridgon_contract"]["version"] -= 1
+        saved["memsolve_contract"]["version"] -= 1
     path.write_text(json.dumps(saved))
     with pytest.raises((ValueError, RuntimeError), match="contract"):
         AutoModelForMaskedLM.from_pretrained(tmp_path)
 
 
-def test_explicit_ridgon_config_cannot_disguise_stock_bert_weights(tmp_path):
+def test_explicit_memsolve_config_cannot_disguise_stock_bert_weights(tmp_path):
     c = config()
     stock = BertForMaskedLM(BertConfig(
         vocab_size=c.vocab_size, hidden_size=c.hidden_size,
@@ -182,8 +197,8 @@ def test_explicit_ridgon_config_cannot_disguise_stock_bert_weights(tmp_path):
         intermediate_size=c.intermediate_size, max_position_embeddings=c.max_position_embeddings,
     ))
     stock.save_pretrained(tmp_path)
-    with pytest.raises(RuntimeError, match="missing Ridgon mixer weights"):
-        RidgonBertForMaskedLM.from_pretrained(tmp_path, config=c)
+    with pytest.raises(RuntimeError, match="missing MemSolve mixer weights"):
+        MemSolveBertForMaskedLM.from_pretrained(tmp_path, config=c)
 
 
 def test_unsupported_attention_interfaces_fail_explicitly():
@@ -191,7 +206,7 @@ def test_unsupported_attention_interfaces_fail_explicitly():
         config(is_decoder=True)
     with pytest.raises(ValueError, match="attention-probability"):
         config(attention_probs_dropout_prob=0.1)
-    model = RidgonBertForMaskedLM(config())
+    model = MemSolveBertForMaskedLM(config())
     with pytest.raises(ValueError, match="probabilities"):
         model(**batch(), output_attentions=True)
     data = batch()
@@ -209,7 +224,7 @@ def test_unsupported_attention_interfaces_fail_explicitly():
 @pytest.mark.parametrize("rank", [32, 48])
 def test_bf16_cuda_mlm_matches_reference_and_updates(rank):
     torch.manual_seed(43)
-    reference = RidgonBertForMaskedLM(config(ridgon_rank=rank)).cuda().train()
+    reference = MemSolveBertForMaskedLM(config(memsolve_rank=rank)).cuda().train()
     fast = copy.deepcopy(reference)
     for layer in fast.bert.encoder.layer:
         layer.attention.implementation = "cuda"

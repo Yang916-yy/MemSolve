@@ -1,7 +1,7 @@
-"""Thin OpenMMLab adapters for the ViT³-style Ridgon vision backbone.
+"""Thin OpenMMLab adapters for the ViT³-style MemSolve vision backbone.
 
 This module owns framework registration and padded-image plumbing only. The
-operator remains entirely in :mod:`ridgon.ball`, while the ViT³-style encoder is
+operator remains entirely in :mod:`memsolve.ball`, while the ViT³-style encoder is
 owned by :mod:`integrations.timm`.
 """
 
@@ -19,7 +19,7 @@ from experiments.imagenet import (
     validate_checkpoint_contract,
 )
 from integrations.timm import (
-    RidgonViT,
+    MemSolveViT,
     VisionTokenLayout,
     vision_default_rank,
     vision_spec,
@@ -65,12 +65,12 @@ def _checkpoint_state(payload: dict[str, Any]) -> dict[str, torch.Tensor | objec
     }
 
 
-class RidgonViTBackbone(RidgonViT):
-    """ViT³-style Ridgon features for Mask R-CNN/FPN and UperNet.
+class MemSolveViTBackbone(MemSolveViT):
+    """ViT³-style MemSolve features for Mask R-CNN/FPN and UperNet.
 
     Four intermediate plain-ViT maps are converted to strides 4, 8, 16, and
     32 with the same simple feature pyramid used by the XCiT downstream code.
-    A pixel-validity mask becomes the Ridgon token mask before every global mix.
+    A pixel-validity mask becomes the MemSolve token mask before every global mix.
     """
 
     def __init__(
@@ -79,6 +79,8 @@ class RidgonViTBackbone(RidgonViT):
         variant: str,
         image_size: int = 224,
         rank: int | None = None,
+        qk_conv_kernel_size: int = 3,
+        output_gate_rank: int = 32,
         out_indices: Sequence[int] | None = None,
         bias: bool = True,
         implementation: str = "cuda",
@@ -102,11 +104,11 @@ class RidgonViTBackbone(RidgonViT):
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "architecture": "vit3_cpe_mean_swiglu_v2", "ffn": "swiglu",
+            "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
             "layer_scale": False,
             "class_token": False,
             "pooling": "token_ln_mean",
-            "position_encoding": "cpe",
+            "position_encoding": "rope_2d_axial",
             "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": spec.embed_dim,
@@ -118,6 +120,8 @@ class RidgonViTBackbone(RidgonViT):
         self._pretrained_operator_contract = {
             "bias": bias,
             "implementation": implementation,
+            "qk_conv_kernel_size": qk_conv_kernel_size,
+            "output_gate_rank": output_gate_rank,
         }
         super().__init__(
             image_size=image_size,
@@ -127,6 +131,8 @@ class RidgonViTBackbone(RidgonViT):
             depth=spec.depth,
             num_heads=spec.num_heads,
             rank=resolved_rank,
+            qk_conv_kernel_size=qk_conv_kernel_size,
+            output_gate_rank=output_gate_rank,
             mlp_ratio=4.0,
             bias=bias,
             implementation=implementation,
@@ -354,7 +360,7 @@ def _pixel_valid_mask(
 class _MaskAwareMixin:
     """Thread OpenMMLab's per-image shape metadata into the token mixer."""
 
-    _ridgon_valid_mask: torch.Tensor | None = None
+    _memsolve_valid_mask: torch.Tensor | None = None
 
     def forward(
         self,
@@ -362,14 +368,14 @@ class _MaskAwareMixin:
         data_samples: Sequence[Any] | None = None,
         mode: str = "tensor",
     ) -> Any:
-        self._ridgon_valid_mask = _pixel_valid_mask(inputs, data_samples)
+        self._memsolve_valid_mask = _pixel_valid_mask(inputs, data_samples)
         try:
             return super().forward(inputs, data_samples, mode)
         finally:
-            self._ridgon_valid_mask = None
+            self._memsolve_valid_mask = None
 
     def extract_feat(self, batch_inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        features = self.backbone(batch_inputs, valid_mask=self._ridgon_valid_mask)
+        features = self.backbone(batch_inputs, valid_mask=self._memsolve_valid_mask)
         if self.with_neck:
             features = self.neck(features)
         return features
@@ -392,25 +398,25 @@ def _register_openmmlab() -> None:
         MMSEG_MODELS = None  # type: ignore[assignment]
 
     if MMDET_MODELS is not None:
-        MMDET_MODELS.register_module(module=RidgonViTBackbone, force=True)
+        MMDET_MODELS.register_module(module=MemSolveViTBackbone, force=True)
         if MaskRCNN is not None:
-            class RidgonMaskRCNN(_MaskAwareMixin, MaskRCNN):
+            class MemSolveMaskRCNN(_MaskAwareMixin, MaskRCNN):
                 pass
 
-            MMDET_MODELS.register_module(module=RidgonMaskRCNN, force=True)
-            globals()["RidgonMaskRCNN"] = RidgonMaskRCNN
+            MMDET_MODELS.register_module(module=MemSolveMaskRCNN, force=True)
+            globals()["MemSolveMaskRCNN"] = MemSolveMaskRCNN
 
     if MMSEG_MODELS is not None:
-        MMSEG_MODELS.register_module(module=RidgonViTBackbone, force=True)
+        MMSEG_MODELS.register_module(module=MemSolveViTBackbone, force=True)
         if EncoderDecoder is not None:
-            class RidgonEncoderDecoder(_MaskAwareMixin, EncoderDecoder):
+            class MemSolveEncoderDecoder(_MaskAwareMixin, EncoderDecoder):
                 pass
 
-            MMSEG_MODELS.register_module(module=RidgonEncoderDecoder, force=True)
-            globals()["RidgonEncoderDecoder"] = RidgonEncoderDecoder
+            MMSEG_MODELS.register_module(module=MemSolveEncoderDecoder, force=True)
+            globals()["MemSolveEncoderDecoder"] = MemSolveEncoderDecoder
 
 
 _register_openmmlab()
 
 
-__all__ = ["RidgonViTBackbone"]
+__all__ = ["MemSolveViTBackbone"]

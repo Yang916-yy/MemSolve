@@ -1,4 +1,4 @@
-Ridgon Operator
+MemSolve Operator
 Copyright 2026 Zhaoyang Wang
 
 This product is licensed under the Apache License, Version 2.0.
@@ -21,22 +21,52 @@ The packed SwiGLU gate/up layout in integrations/transformers.py follows
 Transformers' Apache-2.0 Phi3MLP implementation:
 https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/phi3/modeling_phi3.py
 Copyright 2024 Microsoft and the HuggingFace Inc. team. All rights reserved.
-Ridgon retains BERT projection biases and its FFN output residual module.
+MemSolve retains BERT projection biases and its FFN output residual module.
 
-The grouped RMSNorm kernels in ridgon/ball/cuda.py are adapted from
+The sigmoid output gate follows the placement/activation studied in
+Gated Attention (Qiu et al., 2025): https://arxiv.org/abs/2505.06708
+https://github.com/qiuzh20/gated_attention/blob/main/modeling_qwen3.py
+Post-RMS placement also follows FLA Gated DeltaNet (which uses SiLU).
+The low-rank linear factorization is MemSolve's cost choice. The fused
+post-RMS gate follows FLA's norm-before-gate forward/backward decomposition,
+with sigmoid rather than SiLU and FP32 normalization/gating arithmetic:
+https://github.com/fla-org/flash-linear-attention/blob/8024667ab58fdd8986587147fca71fecc017f977/fla/modules/layernorm_gated.py
+The three-residual BF16/FP32 readout product follows the multi-component
+arithmetic construction of Henry et al. (2019), https://arxiv.org/abs/1904.06376.
+Since one operand is exactly BF16, three residual products suffice without
+the cross terms required for two FP32 operands.
+
+The FP16 readout-forward / BF16 backward storage policy is informed by
+FLA Mesa's range-aware Q/K precision and its state/small-gradient fixes:
+https://github.com/fla-org/flash-linear-attention/pull/1152
+https://github.com/fla-org/flash-linear-attention/issues/1283
+The parallel weight-gradient reduction follows CUTLASS's split-K algorithm,
+implemented using the existing Triton GEMM (no CUTLASS source is copied):
+https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html#parallelized-reductions
+
+The grouped RMSNorm kernels in memsolve/ball/cuda.py are adapted from
 https://github.com/fla-org/flash-linear-attention/blob/954438d1fcb5e1bb05c22f9908de9c5c2df74ae5/fla/modules/layernorm.py
 Copyright (c) 2023 Tri Dao
 
-Token-kernel scheduling and small-tile warp choices in ridgon/ball/cuda.py
+Token-kernel scheduling and small-tile warp choices in memsolve/ball/cuda.py
 also draw on the MIT-licensed FLA chunk kernels:
 https://github.com/fla-org/flash-linear-attention/blob/864a87f6ce5be8828bef81eb22baafd41937cdf2/fla/ops/common/chunk_o.py
+
+The packed rotary kernel in memsolve/ball/cuda.py specializes the interleaved
+pair-loading and conjugate-backward algorithm from the MIT-licensed FLA:
+https://github.com/fla-org/flash-linear-attention/blob/864a87f6ce5be8828bef81eb22baafd41937cdf2/fla/modules/rotary.py
+Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
+The fixed axial frequency formula and channel convention in reference.py
+follow RoPE-ViT's compute_axial_cis (theta 100):
+https://github.com/naver-ai/rope-vit/blob/main/models/vit_rope.py
 
 MIT License
 
 Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 
-The vision scaffold in integrations/timm.py follows the residual CPE,
-Pre-LN and token-LN mean readout in the MIT-licensed ViT³ implementation:
+The vision scaffold in integrations/timm.py follows the Pre-LN and token-LN
+mean readout in the MIT-licensed ViT³ implementation (its residual CPE has
+been replaced by Q/K convolution followed by 2D RoPE):
 https://github.com/LeapLabTHU/ViTTT/blob/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt/models/vittt.py
 ViT³ modifications by Dongchen Han; upstream license copyright
 (c) Microsoft Corporation. The MIT permission notice below applies.
@@ -59,7 +89,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The projection GEMM grouped program ordering in ridgon/ball/reference.py follows
+The projection GEMM grouped program ordering in memsolve/ball/reference.py follows
 https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
 
 /*

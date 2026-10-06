@@ -3,9 +3,9 @@ from copy import deepcopy
 import pytest
 import torch
 
-from ridgon import Ridgon, RidgonConfig
-from ridgon.ball import cuda
-from ridgon.ball.reference import ridge_query_readout, head_rms_norm, split_qkv
+from memsolve import MemSolve, MemSolveConfig
+from memsolve.ball import cuda
+from memsolve.ball.reference import ridge_query_readout, head_rms_norm, split_qkv
 
 pytestmark = [
     pytest.mark.cuda,
@@ -21,6 +21,25 @@ def relative(actual, expected):
     return (
         actual.double() - expected.double()
     ).norm() / expected.double().norm().clamp_min(1e-12)
+
+
+@pytest.mark.parametrize('rank', [16, 32, 48, 64])
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
+def test_packed_rope_and_conjugate_backward_match_reference(rank, dtype):
+    from memsolve.ball.reference import axial_rotary_tables, rotary_qk
+
+    torch.manual_seed(232)
+    # Odd packed width exercises row alignment; transposed cotangent exercises
+    # noncontiguous incoming gradients. Nonzero positions test both grid axes.
+    x = torch.randn(2, 15, 2 * rank + 7, device='cuda', dtype=dtype, requires_grad=True)
+    cos, sin = axial_rotary_tables(rank, (3, 5), device=x.device, dtype=torch.float32)
+    actual = cuda.rotary_qk(x, 1, cos, sin)
+    expected = rotary_qk(x, 1, cos, sin)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    e = torch.randn(2, x.shape[-1], 15, device='cuda', dtype=dtype).transpose(1, 2)
+    torch.testing.assert_close(torch.autograd.grad(actual, x, e)[0],
+                               torch.autograd.grad(expected, x, e)[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[..., 2 * rank:], x[..., 2 * rank:], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -88,22 +107,52 @@ def test_fla_group_rmsnorm_and_vjp_match_reference(dim, scale):
         assert relative(a, b) < 2e-5
 
 
+def test_compiled_sigmoid_output_gate_matches_forward_and_both_adjoints():
+    from memsolve.ball.reference import sigmoid_output_gate
+    import torch._functorch.config as functorch_config
+
+    torch.manual_seed(171)
+    value = torch.randn(2, 37, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    # Cover useful gate tails as well as the unsaturated central region.
+    logits = torch.linspace(-12, 12, value.numel(), device="cuda", dtype=torch.bfloat16)
+    logits = logits.reshape_as(value).requires_grad_()
+    compiled = torch.compile(sigmoid_output_gate, fullgraph=True,
+                             options={"triton.cudagraphs": False, "emulate_precision_casts": True})
+    cotangent = torch.randn_like(value)
+    with functorch_config.patch(backward_pass_autocast="off"):
+        actual = compiled(value, logits)
+        actual_grads = torch.autograd.grad(actual, (value, logits), cotangent)
+    expected = sigmoid_output_gate(value, logits)
+    expected_grads = torch.autograd.grad(expected, (value, logits), cotangent)
+    assert relative(actual, expected) < 0.001
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        assert relative(actual_grad, expected_grad) < 0.001
+
+
 @pytest.mark.parametrize("rank", [16, 32, 48, 64])
 @pytest.mark.parametrize("delta_scale", [0.0, 0.3])
-def test_public_model_production_reference_and_cuda_gradients(rank, delta_scale):
+@pytest.mark.parametrize("conv_dim", [1, 2])
+@pytest.mark.parametrize("kernel_size", [3, 5])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_public_model_production_reference_and_cuda_gradients(rank, delta_scale, conv_dim, kernel_size, dtype):
     _require_cuda()
     torch.manual_seed(41)
-    ref = Ridgon(RidgonConfig(64, 2, rank, bias=True)).cuda()
+    ref = MemSolve(MemSolveConfig(64, 2, rank, bias=True, qk_conv_dim=conv_dim,
+                             qk_conv_kernel_size=kernel_size)).cuda()
     with torch.no_grad():
         ref.core_delta.normal_(std=delta_scale)
+        ref.qk_conv.weight.add_(torch.randn_like(ref.qk_conv.weight) * .1)
+        ref.gate_up.weight.normal_(std=.7)
     fast = deepcopy(ref)
-    x = torch.randn(3, 37, 64, device="cuda", dtype=torch.bfloat16)
-    mask = torch.rand(3, 37, device="cuda") > 0.2
+    x = torch.randn(3, 35, 64, device="cuda", dtype=dtype)
+    # Public masks may be strided even though the packed CUDA mask is dense.
+    mask = (torch.rand(35, 3, device="cuda") > 0.2).transpose(0, 1)
+    kwargs = {"spatial_shape": (5, 7)} if conv_dim == 2 else {}
     mask[-1] = False
     a = x.clone().requires_grad_()
     b = x.clone().requires_grad_()
-    yr = ref(a, mask)
-    yc = fast(b, mask, implementation="cuda")
+    yr = ref(a, mask, **kwargs)
+    yc = fast(b, mask, implementation="cuda", **kwargs)
     e = torch.randn_like(yr)
     (yr * e).sum().backward()
     (yc * e).sum().backward()
@@ -161,14 +210,113 @@ def test_fused_readout_norm_supports_weight_only_gradients():
     assert weight.grad is not None and torch.isfinite(weight.grad).all()
 
 
-def test_cuda_graph_replays_changed_inputs_and_core_without_stale_map():
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_fused_gate_rounds_once_and_matches_all_adjoints(rank):
+    from memsolve.ball.reference import sigmoid_output_gate
+
+    torch.manual_seed(187)
+    batch, length, heads, dim = 2, 37, 2, 32
+    x = torch.randn(batch, length, heads * (2 * rank + dim),
+                    device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    core = torch.randn(heads, rank, rank, device="cuda", requires_grad=True)
+    w = torch.randn(dim, device="cuda", requires_grad=True)
+    logits = torch.linspace(-12, 12, batch * length * heads * dim,
+                            device="cuda", dtype=torch.bfloat16).reshape(batch, length, -1).requires_grad_()
+    e = torch.randn_like(logits)
+    fused = cuda.fast_mix(x, core, norm_weight=w, gate_logits=logits)
+    # Independent reference: RMS and sigmoid are FP32 until the final store.
+    q, k, v = split_qkv(x, heads, rank)
+    raw = ridge_query_readout(q, k, v, core).transpose(1, 2)
+    normalized = head_rms_norm(raw, w).reshape_as(logits)
+    separate = sigmoid_output_gate(normalized, logits).to(torch.bfloat16)
+    assert relative(fused, separate) < 0.001
+    for actual, expected in zip(torch.autograd.grad(fused, (x, core, w, logits), e),
+                                torch.autograd.grad(separate, (x, core, w, logits), e)):
+        assert relative(actual, expected) < 0.001
+    # A trainable gate alone must still select the autograd implementation.
+    only_gate = logits.detach().requires_grad_()
+    cuda.fast_mix(x.detach(), core.detach(), norm_weight=w.detach(),
+                  gate_logits=only_gate).float().sum().backward()
+    assert only_gate.grad is not None and torch.isfinite(only_gate.grad).all()
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_fp16_projected_readout_matches_oracle_and_retains_small_gradients(rank):
+    torch.manual_seed(417)
+    b, n, h, d = 2, 37, 2, 32
+    packed = torch.randn(b, n, h*(2*rank+d), device="cuda", dtype=torch.bfloat16)
+    packed[..., h*rank:2*h*rank] *= 8
+    packed[-1] = 0
+    packed.requires_grad_()
+    core = torch.randn(h, rank, rank, device="cuda", requires_grad=True)
+    gain = torch.randn(d, device="cuda", requires_grad=True)
+    logits = torch.linspace(-12, 12, b*n*h*d, device="cuda", dtype=torch.bfloat16).reshape(b,n,h*d).requires_grad_()
+    wo = (torch.randn(h*d, h*d, device="cuda")*.1).requires_grad_()
+    bias = torch.randn(h*d, device="cuda", requires_grad=True)
+    inputs = (packed, core, gain, logits, wo, bias)
+    y = cuda.fast_mix(packed, core, norm_weight=gain, gate_logits=logits,
+                     output_weight=wo, output_bias=bias, output_dtype=torch.float32)
+    oracle = tuple(x.detach().double().requires_grad_() for x in inputs)
+    q, k, v = split_qkv(oracle[0], h, rank)
+    raw = ridge_query_readout(q,k,v,oracle[1]).transpose(1,2)
+    norm = head_rms_norm(raw, oracle[2]).reshape_as(logits)
+    ref = (norm * oracle[3].sigmoid()) @ oracle[4].T + oracle[5]
+    assert relative(y, ref) < .001
+    e = torch.randn_like(y)
+    expected = torch.autograd.grad(ref, oracle, e.double())
+    actual = torch.autograd.grad(y, inputs, e, retain_graph=True)
+    for a, z in zip(actual, expected):
+        assert relative(a, z) < .008
+    # Upstream gradient scaling must not change the VJP, beyond BF16 rounding.
+    for scale in (1e-3, 1e-7, 1e-9):
+        grads = torch.autograd.grad(y, inputs, e*scale, retain_graph=True)
+        for a, z in zip(grads, actual):
+            assert torch.isfinite(a).all()
+            assert relative(a.float()/scale, z) < .008
+    # Output-projection-only gradients still require the custom autograd path.
+    frozen = [x.detach() for x in inputs]
+    frozen[-1].requires_grad_()
+    cuda.fast_mix(frozen[0], frozen[1], norm_weight=frozen[2], gate_logits=frozen[3],
+                  output_weight=frozen[4], output_bias=frozen[5], output_dtype=torch.float32).sum().backward()
+    assert torch.equal(frozen[-1].grad, torch.full_like(bias, b*n))
+
+
+@pytest.mark.parametrize("shape,kernel", [(None, 1), (None, 5), ((5, 7), 1), ((5, 7), 5)])
+def test_native_local_pack_matches_centered_filter_rope_and_mask(shape, kernel):
+    from memsolve.ball.reference import axial_rotary_tables, convolve_qk, rotary_qk
+
+    torch.manual_seed(280)
+    # QK and V share a partial 512-element block; exercise gapped/empty masks.
+    x = torch.randn(2, 35, 39, device="cuda", dtype=torch.bfloat16)
+    mask = torch.rand(2, 35, device="cuda") > .3
+    mask[-1] = False
+    x = torch.where(mask[..., None], x, 0).requires_grad_()
+    w = torch.randn((32, 1) + (kernel,) * (1 if shape is None else 2),
+                    device="cuda", requires_grad=True)
+    cos, sin = (None, None) if shape is None else axial_rotary_tables(
+        16, shape, device=x.device, dtype=torch.float32)
+    expected = convolve_qk(x, w, shape)
+    if shape is not None:
+        expected = rotary_qk(expected, 1, cos, sin)
+    expected = torch.where(mask[..., None], expected, 0)
+    actual = cuda.local_qk(x, w, cos=cos, sin=sin, valid_mask=mask, spatial_shape=shape)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # A strided incoming gradient must work in the packing adjoint.
+    e = torch.randn(2, 39, 35, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    for a, b in zip(torch.autograd.grad(actual, (x, w), e), torch.autograd.grad(expected, (x, w), e)):
+        assert relative(a, b) < 0.005
+
+
+@pytest.mark.parametrize("conv_dim", [1, 2])
+def test_cuda_graph_replays_changed_inputs_and_core_without_stale_map(conv_dim):
     _require_cuda()
     torch.manual_seed(27)
-    model = Ridgon(RidgonConfig(64, 2, 16)).cuda()
-    x = torch.randn(2, 37, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    model = MemSolve(MemSolveConfig(64, 2, 16, qk_conv_dim=conv_dim)).cuda()
+    kwargs = {"spatial_shape": (5, 7)} if conv_dim == 2 else {}
+    x = torch.randn(2, 35, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
     def step():
-        y = model(x, implementation="cuda")
+        y = model(x, implementation="cuda", **kwargs)
         y.float().square().mean().backward()
         return y
 
@@ -187,6 +335,11 @@ def test_cuda_graph_replays_changed_inputs_and_core_without_stale_map():
     with torch.no_grad():
         x.copy_(torch.randn_like(x))
         model.core_delta.add_(torch.randn_like(model.core_delta) * 0.05)
+        model.qk_conv.weight.add_(torch.randn_like(model.qk_conv.weight) * .1)
+        if conv_dim == 2:
+            # Eager evaluation on a different same-length grid must not release
+            # or overwrite the tables still referenced by the captured graph.
+            model(x, implementation='cuda', spatial_shape=(7, 5))
     model.zero_grad(set_to_none=False)
     x.grad.zero_()
     graph.replay()
@@ -194,7 +347,7 @@ def test_cuda_graph_replays_changed_inputs_and_core_without_stale_map():
     gradients = [p.grad.clone() for p in model.parameters()]
     eager_model = deepcopy(model)
     eager_x = x.detach().clone().requires_grad_()
-    eager = eager_model(eager_x, implementation="cuda")
+    eager = eager_model(eager_x, implementation="cuda", **kwargs)
     eager.float().square().mean().backward()
     torch.testing.assert_close(replay, eager, rtol=0, atol=0)
     for a, p in zip(gradients, eager_model.parameters()):
@@ -203,8 +356,8 @@ def test_cuda_graph_replays_changed_inputs_and_core_without_stale_map():
 
 def test_cuda_contract_and_public_rejections():
     _require_cuda()
-    assert cuda._CUDA_CONTRACT_VERSION == 17
-    model = Ridgon(RidgonConfig(64, 2, 16)).cuda()
+    assert cuda._CUDA_CONTRACT_VERSION == 19
+    model = MemSolve(MemSolveConfig(64, 2, 16)).cuda()
     with pytest.raises(TypeError):
         model(torch.randn(1, 7, 64, device="cuda"), implementation="cuda")
     with pytest.raises(ValueError):
@@ -218,7 +371,7 @@ def test_cuda_contract_and_public_rejections():
 
 def test_graph_training_replays_fused_adamw_and_matches_eager():
     torch.manual_seed(113)
-    model = Ridgon(RidgonConfig(64, 2, 16)).cuda()
+    model = MemSolve(MemSolveConfig(64, 2, 16)).cuda()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=0.002, fused=True, capturable=True,
     )
@@ -257,7 +410,7 @@ def test_graph_training_replays_fused_adamw_and_matches_eager():
 
 
 def test_fused_amp_skipped_step_preserves_delta_and_moments():
-    model = Ridgon(RidgonConfig(64, 2, 16)).cuda()
+    model = MemSolve(MemSolveConfig(64, 2, 16)).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, fused=True)
     scaler = torch.amp.GradScaler("cuda")
     for skip in (False, True):

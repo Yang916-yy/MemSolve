@@ -6,22 +6,22 @@ import importlib.util
 import torch
 
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
-_CUDA_CONTRACT_VERSION = 17
+_CUDA_CONTRACT_VERSION = 19
 
 
 def is_available() -> bool:
-    """The fast path uses PyTorch CUDA and Triton; no native Ridgon library."""
+    """The fast path uses PyTorch CUDA and Triton; no native MemSolve library."""
     return torch.cuda.is_available() and importlib.util.find_spec("triton") is not None
 
 
 def require_available() -> None:
     if not is_available():
-        raise RuntimeError("the Ridgon CUDA fast path requires CUDA PyTorch and Triton")
+        raise RuntimeError("the MemSolve CUDA fast path requires CUDA PyTorch and Triton")
 
 
 def _device_architecture(device: torch.device | int | None = None) -> int:
     if not torch.cuda.is_available():
-        raise RuntimeError("the Ridgon CUDA fast path requires an available CUDA device")
+        raise RuntimeError("the MemSolve CUDA fast path requires an available CUDA device")
 
     if device is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
@@ -31,7 +31,7 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
         resolved_device = torch.device(device)
     if resolved_device.type != "cuda":
         raise ValueError(
-            f"the Ridgon CUDA fast path requires a CUDA device, got {resolved_device}"
+            f"the MemSolve CUDA fast path requires a CUDA device, got {resolved_device}"
         )
     if resolved_device.index is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
@@ -42,7 +42,7 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
         architecture = 120
     if architecture not in _SUPPORTED_ARCHITECTURES:
         raise RuntimeError(
-            "the Ridgon CUDA fast path supports SM80, SM86, SM87, SM89, "
+            "the MemSolve CUDA fast path supports SM80, SM86, SM87, SM89, "
             f"SM90, SM100, and SM120; got SM{major}{minor}"
         )
     return architecture
@@ -55,6 +55,186 @@ def load(*, device: torch.device | int | None = None) -> None:
 
 
 @lru_cache(maxsize=1)
+def _rotary_kernel():
+    # Interleaved-pair loading and conjugate backward follow FLA rotary.py
+    # (MIT; see NOTICE). Specialize to packed [Q,K,V], copying V in the same
+    # launch, with no full-size FP32 intermediate or saved input activations.
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def rotate(X, COS, SIN, Y, SIZE: tl.constexpr, N: tl.constexpr,
+               C: tl.constexpr, H: tl.constexpr, R: tl.constexpr,
+               CONJUGATE: tl.constexpr, BLOCK: tl.constexpr):
+        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        channel = offset % C
+        token = (offset // C) % N
+        valid = offset < SIZE
+        is_qk = channel < 2 * H * R
+        pair = (channel % R) // 2
+        cosine = tl.load(COS + token * (R // 2) + pair, valid & is_qk, other=1).to(tl.float32)
+        sine = tl.load(SIN + token * (R // 2) + pair, valid & is_qk, other=0).to(tl.float32)
+        x = tl.load(X + offset, valid, other=0).to(tl.float32)
+        mate = tl.load(X + offset + 1 - 2 * (channel % 2), valid & is_qk, other=0).to(tl.float32)
+        if CONJUGATE:
+            sine = -sine
+        base, cross = x * cosine, mate * sine
+        rotated = tl.where(channel % 2 == 0, base - cross, base + cross)
+        tl.store(Y + offset, tl.where(is_qk, rotated, x), valid)
+
+    return rotate
+
+
+def _rotate_packed(projected, num_heads, cos, sin, *, conjugate):
+    projected = projected.contiguous()
+    output = torch.empty_like(projected)
+    batch, length, width = projected.shape
+    size = batch * length * width
+    _rotary_kernel()[((size + 511) // 512,)](
+        projected, cos, sin, output, size, length, width, num_heads, 2 * cos.shape[1],
+        conjugate, 512, num_warps=4, enable_fp_fusion=False,
+    )
+    return output
+
+
+class _RotaryQK(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, projected, num_heads, cos, sin):
+        ctx.num_heads = num_heads
+        ctx.save_for_backward(cos, sin)
+        return _rotate_packed(projected, num_heads, cos, sin, conjugate=False)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        cos, sin = ctx.saved_tensors
+        return _rotate_packed(gradient, ctx.num_heads, cos, sin, conjugate=True), None, None, None
+
+
+def rotary_qk(projected, num_heads, cos, sin):
+    """Packed Q/K rotation; tables obey reference.axial_rotary_tables."""
+    if projected.device.type != "cuda" or projected.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("CUDA RoPE requires CUDA float16/bfloat16/float32 projections")
+    if projected.ndim != 3 or min(projected.shape) <= 0:
+        raise ValueError("CUDA RoPE requires nonempty [B,N,C] projections")
+    if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+        raise ValueError("CUDA RoPE requires positive num_heads")
+    if cos.ndim != 2 or cos.shape != sin.shape or cos.shape[0] != projected.shape[1] or cos.shape[1] <= 0:
+        raise ValueError("CUDA RoPE tables must have shape [N,rank/2]")
+    if projected.shape[-1] <= 4 * num_heads * cos.shape[1]:
+        raise ValueError("CUDA RoPE requires packed Q/K and nonempty V")
+    for table in (cos, sin):
+        if table.device != projected.device or table.dtype != torch.float32 or not table.is_contiguous():
+            raise TypeError("CUDA RoPE requires contiguous FP32 tables on the projection device")
+        if table.requires_grad:
+            raise ValueError("CUDA RoPE uses fixed positional frequencies")
+    load(device=projected.device)
+    return _RotaryQK.apply(projected, num_heads, cos, sin)
+
+
+@lru_cache(maxsize=1)
+def _local_pack_kernel():
+    # FLA-style adjacent-pair RoPE, fused with packing / unpacking and masking.
+    # The depthwise convolution itself stays in cuDNN.
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def pack(QK, V, COS, SIN, MASK, PACKED,
+             SIZE: tl.constexpr, N: tl.constexpr, C: tl.constexpr,
+             Q: tl.constexpr, R: tl.constexpr, V0: tl.constexpr, V1: tl.constexpr,
+             ROPE: tl.constexpr, MASKED: tl.constexpr, BACKWARD: tl.constexpr,
+             BLOCK: tl.constexpr):
+        o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        c, row = o % C, o // C
+        b, n = row // N, row % N
+        valid = o < SIZE
+        active = valid
+        if MASKED:
+            active = active & tl.load(MASK + row, valid, 0)
+        is_qk = c < Q
+        if BACKWARD:
+            x = tl.load(PACKED + o, active, 0).to(tl.float32)
+        else:
+            qk = tl.load(QK + row * Q + c, active & is_qk, 0).to(tl.float32)
+            v = tl.load(V + b * V0 + n * V1 + c - Q, active & ~is_qk, 0).to(tl.float32)
+            x = tl.where(is_qk, qk, v)
+        if ROPE:
+            phase = n * (R // 2) + (c % R) // 2
+            co = tl.load(COS + phase, active & is_qk, 1)
+            si = tl.load(SIN + phase, active & is_qk, 0)
+            if BACKWARD:
+                mate = tl.load(PACKED + o + 1 - 2 * (c % 2), active & is_qk, 0).to(tl.float32)
+                si = -si
+            else:
+                mate = tl.load(QK + row * Q + (c ^ 1), active & is_qk, 0).to(tl.float32)
+            base, cross = x * co, mate * si
+            x = tl.where(c % 2 == 0, base - cross, base + cross)
+        if BACKWARD:
+            tl.store(QK + row * Q + c, x, valid & is_qk)
+            tl.store(V + row * (C - Q) + c - Q, x, valid & ~is_qk)
+        else:
+            tl.store(PACKED + o, x, valid)
+    return pack
+
+
+class _PackLocalQK(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qk, value, cos, sin, mask):
+        batch, length, channels = qk.shape
+        width = channels + value.shape[-1]
+        output = torch.empty((batch, length, width), device=qk.device, dtype=qk.dtype)
+        args = (batch * length * width, length, width, channels,
+                0 if cos is None else 2 * cos.shape[1], value.stride(0), value.stride(1),
+                cos is not None, mask is not None)
+        _local_pack_kernel()[((output.numel() + 511) // 512,)](
+            qk, value, cos, sin, mask, output, *args, False, 512,
+            num_warps=4, enable_fp_fusion=False,
+        )
+        ctx.save_for_backward(cos, sin, mask)
+        ctx.args = args
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        cos, sin, mask = ctx.saved_tensors
+        batch, length, width = gradient.shape
+        channels = ctx.args[3]
+        qk = torch.empty((batch, length, channels), device=gradient.device, dtype=gradient.dtype)
+        value = torch.empty((batch, length, width - channels), device=gradient.device, dtype=gradient.dtype)
+        _local_pack_kernel()[((gradient.numel() + 511) // 512,)](
+            qk, value, cos, sin, mask, gradient.contiguous(), *ctx.args, True, 512,
+            num_warps=4, enable_fp_fusion=False,
+        )
+        return qk, value, None, None, None
+
+
+def local_qk(projected, weight, *, cos=None, sin=None, valid_mask=None, spatial_shape=None):
+    """Native channels-last convolution plus fused QKV packing/RoPE/masking.
+
+    A sequence is a 1 x N grid and its width-k filter is a 1 x k kernel. This
+    equals centered Conv1d exactly, while letting cuDNN retain channels-last
+    activations in both modalities. Invalid input rows are zeroed by the model.
+    """
+    import torch.nn.functional as functional
+
+    batch, length, width = projected.shape
+    channels = weight.shape[0]
+    shape = (1, length) if spatial_shape is None else spatial_shape
+    qk, value = projected.split((channels, width - channels), -1)
+    with torch.autocast('cuda', enabled=False):
+        x = qk.reshape(batch, *shape, channels).permute(0, 3, 1, 2)
+        x = x.contiguous(memory_format=torch.channels_last)
+        w = weight.to(torch.bfloat16)
+        if spatial_shape is None:
+            w = w.unsqueeze(2)
+        qk = functional.conv2d(x, w, padding=(w.shape[-2] // 2, w.shape[-1] // 2), groups=channels)
+        qk = qk.flatten(2).transpose(1, 2).contiguous()
+        return _PackLocalQK.apply(qk, value, cos, sin, valid_mask)
+
+
+@lru_cache(maxsize=1)
 def _token_kernels():
     """Parallel token tiles, compact reduction, then a separate readout.
 
@@ -62,7 +242,9 @@ def _token_kernels():
     Triton's upstream FP32-input Tensor Core decomposition, also implemented
     by OpenXLA following Henry et al. (2019). FP32 storage and accumulation
     are retained; no direct FP16 cast of unbounded coefficients or adjoints.
-    BF16 Q/K/V statistics use ordinary BF16 dots.
+    BF16 Q/K/V statistics use ordinary BF16 dots. The normalized readout and
+    its coefficient VJP use three residual products for the FP32 operand,
+    retaining the low component omitted by ordinary BF16x3.
     The grid traverses (head, token tile, batch), keeping heads/tokens local
     before advancing to another sample, following FLA chunk-kernel scheduling.
     """
@@ -72,6 +254,19 @@ def _token_kernels():
     @jit
     def wide_dot(a, b):
         return tl.dot(a.to(tl.float32), b.to(tl.float32), input_precision="bf16x3")
+
+    @jit
+    def mixed_dot(a, b):
+        # A is exactly BF16. Three residual components of the FP32 operand
+        # retain its mantissa; ordinary BF16x3 omits the third component.
+        # Accumulate small products first so the large term rounds only once.
+        hi = b.to(tl.bfloat16)
+        residual = b - hi.to(tl.float32)
+        mid = residual.to(tl.bfloat16)
+        lo = (residual - mid.to(tl.float32)).to(tl.bfloat16)
+        result = tl.dot(a, lo)
+        result = tl.dot(a, mid, result)
+        return tl.dot(a, hi, result)
 
     @jit
     def statistics(
@@ -270,9 +465,9 @@ def _token_kernels():
 
     @jit
     def normalized_readout(
-        X, COEF, COUNT, W, E, Y, DW, DM,
+        X, COEF, COUNT, W, E, Y, DW, DM, GATE, DGATE,
         N: tl.constexpr, H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
-        HAS_COUNT: tl.constexpr, BACKWARD: tl.constexpr,
+        HAS_COUNT: tl.constexpr, BACKWARD: tl.constexpr, HAS_GATE: tl.constexpr,
         BR: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr,
     ):
         # Recompute the compact query readout in backward instead of saving a
@@ -293,34 +488,49 @@ def _token_kernels():
             COEF + (s * R + r[:, None]) * D + d[None, :],
             (r[:, None] < R) & (d[None, :] < D), 0,
         )
-        value = wide_dot(q, coef) / tl.sqrt(count)
+        value = mixed_dot(q, coef) / tl.sqrt(count)
         rstd = tl.rsqrt(tl.sum(value * value, 1) / D + 1e-6)
         xhat = value * rstd[:, None]
         weight = tl.load(W + d, d < D, 0)
         offset = (b * N + n[:, None]) * (H * D) + h * D + d[None, :]
+        if HAS_GATE:
+            logits = tl.load(GATE + offset, (n[:, None] < N) & (d[None, :] < D), 0).to(tl.float32)
+            gate = tl.sigmoid(logits)
+            # RMS, gain and gating share FP32 registers; round only on store.
+            normalized = xhat * weight[None, :]
         if BACKWARD:
             e = tl.load(
                 E + offset, (n[:, None] < N) & (d[None, :] < D), 0,
             ).to(tl.float32)
+            if HAS_GATE:
+                dg = ((e * normalized) * gate) * (1.0 - gate)
+                tl.store(DGATE + offset, dg, (n[:, None] < N) & (d[None, :] < D))
+                e = e * gate
             we = e * weight[None, :]
             result = (we - xhat * (tl.sum(we * xhat, 1) / D)[:, None]) * rstd[:, None]
+            dw = tl.sum(e * xhat, 0)
+            tl.store(DW + (s * tl.cdiv(N, BT) + tile) * D + d, dw, d < D)
             inv = 1.0 / tl.sqrt(count)
             # Both readout VJPs consume the same RMS adjoint. Compute them here
             # so that no token-sized FP32 adjoint crosses the compact-solve barrier.
-            dm = wide_dot(tl.trans(q), result) * inv
+            dm = mixed_dot(tl.trans(q), result) * inv
             tl.store(
                 DM + ((s * tl.cdiv(N, BT) + tile) * R + r[:, None]) * D + d[None, :],
                 dm, (r[:, None] < R) & (d[None, :] < D),
+            )
+            # Reload the small coefficient after dM so it need not remain
+            # live across normalization and another Tensor Core product.
+            coef = tl.load(
+                COEF + (s * R + r[:, None]) * D + d[None, :],
+                (r[:, None] < R) & (d[None, :] < D), 0, volatile=True,
             )
             dq = wide_dot(result, tl.trans(coef)) * inv
             tl.store(
                 Y + (b * N + n[:, None]) * (H * (2 * R + D)) + h * R + r[None, :],
                 dq, (n[:, None] < N) & (r[None, :] < R),
             )
-            dw = tl.sum(e * xhat, 0)
-            tl.store(DW + (s * tl.cdiv(N, BT) + tile) * D + d, dw, d < D)
         else:
-            result = xhat * weight[None, :]
+            result = normalized * gate if HAS_GATE else xhat * weight[None, :]
             tl.store(Y + offset, result, (n[:, None] < N) & (d[None, :] < D))
 
     return statistics, readout, backward, normalized_readout
@@ -413,69 +623,118 @@ def _compact_product_kernel():
         Z0: tl.constexpr, Z1: tl.constexpr, Z2: tl.constexpr, Z3: tl.constexpr,
         BR: tl.constexpr,
     ):
-        s = tl.program_id(0)
-        r = tl.arange(0, BR)
-        square_mask = (r[:, None] < R) & (r[None, :] < R)
-        t = tl.load(T + (s % H) * R * R + r[:, None] * R + r[None, :], square_mask, 0)
-        dt = tl.load(DT + s * R * R + r[:, None] * R + r[None, :], square_mask, 0)
-        product = -tl.dot(t, tl.trans(dt), input_precision="ieee")
-        for start in range(tl.cdiv(D, 32)):
-            d = start * 32 + tl.arange(0, 32)
-            mask = (r[:, None] < R) & (d[None, :] < D)
-            dz = tl.load(DZ + s * R * D + r[:, None] * D + d[None, :], mask, 0)
-            z = tl.load(
-                Z + (s // H) * Z0 + (s % H) * Z1
-                + r[:, None] * Z2 + d[None, :] * Z3, mask, 0,
-            )
-            product -= tl.dot(dz, tl.trans(z), input_precision="ieee")
-        # sym(Phi(product)): copy the lower triangle, halve every stored entry.
-        symmetric = tl.where(r[:, None] >= r[None, :], product, tl.trans(product)) * 0.5
-        tl.store(OUT + s * R * R + r[:, None] + r[None, :] * R, symmetric, square_mask)
+        s = tl.program_id(2)
+        i = tl.program_id(0) * BR + tl.arange(0, BR)
+        j = tl.program_id(1) * BR + tl.arange(0, BR)
+        # Only lower blocks are needed; mirror them into the upper triangle.
+        # A 32x32 output tile avoids the register spills of full-rank IEEE dots.
+        if tl.program_id(0) >= tl.program_id(1):
+            inner = tl.arange(0, 32)
+            product = tl.full((BR, BR), 0., tl.float32)
+            for start in range(tl.cdiv(R, 32)):
+                k = start * 32 + inner
+                t = tl.load(T + (s % H) * R * R + i[:, None] * R + k[None, :],
+                            (i[:, None] < R) & (k[None, :] < R), 0)
+                dt = tl.load(DT + s * R * R + j[:, None] * R + k[None, :],
+                             (j[:, None] < R) & (k[None, :] < R), 0)
+                product -= tl.dot(t, tl.trans(dt), input_precision="ieee")
+            for start in range(tl.cdiv(D, 32)):
+                d = start * 32 + inner
+                dz = tl.load(DZ + (s * R + i[:, None]) * D + d[None, :],
+                             (i[:, None] < R) & (d[None, :] < D), 0)
+                z = tl.load(Z + (s // H) * Z0 + (s % H) * Z1
+                            + j[:, None] * Z2 + d[None, :] * Z3,
+                            (j[:, None] < R) & (d[None, :] < D), 0)
+                product -= tl.dot(dz, tl.trans(z), input_precision="ieee")
+            if tl.program_id(0) == tl.program_id(1):
+                product = tl.where(i[:, None] >= j[None, :], product, tl.trans(product))
+            value = product * 0.5
+            mask = (i[:, None] < R) & (j[None, :] < R)
+            tl.store(OUT + s * R * R + i[:, None] + j[None, :] * R, value, mask)
+            if tl.program_id(0) != tl.program_id(1):
+                tl.store(OUT + s * R * R + j[None, :] + i[:, None] * R, value, mask)
     return kernel
 
 
 def _compact_product(mapping, core_samples, state_gradient, state):
     batch, heads, rank, dim = state.shape
     result = torch.empty_like(core_samples, memory_format=torch.contiguous_format).mT
-    _compact_product_kernel()[(batch * heads,)](
+    tile = min(32, _block_size(rank))
+    _compact_product_kernel()[((rank + tile - 1) // tile, (rank + tile - 1) // tile, batch * heads)](
         mapping, core_samples, state_gradient, state, result,
-        heads, rank, dim, *state.stride(), _block_size(rank), num_warps=4,
+        heads, rank, dim, *state.stride(), tile, num_warps=4,
+    )
+    return result
+
+
+@lru_cache(maxsize=1)
+def _shared_core_kernel():
+    # Standard tiled GEMM (Triton tutorial), addressing the shared head map
+    # directly rather than expanding it across the batch before a cuBLAS BMM.
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def multiply(T, X, Y, H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
+                 TRANSPOSE: tl.constexpr):
+        s = tl.program_id(2)
+        i = tl.program_id(0) * 32 + tl.arange(0, 32)
+        j = tl.program_id(1) * 32 + tl.arange(0, 32)
+        inner = tl.arange(0, 32)
+        value = tl.full((32, 32), 0., tl.float32)
+        for start in range(tl.cdiv(R, 32)):
+            k = start * 32 + inner
+            index = k[None, :] * R + i[:, None] if TRANSPOSE else i[:, None] * R + k[None, :]
+            t = tl.load(T + (s % H) * R * R + index,
+                        (i[:, None] < R) & (k[None, :] < R), 0)
+            x = tl.load(X + (s * R + k[:, None]) * D + j[None, :],
+                        (k[:, None] < R) & (j[None, :] < D), 0)
+            value = tl.dot(t, x, value, input_precision="ieee")
+        tl.store(Y + (s * R + i[:, None]) * D + j[None, :], value,
+                 (i[:, None] < R) & (j[None, :] < D))
+    return multiply
+
+
+def _shared_core_product(mapping, state, *, transpose=False):
+    batch, heads, rank, dim = state.shape
+    result = torch.empty_like(state)
+    _shared_core_kernel()[((rank + 31) // 32, (dim + 31) // 32, batch * heads)](
+        mapping, state, result, heads, rank, dim, transpose, num_warps=4,
     )
     return result
 
 
 def _compact_forward(gram, cross, core_map):
     factor, _ = torch.linalg.cholesky_ex(_ridge_system(gram), check_errors=False)
-    state = torch.linalg.solve_triangular(factor, cross, upper=False)
+    # Reuse the compact triangular inverse across forward and backward.
+    # FP32 is retained; no token-sized inverse or P is formed.
+    inverse = torch.linalg.solve_triangular(
+        factor, torch.eye(factor.shape[-1], device=factor.device, dtype=factor.dtype).expand_as(factor),
+        upper=False,
+    )
+    state = inverse @ cross
     mapping = core_map
-    coefficient = torch.linalg.solve_triangular(
-        factor.mT, mapping @ state, upper=True
-    ).contiguous()
-    return coefficient, (factor, state, mapping)
+    coefficient = inverse.mT @ _shared_core_product(mapping, state)
+    return coefficient, (inverse, state, mapping)
 
 
 def _compact_backward(tape, gradient):
     """Analytic VJP; sum sample contributions to the shared direct T."""
-    factor, state, mapping = tape
-    memory_gradient = torch.linalg.solve_triangular(factor, gradient, upper=False)
+    inverse, state, mapping = tape
+    memory_gradient = inverse @ gradient
     core_samples = memory_gradient @ state.mT
     core_gradient = core_samples.sum(0)
-    state_gradient = mapping.mT @ memory_gradient
-    cross_gradient = torch.linalg.solve_triangular(
-        factor.mT, state_gradient, upper=True
-    )
+    state_gradient = _shared_core_product(mapping, memory_gradient, transpose=True)
+    cross_gradient = inverse.mT @ state_gradient
     # L^T dL = -(T Z) U^T - (T^T U) Z^T
     #         = -T (U Z^T)^T - state_gradient Z^T.
     # Reuse per-sample dT=U Z^T; neither dL nor L^T dL needs materializing via dL.
     symmetric = _compact_product(mapping, core_samples, state_gradient, state)
-    intermediate = torch.linalg.solve_triangular(factor.mT, symmetric, upper=True)
-    gram_gradient = torch.linalg.solve_triangular(
-        factor.mT, intermediate.mT, upper=True
-    ).mT
+    gram_gradient = inverse.mT @ symmetric @ inverse
     return gram_gradient, cross_gradient, core_gradient
 
 
-def _forward(projected, core_map, counts, norm_weight=None):
+def _forward(projected, core_map, counts, norm_weight=None, gate_logits=None, *, storage_dtype=torch.bfloat16):
     from .reference import _ieee_fp32_matmul
 
     heads, rank = core_map.shape[:2]
@@ -490,11 +749,11 @@ def _forward(projected, core_map, counts, norm_weight=None):
         coefficient, tape = _compact_forward(gram, cross, core_map)
     if norm_weight is not None:
         output = torch.empty(
-            (batch, length, heads * dim), device=projected.device, dtype=torch.bfloat16,
+            (batch, length, heads * dim), device=projected.device, dtype=storage_dtype,
         )
         _token_kernels()[3][(batch * heads * ((length + 31) // 32),)](
-            projected, coefficient, counts, norm_weight, None, output, None, None,
-            length, heads, rank, dim, counts is not None, False,
+            projected, coefficient, counts, norm_weight, None, output, None, None, gate_logits, None,
+            length, heads, rank, dim, counts is not None, False, gate_logits is not None,
             _block_size(rank), _block_size(dim), 32, num_warps=4, num_stages=1,
         )
         return output, (coefficient, *tape)
@@ -522,9 +781,16 @@ def _forward(projected, core_map, counts, norm_weight=None):
 
 class _QKVMix(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, projected, core_map, counts, norm_weight):
-        output, saved = _forward(projected, core_map, counts, norm_weight)
-        ctx.save_for_backward(projected, counts, norm_weight, *saved)
+    def forward(ctx, projected, core_map, counts, norm_weight, gate_logits,
+                output_weight, output_bias, output_dtype):
+        output, saved = _forward(projected, core_map, counts, norm_weight, gate_logits,
+            storage_dtype=torch.float16 if output_weight is not None else torch.bfloat16)
+        value16 = weight16 = None
+        if output_weight is not None:
+            from .reference import _readout_linear_forward
+            output, value16, weight16 = _readout_linear_forward(output, output_weight, output_bias, output_dtype)
+        ctx.save_for_backward(projected, counts, norm_weight, gate_logits, value16, weight16, *saved)
+        ctx.has_output_bias = output_bias is not None
         ctx.heads, ctx.rank = core_map.shape[:2]
         return output
 
@@ -533,16 +799,22 @@ class _QKVMix(torch.autograd.Function):
     def backward(ctx, gradient):
         from .reference import _ieee_fp32_matmul
 
-        projected, counts, norm_weight, coefficient, *tape = ctx.saved_tensors
+        projected, counts, norm_weight, gate_logits, value16, weight16, coefficient, *tape = ctx.saved_tensors
+        output_weight_gradient = output_bias_gradient = None
+        if value16 is not None:
+            from .reference import _readout_linear_backward
+            gradient, output_weight_gradient, output_bias_gradient = _readout_linear_backward(
+                gradient, value16, weight16, ctx.has_output_bias)
         heads, rank = ctx.heads, ctx.rank
         batch, length, width = projected.shape
         dim = (width - 2 * heads * rank) // heads
         gradient = gradient.contiguous()
         norm_gradient = None
+        gate_gradient = None if gate_logits is None else torch.empty_like(gate_logits)
         projected_gradient = torch.empty_like(projected)
         if norm_weight is not None:
-            # FLA-style small tiles with fewer warps reduce register pressure
-            # in the fused readout VJP without changing its BF16x3 arithmetic.
+            # FLA-style small tiles. Store the gain VJP early and reload the
+            # compact coefficient inside the kernel to keep live ranges short.
             bt = 32
             tiles = (length + bt - 1) // bt
             partial = torch.empty(
@@ -553,8 +825,8 @@ class _QKVMix(torch.autograd.Function):
             )
             _token_kernels()[3][(batch * heads * tiles,)](
                 projected, coefficient, counts, norm_weight, gradient,
-                projected_gradient, partial, coefficient_partial,
-                length, heads, rank, dim, counts is not None, True,
+                projected_gradient, partial, coefficient_partial, gate_logits, gate_gradient,
+                length, heads, rank, dim, counts is not None, True, gate_logits is not None,
                 _block_size(rank), _block_size(dim), bt, num_warps=2, num_stages=1,
             )
             # Shared affine weights accumulate gradients from every head.
@@ -592,15 +864,21 @@ class _QKVMix(torch.autograd.Function):
             num_warps=2 if rank <= 32 else 4,
             num_stages=1,
         )
-        return projected_gradient, core_gradient, None, norm_gradient
+        return (projected_gradient, core_gradient, None, norm_gradient, gate_gradient,
+                output_weight_gradient, output_bias_gradient, None)
 
 
-def fast_mix(projected, core_map, valid_counts=None, *, norm_weight=None):
+def fast_mix(projected, core_map, valid_counts=None, *, norm_weight=None, gate_logits=None,
+             output_weight=None, output_bias=None, output_dtype=None):
     """Direct Q/K/V readout without materializing P, for every N and rank.
 
     Packed input rows excluded by a mask must already be zero. Counts are
     clamped to one for empty samples by the model; they are not differentiable.
-    A norm weight fuses the canonical head RMSNorm and returns BF16. Backward
+    A norm weight fuses the canonical head RMSNorm and returns BF16. Optional
+    gate logits fuse post-norm sigmoid selection, without intermediate rounding.
+    An output weight includes Wo in the autograd boundary: the internal readout
+    and forward Wo operands use FP16, while its incoming readout VJP uses BF16 storage and FP32 arithmetic.
+    Backward
     recomputes the FP32 readout from the saved compact coefficient. Without
     it, this primitive returns the unnormalized FP32 readout for operator use.
     """
@@ -646,12 +924,43 @@ def fast_mix(projected, core_map, valid_counts=None, *, norm_weight=None):
         or not norm_weight.is_contiguous()
     ):
         raise ValueError("norm_weight must be contiguous FP32 [D], shared across heads, on the projected device")
+    if gate_logits is not None and (
+        norm_weight is None
+        or gate_logits.shape != (batch, length, width - 2 * heads * rank)
+        or gate_logits.dtype != torch.bfloat16
+        or gate_logits.device != projected.device
+        or not gate_logits.is_contiguous()
+    ):
+        raise ValueError("gate_logits require norm_weight and contiguous BF16 [B,N,H*D] on the projected device")
+    if output_weight is not None:
+        dim = width - 2 * heads * rank
+        if (norm_weight is None or output_weight.shape != (dim, dim)
+                or output_weight.device != projected.device or output_weight.dtype != torch.float32
+                or not output_weight.is_contiguous()):
+            raise ValueError("output_weight requires norm_weight and contiguous FP32 [H*D,H*D] on the projected device")
+        if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError("output_dtype must be float16, bfloat16 or float32")
+        if output_bias is not None and (output_bias.shape != (dim,)
+                or output_bias.device != projected.device or output_bias.dtype != torch.float32
+                or not output_bias.is_contiguous()):
+            raise ValueError("output_bias must be contiguous FP32 [H*D] on the projected device")
+    elif output_bias is not None or output_dtype is not None:
+        raise ValueError("output_bias/output_dtype require output_weight")
     if torch.is_grad_enabled() and (
         projected.requires_grad or core_map.requires_grad
         or (norm_weight is not None and norm_weight.requires_grad)
+        or (gate_logits is not None and gate_logits.requires_grad)
+        or (output_weight is not None and output_weight.requires_grad)
+        or (output_bias is not None and output_bias.requires_grad)
     ):
-        return _QKVMix.apply(projected, core_map, valid_counts, norm_weight)
-    return _forward(projected, core_map, valid_counts, norm_weight)[0]
+        return _QKVMix.apply(projected, core_map, valid_counts, norm_weight, gate_logits,
+                             output_weight, output_bias, output_dtype)
+    output = _forward(projected, core_map, valid_counts, norm_weight, gate_logits,
+        storage_dtype=torch.float16 if output_weight is not None else torch.bfloat16)[0]
+    if output_weight is not None:
+        from .reference import _readout_linear_forward
+        output = _readout_linear_forward(output, output_weight, output_bias, output_dtype)[0]
+    return output
 
 
 @lru_cache(maxsize=1)

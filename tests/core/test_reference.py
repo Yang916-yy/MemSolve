@@ -1,6 +1,6 @@
 import pytest
 import torch
-from ridgon.ball.reference import (
+from memsolve.ball.reference import (
     tensor_core_matmul,
     tensor_core_linear,
     ridge_query_readout,
@@ -8,6 +8,35 @@ from ridgon.ball.reference import (
 )
 
 pytestmark = pytest.mark.core
+
+
+@pytest.mark.parametrize('rank', [16, 32, 48, 64])
+def test_axial_rope_matches_complex_oracle_and_preserves_value_and_norm(rank):
+    import math
+    from memsolve.ball.reference import axial_rotary_tables, rotary_qk
+
+    torch.manual_seed(94)
+    height, width, heads, dim = 2, 3, 2, 7
+    packed = torch.randn(2, height * width, 2 * heads * rank + heads * dim,
+                         dtype=torch.float64, requires_grad=True)
+    cos, sin = axial_rotary_tables(rank, (height, width), device=packed.device, dtype=packed.dtype)
+    angles = torch.tensor([
+        [coordinate * math.pow(100, -4 * j / rank)
+         for coordinate in (x, y) for j in range(rank // 4)]
+        for y in range(height) for x in range(width)
+    ], dtype=packed.dtype)
+    qk = packed[..., :2 * heads * rank].reshape(2, height * width, 2 * heads, rank)
+    pairs = torch.view_as_complex(qk.reshape(*qk.shape[:-1], rank // 2, 2).contiguous())
+    expected_qk = torch.view_as_real(pairs * torch.exp(1j * angles)[None, :, None, :]).flatten(-2)
+    expected = torch.cat((expected_qk.flatten(-2), packed[..., 2 * heads * rank:]), dim=-1)
+    actual = rotary_qk(packed, heads, cos, sin)
+    torch.testing.assert_close(actual, expected, rtol=1e-13, atol=1e-13)
+    rotated = actual[..., :2 * heads * rank].reshape_as(qk)
+    torch.testing.assert_close(rotated.square().sum(-1), qk.square().sum(-1), rtol=1e-13, atol=1e-13)
+    e = torch.randn_like(actual)
+    torch.testing.assert_close(torch.autograd.grad(actual, packed, e)[0],
+                               torch.autograd.grad(expected, packed, e)[0], rtol=1e-13, atol=1e-13)
+    torch.testing.assert_close(actual[..., 2 * heads * rank:], packed[..., 2 * heads * rank:], rtol=0, atol=0)
 
 
 def test_tensor_core_matmul_keeps_fp64_as_the_autograd_oracle() -> None:
@@ -302,6 +331,35 @@ def test_biased_linear_covers_full_and_partial_tile_groups(dtype) -> None:
     output = tensor_core_linear(value, weight, bias, output_dtype=dtype)
     expected = (value.double() @ weight.double().T + bias.double()).to(dtype)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("length", [19, 1031])
+def test_fp16_readout_projection_keeps_small_input_and_weight_gradients(with_bias, length):
+    from memsolve.ball.reference import readout_linear
+
+    torch.manual_seed(416)
+    x = torch.randn(2, length, 32, device="cuda", requires_grad=True)
+    w = (torch.randn(17, 32, device="cuda") * .1).requires_grad_()
+    b = torch.randn(17, device="cuda", requires_grad=True) if with_bias else None
+    inputs = (x, w) if b is None else (x, w, b)
+    actual = readout_linear(x, w, b, output_dtype=torch.float32)
+    expected = x.detach().half().double() @ w.detach().half().double().T
+    if b is not None:
+        expected += b.detach().double()
+    torch.testing.assert_close(actual.double(), expected, rtol=2e-5, atol=1e-6)
+    # A pure half autograd edge would erase most of this upstream signal.
+    e = torch.randn_like(actual) * 1e-9
+    grads = torch.autograd.grad(actual, inputs, e)
+    x64, w64 = x.detach().double().requires_grad_(), w.detach().double().requires_grad_()
+    b64 = b.detach().double().requires_grad_() if b is not None else None
+    expected = torch.nn.functional.linear(x64, w64, b64)
+    ref = torch.autograd.grad(expected, (x64, w64) if b is None else (x64, w64, b64), e.double())
+    for a, z in zip(grads, ref):
+        assert a.dtype == torch.float32 and torch.isfinite(a).all()
+        assert (a.double()-z).norm()/z.norm() < .005
 
 
 @pytest.mark.parametrize("length,rank", [(2, 4), (7, 4), (4, 4)])

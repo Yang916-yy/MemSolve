@@ -1,26 +1,76 @@
 # Q/K/V ridge memory and learned query readout
 
-Model contract **19**, source version **0.11.0**. Independent Q/K/V projections,
-a shared query map T = I + Delta, and per-head RMSNorm define one operator.
+Model contract **23**, source version **0.14.0**. Independent Q/K/V projections,
+centered Q/K depthwise convolutions, a shared query map T = I + Delta, and
+per-head RMSNorm and a low-rank sigmoid output gate define one operator.
 There is no input-conditioned core generator, reflected readout, internal value
-skip, projection-local convolution, rotation, or mode selector.
+skip, V convolution or mode selector. Vision adds fixed axial 2D RoPE after
+Q/K convolution; 1D models retain their existing external position embeddings.
 
 ## Definition
 
 For one head, n valid tokens, key/query rank r and value width d:
+convolution uses the original sequence/grid coordinates, with padding masked;
+the displayed matrices below retain only the valid rows.
 
 ```text
-Q = X Wq + bq                 [n,r]
-K = X Wk + bk                 [n,r]
+Q = DWConv_q(X Wq + bq)       [n,r]
+K = DWConv_k(X Wk + bk)       [n,r]
 V = X Wv + bv                 [n,d]
+Q,K = RoPE_2D(Q), RoPE_2D(K)  vision only, before both Gram and KV statistics
 Ak = K / sqrt(n), Aq = Q / sqrt(n)
 R^T R = I + Ak^T Ak           upper Cholesky, positive diagonal
 Pk = Ak R^-1, Pq = Aq R^-1
 Z = Pk^T V
 T = I + core_delta           [r,r], shared across samples
 O = Pq T Z
-Y = concat_h[RMSNorm_h(O)] Wo + bo
+Gout = sigmoid((X Wdown) Wup + bg)  [n,D], D = H*d
+Y = (concat_h[RMSNorm_h(O)] * Gout) Wo + bo
 ```
+
+DWConv is centered, stride one, zero padded, bias free, and has no activation.
+Sequence models default to independent width-3 filters per Q/K channel. Vision defaults to
+3×3 filters on the explicit patch grid, including rectangular grids. Q and K
+share a grouped convolution launch, not weights; V bypasses the convolution.
+The added work is linear in token count. The ridge equations use the filtered
+Q/K, so the memory interpretation and positive-definite system are unchanged.
+
+Filters initialize to one at the center and zero elsewhere, preserving the
+initial projection function and K variance while allowing every tap to learn.
+This is an initialization choice, not a claim of an optimal local prior.
+`qk_conv_kernel_size=k` is a positive odd integer (default 3); padding is k//2.
+A kernel of size 1 is a learned channel scale without neighbor mixing.
+Parameters add `2*H*r*k` per 1D layer or `2*H*r*k*k` per 2D layer. The core config
+selects `qk_conv_dim=1` (default) or `2`; integrations fix this from the data layout,
+and expose the kernel size separately. 2D forward requires
+`spatial_shape=(height, width)` with `height*width=N`. There are no prefix tokens.
+Both backends use native PyTorch convolution. CUDA evaluates the 1D case as a
+channels-last 1 x N image with a 1 x k filter, preserving its centered
+neighborhood and padding. See the depthwise definition in
+[PyTorch Conv2d](https://docs.pytorch.org/docs/2.14/generated/torch.nn.Conv2d.html).
+[FLA ShortConvolution](https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/conv/short_conv.py)
+is causal; its boundary semantics are not reused for this bidirectional filter.
+
+Vision follows the fixed axial convention in
+[RoPE-ViT](https://github.com/naver-ai/rope-vit/blob/main/models/vit_rope.py):
+each head has r/4 adjacent channel pairs for horizontal position, followed by
+r/4 pairs for vertical position, with frequencies `100**(-4*j/r)`. Rank must
+be divisible by four. Coordinates are integer patch indices `(x,y)` in the
+actual row-major `(height,width)` grid; frequencies are shared across heads.
+No frequency training, normalized coordinates, resolution interpolation or
+additional learned position table is used. V is unchanged. In column-vector
+notation, `q_p = Rotation(p) sum_delta D_delta q_raw[p+delta]` (and likewise K).
+The same rotated K enters both K^T K and K^T V. Orthogonal rotation preserves
+each key norm and hence the trace initialization criterion, while changing
+its feature covariance. The ridge system remains positive definite. The
+general T-corrected readout is not claimed to depend only on relative offsets.
+
+Phases are computed in FP32 (FP64 for the oracle), independently of AMP. The
+reference rotates pairs in that dtype and rounds to the projection dtype once.
+CUDA uses the same equations in registers. Derived phase tables are cached by
+both grid dimensions, device and dtype; caches are excluded from checkpoints
+and DDP broadcasts. Warmed tables stay alive across resolution changes so a
+captured training graph can be replayed after evaluation on another grid.
 
 One packed projection stores independent Q/K/V in the layout
 `[Q_all_heads, K_all_heads, V_all_heads]`. `core_delta` has shape `[H,r,r]`
@@ -41,8 +91,64 @@ claim of optimality or improved accuracy. Contract 16 had per-head gains;
 contract 17 adopted the standalone epsilon `1e-5`. Contract 18 corrects that
 to the full-model epsilon `1e-6`, retaining shared gains. Contract 19 replaces
 the constrained T parameter with an unconstrained identity-centered Delta.
+Contract 20 adds the centered Q/K convolutions.
+Contract 21 adds vision RoPE after convolution and removes encoder CPE.
+Contract 22 adds the low-rank sigmoid output gate and configurable odd Q/K kernel size.
 Older contracts are rejected rather than silently converted.
-The encoder owns CPE, residual connections, MLPs and pooling.
+The encoder owns residual connections, MLPs and pooling.
+
+## Coordinate shifts and the learned core
+
+Axial RoPE follows [RoPE-ViT](https://arxiv.org/abs/2403.13298). Its rotations
+preserve each Q/K row norm, hence the trace of the key Gram, but do not preserve
+the Gram's full spectrum when different rows receive different rotations.
+The unit ridge still makes `I + K^T K/n` positive definite.
+
+The following is a deduction for this operator, not a property established by
+the RoPE-ViT experiments. For `T = I`, the readout reduces to
+`O = Q (I + K^T K/n)^-1 K^T V/n`. Shifting all position coordinates by the
+same offset rotates Q and K by a common orthogonal matrix, leaving this readout
+unchanged when content and valid-token membership are held fixed.
+
+For a general learned `T`, write `O = Pq T Pk^T V`. Under that same coordinate
+shift, the Cholesky-whitened frames transform as `Pq' = Pq U`, `Pk' = Pk U`
+for an orthogonal `U` depending on the key statistics and shift. The new output
+is `Pq U T U^T Pk^T V`; an unconstrained shared T need not satisfy `U T U^T = T`.
+Thus the current learned correction does not guarantee coordinate-origin
+invariance. This applies to both Axial and Mixed RoPE. It neither invalidates
+the solve nor establishes a loss of classification accuracy. Full-image
+translation also changes convolution boundary effects, which this argument
+deliberately excludes.
+
+## Output selection
+
+The gate receives the same masked mixer input X as the projections, before
+convolution and RoPE. Vision supplies Pre-LN activations; BERT retains its
+Post-LN scaffold. Wdown has shape [D,m] and Wup [m,D], with
+`output_gate_rank=m` (default 32), independent of the memory rank r. There is
+no intermediate activation, down bias, head sharing or sequence normalization.
+The up bias has shape [D], independently of the QKV/output `bias` setting.
+The gate adds `2*D*m+D` parameters per layer and linear work in sequence length.
+
+Gate location and sigmoid follow [Gated Attention](https://arxiv.org/abs/2505.06708)
+and its [official implementation](https://github.com/qiuzh20/gated_attention/blob/main/modeling_qwen3.py).
+The post-RMS placement follows [FLA Gated DeltaNet](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/gated_deltanet.py),
+which uses a SiLU gate instead. Low-rank factorization is our cost choice, not
+a claim that either upstream establishes rank 32 or a MemSolve accuracy gain.
+The reference uses Tensor Core GEMMs and PyTorch sigmoid/multiply/autograd.
+CUDA fuses sigmoid selection with the readout and RMSNorm, retaining the
+reference's BF16 rounding boundaries in both forward and backward. The
+compact solver remains outside TorchInductor; no extra native dependency
+is introduced.
+
+Both gate factors keep ordinary Linear/framework weight initialization; the
+up bias is zero. Initial gates are near 0.5, not identity-preserving. No factor
+of two, bias saturation, zero-initialized factor or checkpoint conversion is
+introduced. Sigmoid is soft suppression, not guaranteed exact sparsity or
+sparse execution. Multiplication follows head RMSNorm so normalization cannot
+undo suppression, and precedes Wo so channels are selected before mixing heads.
+The gate changes the emitted features; it does not change the ridge objective,
+key statistics, memory solve or learned shared T.
 
 ## Key initialization
 
@@ -52,18 +158,18 @@ For unit-variance normalized inputs, this sets the expected mean eigenvalue of
 K^T K/n to one, keeping the initialization scale independent of model width.
 This is a statistical initialization criterion, not an accuracy guarantee.
 
-`Ridgon.init_weights()` owns this rule and only initializes the K slice. It runs
-on direct construction and after timm's depth-first initialization of child
-Linear modules. Q/V and the output projection keep their existing initializer
+`MemSolve.init_weights()` owns this rule and initializes the Q/K filters to
+identity. It runs on direct construction and after timm's depth-first initialization of child
+Linear modules. Q/V, both gate factors and the output projection keep their existing initializer
 (default Linear outside vision; timm std=0.02 and zero bias in the vision
-factory). Delta, RMSNorm gains and encoder-owned CPE are not changed by this method.
+factory). Delta and RMSNorm gains are not changed by this method.
 No key rescaling or normalization is added to the forward pass.
 
 Loading a checkpoint restores its saved K; it does not reinitialize that tensor.
 The K-only initialization change in source 0.8.1 retained model contract 15.
 The historical source 0.9.0 introduced constrained T under contract 16.
-Current contract 19 uses unconstrained Delta initialized to zero; older
-contracts are rejected on load.
+Current contract 23 uses unconstrained Delta initialized to zero and identity
+Q/K filters; older contracts are rejected on load.
 
 ## Exact memory interpretation
 
@@ -104,7 +210,8 @@ O_ridge = Aq (I+Ak^T Ak)^-1 Ak^T V
 This is an algebraic decomposition, not two runtime readouts. The reference
 and CUDA primitives both receive the effective T and evaluate the same compact
 products as before. Since dT/dDelta is the identity, dLoss/dDelta = dLoss/dT.
-The parameter count and identity initial function are unchanged from contract 18.
+The T reparameterization in contract 19 preserved contract 18's parameter count
+and identity initial function; contract 20 additionally learns Q/K filters.
 
 Use ordinary [PyTorch AdamW](https://docs.pytorch.org/docs/2.14/generated/torch.optim.AdamW.html)
 without model-specific hooks. Delta belongs to the regular weight-decay group.
@@ -143,7 +250,9 @@ M = solve_triangular(F^T, T Z)
 O = Q M / sqrt(n)
 ```
 
-Only key-statistic Cholesky and triangular solves remain. No J, L, Omega,
+CUDA reuses the compact inverse of the Cholesky factor in FP32 GEMMs,
+including its analytic VJP; the reference retains direct triangular solves.
+These evaluate the same equations. No J, L, Omega,
 shared-core LU or inverse-map adjoint is evaluated. This algorithm covers
 N<r, N=r and N>r and never materializes token-sized P.
 
@@ -163,14 +272,30 @@ the model passes them unchanged to Delta through the identity addition.
 
 ## Masking and precision
 
-Boolean [B,N] masks exclude rows before/after biased projection. Counts clamp
-to one for entirely masked samples. Invalid outputs are zeroed after output
-projection; excluded NaNs cannot enter neighboring rows. Position operations
-must separately honor masks.
+Boolean [B,N] masks exclude rows before/after biased projection and after Q/K
+convolution. Counts clamp to one for entirely masked samples. Invalid outputs are zeroed after output
+projection; excluded NaNs cannot enter neighboring rows. Gaps retain their
+original coordinates; compacting a gapped sequence changes its neighborhoods.
+Learned convolutions are not equivariant to arbitrary token permutations.
+Other position operations must separately honor masks.
 
-FP64 is the mathematical oracle. Production projections use BF16 operands and
-FP32 accumulation. Statistics, factors, compact products, raw readout, RMS
-reductions and optimizer updates use FP32. Normalized outputs round to BF16
-before Wo. Parameters remain FP32; public output dtype follows input dtype.
+FP64 is the mathematical oracle. Production QKV/gate projections use BF16
+operands and FP32 accumulation. Q/K convolution uses BF16 activations and cast
+weights with FP32 master parameters. Statistics, factors, compact products,
+raw readout, RMS reductions and optimizer updates use FP32. RMS gain, sigmoid
+and gating multiplication share FP32 arithmetic without an intermediate BF16
+rounding. The gated readout rounds once to FP16 and Wo uses FP16 forward
+operands, FP32 accumulation and FP32 bias before the public output cast.
+
+The non-affine head-normalized readout is bounded by sqrt(head_dim); the gated
+affine value is bounded by abs(gamma_i)*sqrt(head_dim). This is range-safe for
+ordinary trained gains, not an unconditional bound on learned gamma or Wo.
+FP16 forward intermediates stay inside a custom autograd boundary. Wo backward
+uses BF16 operands/storage for the readout VJP and FP32 accumulation, so small
+gradients are not forced through FP16. Operand casts are fused into the GEMM;
+large reductions for dWo use split-K with FP32 partial sums. RMS and solve
+backward arithmetic stays FP32; QKV/logit gradients store BF16. Master parameter
+gradients remain FP32. CPU reference arithmetic stays FP32, and FP64 inputs
+retain the mathematical oracle. Public output dtype follows input dtype.
 Old model contracts are rejected, including under strict=False. Historical
 paper/results retain their recorded operators, not this contract.

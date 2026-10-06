@@ -12,6 +12,94 @@ def _calculation_dtype(value: torch.Tensor) -> torch.dtype:
     return torch.float64 if value.dtype == torch.float64 else torch.float32
 
 
+def axial_rotary_tables(rank, spatial_shape, *, device, dtype):
+    """RoPE-ViT axial convention: x pairs, then y pairs; theta=100.
+
+    Frequencies are 100**(-4*j/rank), j=0..rank/4-1, shared by heads.
+    Coordinates follow the row-major patch grid without normalization or
+    interpolation. Compute phases in FP32 (FP64 for the mathematical oracle).
+    See naver-ai/rope-vit, models/vit_rope.py: compute_axial_cis.
+    """
+    height, width = spatial_shape
+    with torch.inference_mode(False), torch.no_grad(), torch.autocast(device.type, enabled=False):
+        frequencies = 100.0 ** (-torch.arange(0, rank, 4, device=device, dtype=dtype) / rank)
+        index = torch.arange(height * width, device=device)
+        x, y = (index % width).to(dtype), (index // width).to(dtype)
+        phase = torch.cat((x[:, None] * frequencies, y[:, None] * frequencies), dim=-1)
+        return phase.cos(), phase.sin()
+
+
+def rotary_qk(projected, num_heads, cos, sin):
+    """Rotate adjacent Q/K pairs after convolution, leaving packed V intact.
+
+    The real-pair form equals multiplication by exp(i*phase). Production
+    arithmetic uses FP32 and rounds once to the input projection dtype.
+    """
+    rank = 2 * cos.shape[-1]
+    qk_width = 2 * num_heads * rank
+    qk, value = projected.split((qk_width, projected.shape[-1] - qk_width), dim=-1)
+    with torch.autocast(projected.device.type, enabled=False):
+        pairs = qk.reshape(*projected.shape[:2], 2 * num_heads, rank // 2, 2)
+        even, odd = pairs.to(_calculation_dtype(projected)).unbind(-1)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
+        return torch.cat((rotated.reshape_as(qk).to(projected.dtype), value), dim=-1)
+
+
+def convolve_qk(
+    projected: torch.Tensor,
+    weight: torch.Tensor,
+    spatial_shape: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Centered depthwise Q/K filtering of packed [Q, K, V]; V is unchanged.
+
+    The caller zeros invalid projected rows before and after this operation.
+    Coordinates are preserved: masking a token does not close a sequence gap.
+    Native PyTorch/cuDNN convolutions operate in the projection dtype (BF16,
+    or FP64 for the oracle), independently of ambient autocast. Master weights
+    and their accumulated gradients remain FP32 in production.
+    """
+    channels = weight.shape[0]
+    qk, value = projected.split((channels, projected.shape[-1] - channels), dim=-1)
+    with torch.autocast(projected.device.type, enabled=False):
+        weight = weight.to(projected.dtype)
+        if spatial_shape is None:
+            qk = functional.conv1d(
+                qk.transpose(1, 2), weight, padding=weight.shape[-1] // 2, groups=channels,
+            ).transpose(1, 2)
+        else:
+            # NHWC -> channels-last NCHW lets cuDNN use its depthwise kernels.
+            qk = qk.reshape(projected.shape[0], *spatial_shape, channels)
+            qk = functional.conv2d(
+                qk.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last),
+                weight, padding=tuple(size // 2 for size in weight.shape[2:]), groups=channels,
+            ).flatten(2).transpose(1, 2)
+        return torch.cat((qk, value), dim=-1)
+
+
+def low_rank_gate_logits(x, down_weight, up_weight, up_bias):
+    """Logits for the post-RMS gate: (x Wdown) Wup + b.
+
+    Two ordinary GEMMs factorize the gate projection; there is no hidden
+    activation or gate normalization. PyTorch owns sigmoid/multiply/autograd,
+    so torch.compile can fuse the pointwise work. Gate location/activation
+    follow Qiu et al., Gated Attention (2025); low rank is our cost choice.
+    Projection operands/stores are BF16 in production, with FP32 master
+    parameters and gradient accumulation. FP64 inputs retain the oracle.
+    """
+    dtype = torch.float64 if x.dtype == torch.float64 else torch.bfloat16
+    hidden = tensor_core_linear(x, down_weight, output_dtype=dtype)
+    return tensor_core_linear(hidden, up_weight, up_bias, output_dtype=dtype)
+
+
+def sigmoid_output_gate(normalized, logits):
+    """FP32 sigmoid/multiply with one output rounding; FP64 for the oracle."""
+    with torch.autocast(normalized.device.type, enabled=False):
+        calc_dtype = _calculation_dtype(normalized)
+        gated = normalized.to(calc_dtype) * torch.sigmoid(logits.to(calc_dtype))
+        return gated.to(normalized.dtype)
+
+
 @lru_cache(maxsize=1)
 def _biased_gemm_kernel():
     # CUDA PyTorch supplies Triton; keep CPU-only imports independent of it.
@@ -35,6 +123,9 @@ def _biased_gemm_kernel():
         BM: tl.constexpr,
         BN: tl.constexpr,
         BK: tl.constexpr,
+        HAS_BIAS: tl.constexpr = True,
+        BF16_INPUTS: tl.constexpr = False,
+        SPLIT_K: tl.constexpr = 1,
     ):
         # Group eight row tiles to reuse operands in L2 (upstream Triton GEMM).
         pid = tl.program_id(0)
@@ -46,9 +137,10 @@ def _biased_gemm_kernel():
         rows = (first_m + local % group_m) * BM + tl.arange(0, BM)
         columns = (local // group_m) * BN + tl.arange(0, BN)
         inner = tl.arange(0, BK)
+        split = tl.program_id(1)
         accumulator = tl.full((BM, BN), 0, tl.float32)
-        for start in range(tl.cdiv(K, BK)):
-            indices = start * BK + inner
+        for start in range(tl.cdiv(K, BK * SPLIT_K)):
+            indices = (start * SPLIT_K + split) * BK + inner
             left = tl.load(
                 X + rows[:, None] * XM + indices[None, :] * XK,
                 (rows[:, None] < M) & (indices[None, :] < K),
@@ -59,11 +151,13 @@ def _biased_gemm_kernel():
                 (columns[None, :] < N) & (indices[:, None] < K),
                 0,
             )
+            if BF16_INPUTS:
+                left, right = left.to(tl.bfloat16), right.to(tl.bfloat16)
             accumulator = tl.dot(left, right, accumulator)
-        bias = tl.load(B + columns * BS, columns < N, 0)
+        bias = tl.load(B + columns * BS, columns < N, 0) if HAS_BIAS else 0.
         tl.store(
-            Y + rows[:, None] * N + columns[None, :],
-            accumulator + bias[None, :],
+            Y + split * M * N + rows[:, None] * N + columns[None, :],
+            accumulator + (bias[None, :] if HAS_BIAS else 0.),
             (rows[:, None] < M) & (columns[None, :] < N),
         )
 
@@ -73,19 +167,27 @@ def _biased_gemm_kernel():
 def _biased_gemm(
     left: torch.Tensor,
     right: torch.Tensor,
-    bias: torch.Tensor,
+    bias: torch.Tensor | None,
     output_dtype: torch.dtype,
+    *,
+    bf16_inputs: bool = False,
+    split_k: int = 1,
 ) -> torch.Tensor:
     # AB + bias: FP32 accumulation/addition, then one output rounding.
     # Blocked GEMM follows Triton's official matrix-multiplication tutorial:
     # https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
     rows, inner = left.shape
     columns = right.shape[1]
-    output = torch.empty((rows, columns), device=left.device, dtype=output_dtype)
+    output = torch.empty((split_k, rows, columns), device=left.device, dtype=output_dtype)
     if rows == 0 or columns == 0:
-        return output
-    bm, bn, bk = (128, 128, 64) if rows >= 128 else (32, 64, 32)
-    _biased_gemm_kernel()[(((rows + bm - 1) // bm) * ((columns + bn - 1) // bn),)](
+        return output[0]
+    # A 32-wide K tile avoids wasting half the work on low-rank gate logits.
+    # Four warps also improve the full QKV/Wo shapes on SM80, without spills.
+    bm, bn, bk = (128, 64 if inner <= 32 else 128, 32) if rows >= 128 else (32, 64, 32)
+    if split_k > 1:
+        assert bias is None and output_dtype == torch.float32
+        bm, bn = 64, 64
+    _biased_gemm_kernel()[(((rows + bm - 1) // bm) * ((columns + bn - 1) // bn), split_k)](
         left,
         right,
         bias,
@@ -95,14 +197,17 @@ def _biased_gemm(
         inner,
         *left.stride(),
         *right.stride(),
-        bias.stride(0),
+        0 if bias is None else bias.stride(0),
         bm,
         bn,
         bk,
-        num_warps=8 if rows >= 128 else 4,
+        bias is not None,
+        bf16_inputs,
+        split_k,
+        num_warps=4,
         num_stages=3,
     )
-    return output
+    return output[0] if split_k == 1 else output.sum(0)
 
 
 def _wide_gemm(
@@ -112,10 +217,12 @@ def _wide_gemm(
     *,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """BF16 operands with FP32 accumulation, independent of ambient AMP policy."""
+    """16-bit operands with FP32 accumulation, independent of ambient AMP policy."""
     matmul = torch.backends.cuda.matmul
-    previous = matmul.allow_bf16_reduced_precision_reduction
-    matmul.allow_bf16_reduced_precision_reduction = False
+    setting = ("allow_fp16_reduced_precision_reduction" if left.dtype == torch.float16
+               else "allow_bf16_reduced_precision_reduction")
+    previous = getattr(matmul, setting)
+    setattr(matmul, setting, False)
     try:
         with torch.autocast(device_type="cuda", enabled=False):
             if bias is not None:
@@ -123,11 +230,70 @@ def _wide_gemm(
                     return _biased_gemm(left, right, bias, output_dtype)
                 return torch.ops.aten.addmm.dtype(bias, left, right, torch.float32)
             operation = torch.bmm if left.ndim == 3 else torch.mm
-            if output_dtype == torch.bfloat16 and bias is None:
+            if output_dtype == torch.bfloat16 and left.dtype == torch.bfloat16:
                 return operation(left, right)
             return operation(left, right, out_dtype=torch.float32)
     finally:
-        matmul.allow_bf16_reduced_precision_reduction = previous
+        setattr(matmul, setting, previous)
+
+
+def _readout_linear_forward(value, weight, bias, output_dtype):
+    """FP16 readout/Wo operands, FP32 dot and bias, one public output cast.
+
+    The value is post-RMS/sigmoid, bounded by sqrt(head_dim)*abs(gamma).
+    Only the forward operands use FP16; these tensors never form an autograd
+    boundary. Master weights and the backward GEMM accumulation remain FP32.
+    """
+    value16, weight16 = value.to(torch.float16), weight.to(torch.float16)
+    output = _wide_gemm(value16.reshape(-1, value.shape[-1]), weight16.mT,
+                        bias, output_dtype=output_dtype)
+    return output.to(output_dtype).reshape(*value.shape[:-1], weight.shape[0]), value16, weight16
+
+
+def _readout_linear_backward(gradient, value16, weight16, has_bias):
+    """BF16 VJP storage preserves exponent range; all dot products accumulate FP32."""
+    grad = gradient.reshape(-1, weight16.shape[0])
+    with torch.autocast(gradient.device.type, enabled=False):
+        # Reuse the tiled projection GEMM; cast its operands in registers instead
+        # of materializing BF16 copies of the saved FP16 forward activation.
+        value = value16.reshape(-1, value16.shape[-1])
+        dv = _biased_gemm(grad, weight16, None, torch.bfloat16, bf16_inputs=True).reshape_as(value16)
+        # Parallel split-K, as in CUTLASS, gives a small D x D weight gradient
+        # enough CTAs when the reduction spans a large batch of tokens.
+        dw = _biased_gemm(grad.mT, value, None, torch.float32, bf16_inputs=True,
+                         split_k=min(16, max(1, (grad.shape[0] + 1023) // 1024)))
+        db = gradient.sum(tuple(range(gradient.ndim - 1)), dtype=torch.float32) if has_bias else None
+    return dv, dw, db
+
+
+class _ReadoutLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, weight, bias, output_dtype):
+        output, value16, weight16 = _readout_linear_forward(value, weight, bias, output_dtype)
+        ctx.save_for_backward(value16, weight16)
+        ctx.has_bias = bias is not None
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient):
+        return (*_readout_linear_backward(gradient, *ctx.saved_tensors, ctx.has_bias), None)
+
+
+def readout_linear(value, weight, bias=None, *, output_dtype):
+    """Project the FP32 normalized/gated readout without a half-gradient edge.
+
+    GPU production: FP16 forward, BF16 backward operands/VJP storage and FP32
+    accumulation. Autograd restores the input VJP to the FP32 input dtype.
+    CPU and FP64 retain ordinary reference arithmetic. Callers must provide
+    the normalized/gated value in FP32 (FP64 for the mathematical oracle).
+    """
+    if value.is_cuda and value.dtype != torch.float64:
+        if value.dtype != torch.float32 or weight.dtype != torch.float32:
+            raise TypeError("readout_linear requires FP32 activations and master weights")
+        return _ReadoutLinear.apply(value, weight, bias, output_dtype)
+    with torch.autocast(value.device.type, enabled=False):
+        return functional.linear(value, weight, bias).to(output_dtype)
 
 
 def _tensor_core_batches(
@@ -484,6 +650,9 @@ def head_rms_norm(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
+    "axial_rotary_tables",
+    "rotary_qk",
+    "convolve_qk",
     "ridge_query_readout",
     "head_rms_norm",
     "split_qkv",

@@ -8,7 +8,7 @@ explicit CUDA implementation.
 | --- | --- |
 | `memsolve/ball/config.py` | Dimensions, heads, rank, projection bias, Q/K convolution dimension/kernel size and output gate rank |
 | `memsolve/ball/reference.py` | Q/K/V memory equations, FP64 oracle and precision boundaries |
-| `memsolve/ball/model.py` | Independent packed projections, identity-plus-delta shared query map, shared RMS channel weights, masks, checkpoint contract 23 |
+| `memsolve/ball/model.py` | Independent packed projections, identity-plus-delta shared query map, shared RMS channel weights, masks, checkpoint contract 24 |
 | `memsolve/ball/cuda.py` | CUDA contract 19 validation, token tiling, compact analytic VJP, FLA-derived grouped RMSNorm |
 | `integrations/timm.py` | ViT³-derived vision encoder, packed SwiGLU, patch-grid plumbing, token-LN mean pooling and AMP boundaries |
 | `integrations/openmmlab.py` | Dense framework registration and padded-image plumbing |
@@ -18,9 +18,10 @@ There is one public operator and no mode selector. The learned core is
 sample-independent, while the key Gram and key/value memory remain
 input-dependent. The operator applies centered depthwise convolution to Q/K
 before the solve: width 3 for sequences, 3×3 for an explicit image patch grid.
-V remains tokenwise. For vision, the core rotates Q/K with fixed axial 2D RoPE
-after convolution and before statistics. The vision encoder uses token-LayerNorm
-mean pooling and has no residual CPE. Phase tables are derived non-checkpoint state.
+V remains tokenwise. The vision encoder adds a learned 2D absolute position
+table to patch embeddings once, using timm initialization and bicubic grid
+interpolation. The core does not rotate Q/K. The encoder uses token-LayerNorm
+mean pooling and has no residual CPE.
 
 After per-head RMSNorm, a low-rank sigmoid channel gate selects the readout
 before Wo. Its two linear maps reuse the projection GEMMs. PyTorch owns the

@@ -17,7 +17,7 @@ Tiny borrows the Small recipe; upstream does not list a Tiny training command.
 | Optimizer | Apex fused LAMB | Apex fused LAMB | PyTorch fused AdamW |
 | Peak LR | 0.004 | 0.003 | 1e-5 |
 | Minimum LR | 1e-5 | 1e-5 | 1e-5 |
-| Warmup | 5 epochs, start 1e-6 | 5 epochs, start 1e-6 | 5 epochs, start 1e-6 |
+| Warmup | 10 epochs, start 1e-6 | 10 epochs, start 1e-6 | 5 epochs, start 1e-6 |
 | Weight decay | 0.03 | 0.03 | 0.1 |
 | Uniform DropPath | 0 | 0.1 | 0.2 |
 | Loss / smoothing | DeiT BCE / 0 | DeiT BCE / 0 | Soft-target CE / 0.1 |
@@ -59,6 +59,15 @@ after DDP initialization, so its evaluation reads its own parameters on every ra
 
 The MemSolve backbone, BF16 AMP with FP32 parameters, per-update cosine scheduling
 and indexed WebDataset, plus dual ordinary/EMA validation, are local adaptations.
+Pretraining uses 10 epochs of linear warmup, counted in optimizer updates:
+6,250 updates at global batch 2,048 and 625 updates per epoch. Accumulation
+microbatches do not advance the scheduler. This replaces the upstream nominal
+5-epoch warmup; the total remains 400 epochs, including warmup, and the existing
+full-run cosine time base is retained (`warmup_prefix=False`). Base resolution
+fine-tuning retains 5 warmup epochs. Ten-epoch per-step linear warmup has
+precedents in [DINO](https://github.com/facebookresearch/dino/blob/main/main_dino.py)
+and [BEiT v2](https://github.com/microsoft/unilm/blob/master/beit2/PRETRAINING.md);
+those self-supervised recipes do not establish its benefit for MemSolve or LAMB.
 Upstream steps its scheduler per
 epoch. These differences make this a **RoPE-ViT-derived protocol**.
 
@@ -94,7 +103,7 @@ under the new 400-epoch schedule.
 
 `experiments/configs/imagenet_deit3_400.toml` adapts the ImageNet-1K recipe in
 [DeiT III](https://arxiv.org/abs/2204.07118), tables 1, 6 and 13. The backbone
-retains MemSolve-ViT-B/r48, packed SwiGLU, Q/K convolution followed by axial 2D RoPE, token-LN mean
+retains MemSolve-ViT-B/r48, packed SwiGLU, Q/K convolution and learned 2D absolute patch positions, token-LN mean
 pooling, no CLS and no LayerScale. BF16 AMP, no EMA, local indexed WebDataset and
 physical-batch gradient accumulation are local adaptations. This is a
 **DeiT III-derived training protocol**, not the original ViT architecture or

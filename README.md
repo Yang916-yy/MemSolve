@@ -18,8 +18,8 @@ name its vision and language integrations.
 For one head, let `Q` and `K` be independently projected and depthwise-filtered
 features, and `V` a tokenwise value projection. Q/K filters are centered width-3
 for sequences or 3×3 on an explicit image patch grid, initialized to identity.
-Vision applies fixed axial 2D RoPE to Q/K after convolution and before the
-global statistics. V remains unrotated.
+Vision adds a learned 2D absolute position table to patch embeddings before
+the first block. The operator does not rotate Q/K.
 Let `n` be its valid-token count. Set `Aq = Q / sqrt(n)` and
 `Ak = K / sqrt(n)`. The global memory is
 
@@ -100,10 +100,11 @@ or norm constraint is required.
 ## Vision models
 
 All three models use patch size 16, 12 blocks, independent 3×3 depthwise Q/K
-filters followed by fixed axial 2D RoPE (theta 100),
+filters and a learned 2D absolute patch position table,
 Pre-LayerNorm blocks, packed SwiGLU, and token-LayerNorm followed by mean pooling.
 The SwiGLU branch width is `8/3` of the embedding width. There is no CLS token
-or LayerScale. RoPE replaces the former per-layer residual CPE.
+or LayerScale. Position embeddings reuse timm initialization and bicubic grid
+interpolation; there is no per-layer residual CPE.
 
 `output_gate_rank=32` controls the output gate bottleneck. `qk_conv_kernel_size=3`
 controls the centered odd-width neighborhood (width k for 1D, k×k for 2D).
@@ -111,17 +112,20 @@ Vision adapters fix the convolution dimension to 2; sequence/BERT adapters use 1
 
 | Model | Width | Heads | Rank | SwiGLU branch width | Parameters¹ |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| MemSolve-ViT-T | 192 | 6 | 16 | 512 | 5,427,112 |
-| MemSolve-ViT-S | 384 | 6 | 32 | 1024 | 20,622,184 |
-| MemSolve-ViT-B | 768 | 12 | 48 | 2048 | 83,940,328 |
+| MemSolve-ViT-T | 192 | 6 | 16 | 512 | 5,464,744 |
+| MemSolve-ViT-S | 384 | 6 | 32 | 1024 | 20,697,448 |
+| MemSolve-ViT-B | 768 | 12 | 48 | 2048 | 84,090,856 |
 
-¹ Including the 1,000-class ImageNet head. Training recipes specify their own
+¹ At 224px, including the learned position table and 1,000-class ImageNet head.
+Training recipes specify their own
 DropPath, optimizer, augmentation and schedule.
 
 [Default ImageNet training](docs/IMAGENET_DEIT3.md) follows RoPE-ViT:
 T/S train at 224px for 400 epochs; Base trains at 192px for 400 epochs and
 fine-tunes at 224px for 20 epochs. Pretraining uses fused LAMB, 3-Augment,
 DeiT BCE and global batch 2048; Base fine-tuning uses fused AdamW and batch 512.
+Pretraining uses a local 10-epoch linear warmup counted in optimizer updates;
+Base fine-tuning retains 5 warmup epochs.
 EMA uses upstream's constant decay 0.99996 and updates after optimizer steps.
 Validation records ordinary and EMA metrics, with separate `checkpoint_best.pt`
 and `checkpoint_best_ema.pt` files. Fine-tuning loads the selected weight set;
@@ -189,7 +193,7 @@ evaluation. Both modalities call the same MemSolve operator and CUDA path.
 
 ## Research status and provenance
 
-Current model checkpoint contract: **23**; CUDA algorithm contract: **19**;
+Current model checkpoint contract: **24**; CUDA algorithm contract: **19**;
 source version: **0.14.0**. The current API is `MemSolve` / `MemSolveConfig`.
 Older model checkpoints and the former `lsso` namespace are not supported.
 

@@ -4,14 +4,14 @@ Detection and segmentation are outside the current experimental scope. The
 adapters below are retained for development; no current MemSolve downstream
 accuracy or complete detector/segmenter validation is claimed.
 
-> Current source uses model contract 23 and CUDA contract 19. External position
+> Current source uses model contract 24 and CUDA contract 19. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
 
 The optional dense adapters share the current MemSolveViT encoder used by ImageNet:
-Q/K convolution followed by axial 2D RoPE, Pre-LN, no CLS and no LayerScale.
-Both local convolution and RoPE use the actual patch grid,
+Q/K convolution, learned 2D absolute patch positions, Pre-LN, no CLS and no LayerScale.
+Local convolution and timm position interpolation use the actual patch grid,
 including rectangular padded images; the mixer consumes patch features and the
 validity mask. Updating this shared adapter does not constitute a new detection
 or segmentation experiment.
@@ -107,7 +107,7 @@ backbone; the launch examples below use Base.
 
 ## Pretrained checkpoint compatibility
 
-Current loading validates ImageNet envelope **12**, MemSolve model contract **23**
+Current loading validates ImageNet envelope **12**, MemSolve model contract **24**
 and CUDA contract **19**. The independent-QKV architecture cannot load earlier
 shared-A checkpoints. A new matching ImageNet checkpoint is required; changing
 metadata or using `strict=False` is not a conversion.

@@ -45,7 +45,7 @@ Before the 2026-09-12 main publication, the full suite passed 342 tests with
 6 skips; only SM120 was executed. This is a dated verification record, not a
 promise that all optional stacks or architectures were exercised.
 
-Model contract 23 / CUDA contract 19 retains the original single-valid-token
+Model contract 24 / CUDA contract 19 retains the original single-valid-token
 FP64 oracle tolerance. Its former near-zero core-gradient failure is fixed by
 residual-compensated readout and coefficient-adjoint products. The suite also
 checks fused sigmoid gates, native centered convolution with fused packing,

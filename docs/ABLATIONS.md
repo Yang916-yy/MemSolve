@@ -5,10 +5,10 @@ identity-plus-delta query map T, centered depthwise Q/K convolution, ridge memor
 readout and per-head RMS normalization.
 It exposes no Dynamic/Static/Zero, skew or complement switches.
 
-The input-conditioned core generator, V convolution and output gating remain
-absent. Q/K use width-3 sequence filters or 3×3 image filters with identity
-initialization. Vision additionally uses fixed axial 2D RoPE after Q/K convolution,
-replacing residual CPE. Short distillation probes motivate studying the local prior;
+The input-conditioned core generator and V convolution remain absent.
+A low-rank sigmoid output gate follows per-head RMSNorm. Q/K use width-3 sequence filters or 3×3 image filters with identity
+initialization. Vision adds learned 2D absolute positions to patch embeddings;
+Q/K are not rotated and there is no residual CPE. Short distillation probes motivate studying the local prior;
 they do not establish gains from full training. V names the value tensor;
 T names the shared query map, so K remains unambiguously the key tensor.
 

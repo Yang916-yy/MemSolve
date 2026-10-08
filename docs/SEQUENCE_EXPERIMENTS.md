@@ -1,6 +1,6 @@
 # Sequence Experiments
 
-> Current source uses model contract 23 and CUDA contract 19. External position
+> Current source uses model contract 24 and CUDA contract 19. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -16,7 +16,7 @@ depthwise convolution with identity initialization; V remains tokenwise.
 It has no core-mode or complement switches.
 The shared encoder retains learned absolute position embeddings initialized
 from `Normal(0, 0.02)`. CUDA contract 19 accepts FP16 and BF16 inputs; sequence
-recipes still default to FP16. Current model checkpoints use contract 23.
+recipes still default to FP16. Current model checkpoints use contract 24.
 The output uses a low-rank sigmoid channel gate after head RMSNorm.
 `--qk-conv-kernel-size` selects an odd centered 1D kernel width (default 3);
 `--output-gate-rank` sets the independent output gate bottleneck (default 32).

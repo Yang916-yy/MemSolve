@@ -59,12 +59,12 @@ the global batch of the upstream README launch. Upstream scales its base LR
 | base | 768 | 12 | 12 | 48 | 0.4 |
 
 The small model uses **SwiGLU with gate width 1024**, a packed input
-projection of width 2048, and 20,622,184 parameters including the 1000-class
+projection of width 2048, and 20,697,448 parameters including the 1000-class
 head. `mlp_ratio=4.0` denotes the equivalent two-projection MLP weight budget:
 the gate width is `ceil_to_16(floor(2 * int(width * mlp_ratio) / 3))`.
 All three tiers use budget ratio 4.0, so the gate width is exactly `(8/3) * width`:
 512 / 1024 / 2048 for T / S / B. Their parameter counts including the
-1000-class head are 5,427,112 / 20,622,184 / 83,940,328.
+1000-class head and 224px position table are 5,464,744 / 20,697,448 / 84,090,856.
 This replaces the original ViT³ GELU FFN; it is a local architecture choice,
 not part of the upstream recipe. Historical results and speed measurements
 belong to their recorded model versions.
@@ -81,11 +81,10 @@ second-half initialization, which targets the value branch with this packing.
 DropPath increases linearly from zero to the listed maximum across blocks,
 as in plain ViT³. MemSolve ranks are our model choices. The canonical
 `integrations.timm.create_memsolve_vit` encoder uses 3×3 depthwise Q/K convolution
-followed by fixed axial 2D RoPE inside each Pre-LN mixer, with no residual CPE,
-absolute position table, CLS, or LayerScale. Convolution uses PyTorch/cuDNN and
-keeps masked patch features out of neighboring valid updates. RoPE follows
-RoPE-ViT's adjacent-pair convention with theta 100 and actual integer patch
-coordinates. At 224/16, all 196 tokens are image patches. The final readout is
+inside each Pre-LN mixer, with no residual CPE, CLS, or LayerScale. A learned
+2D absolute position table is added after patch embedding, before the first block.
+It reuses timm's initialization and bicubic grid interpolation. Convolution uses
+PyTorch/cuDNN and keeps masked patches out of neighboring valid updates. At 224/16, all 196 tokens are image patches. The final readout is
 per-token LayerNorm (ε=1e-6), then patch mean, then the classifier. timm's
 post-pooling `fc_norm` is explicitly disabled; moving LN after the mean would
 change the architecture. Masked pooling averages only valid patches.
@@ -95,7 +94,7 @@ per-head RMSNorm with a shared channel gain initialized to one and epsilon
 `1e-6`, following the FLA Gated DeltaNet model configuration (see [core contract](CORE_CONTRACT.md));
 projected Q/K additionally use independent centered 3×3 depthwise filters on
 the patch grid, initialized to identity without bias or activation. V remains
-tokenwise. Q/K are then rotated before both Gram and KV statistics. This is
+tokenwise. Q/K enter Gram and KV statistics without rotation. This is
 **MemSolve in a plain ViT³-style visual scaffold with its derived training recipe**.
 It does not use the upstream TTT mixer, adaptive convolution, or MESA variant.
 
@@ -196,8 +195,8 @@ epoch. Workers use `spawn` and prefetch one physical batch each. Defaults are
 semantics in the [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.14/data.html).
 
 The ImageNet checkpoint envelope is now **12**, vision scaffold contract **4**,
-MemSolve model contract **23**, and CUDA contract **19**. The model metadata records
-`vit3_qkconv_rope2d_mean_swiglu_v4`, SwiGLU, no CLS/LayerScale and token-LN mean pooling.
+MemSolve model contract **24**, and CUDA contract **19**. The model metadata records
+`vit3_qkconv_lpe2d_mean_swiglu_v5`, SwiGLU, no CLS/LayerScale and token-LN mean pooling.
 Previous GELU or CLS/LayerScale ImageNet states cannot resume as this model.
 Historical classification results retain their original training protocol and
 source version, including the previous shared-A ViT³-derived run. This refactor

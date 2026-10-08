@@ -1,11 +1,13 @@
 # CUDA contract 19
 
-Implements [model contract 23](CORE_CONTRACT.md), source version 0.14.0.
+Implements [model contract 24](CORE_CONTRACT.md), source version 0.14.0.
 The fast path uses PyTorch CUDA linear algebra and Triton kernels. No MemSolve
 native library, MathDx build, CMake or separate runtime wheel is needed.
 The name change introduces `memsolve` / `MemSolve` / `MemSolveConfig`; operator
 parameters and equations remain unchanged; contract 23 changes readout rounding
-and the output projection's mixed-precision boundary.
+and the output projection's mixed-precision boundary. Model contract 24 removes
+Q/K rotation from the public model; its CUDA local packing uses the existing
+no-rotation branch. Learned vision positions are added outside the operator.
 
 ## Runtime
 
@@ -18,6 +20,70 @@ and the output projection's mixed-precision boundary.
 - Supported architecture checks: SM80/86/87/89/90/100/120 (SM121 maps to SM120).
   Devices other than SM80 still require hardware-specific validation.
 
+## Device-aware token launches
+
+Token statistics, raw/normalized readout and their token adjoints use a bounded
+set of launch schedules. These change token tiles, warp counts and pipeline
+stages only. The compact solve, dtypes, compensated products, normalization,
+gating and mathematical VJP remain the same. Changing tiles can change FP32
+reduction order; candidates are checked against the independent reference.
+
+The normal path first tries the existing schedule. On its first eager call it
+compiles the candidate, checks the compiled shared-memory requirement against
+the actual device's opt-in limit, and lets Triton validate remaining launch
+resource limits. Resource-incompatible schedules are replaced by smaller
+equivalent schedules. Candidate workspace allocation failures are recorded and
+skipped too: smaller token tiles can require larger global partial buffers.
+If none fits, the operation fails explicitly: it never
+changes precision or silently switches to the reference implementation.
+
+For performance tuning, warm up representative **forward and backward** calls
+before CUDA Graph capture, on an otherwise idle GPU:
+
+```python
+from memsolve.ball import cuda
+
+with cuda.autotune():
+    output = model(x, implementation="cuda")
+    output.float().square().mean().backward()
+model.zero_grad(set_to_none=True)
+# Do the usual side-stream warmup, then capture/replay the training graph.
+records = cuda.launch_report()
+```
+
+Tuning uses Triton's CUDA Graph benchmark utility and includes partial-buffer
+reductions in timing. A cache hit performs neither benchmarking nor resource
+probing. The process-local cache separates device index/UUID/capability/resource
+limits, workload dimensions, optional mask/gate paths and relevant dtypes.
+It retains scalar metadata only, not tensors. Reports include each attempted
+configuration, shared-memory bytes, registers, spills, partial workspace bytes,
+resource rejection reasons and (when tuned) timings. They can be serialized to
+JSON for review; plans are not automatically persisted/reloaded across processes.
+
+An uncached shape encountered inside CUDA Graph capture raises an actionable
+warmup error. Autotuning must happen before capture; existing captured graphs
+keep their selected kernels even if later eager calls are tuned. Concurrent GPU
+work can distort timing, so tuning is explicit rather than an unconditional
+cost on every new training shape. The simple rotary/packing kernels and vendor
+linear algebra are not part of this search. Resource checks do not substitute
+for numerical and performance validation on other GPU architectures.
+
+Example with a complete mixer and resource report:
+
+```bash
+python -m benchmarks.benchmark_ball --batch 32 --length 196 --dim 384 \
+    --heads 6 --rank 32 --dtype bfloat16 --mode train --graph --autotune \
+    --launch-report /tmp/memsolve-launches.json
+```
+
+The bounded configuration search follows the approach in
+[Mamba-2's chunk scan](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/ssd_chunk_scan.py);
+resource handling follows
+[Triton's autotuner](https://github.com/triton-lang/triton/blob/main/python/triton/runtime/autotuner.py).
+The launch coordinator is local because token tile sizes also determine partial
+buffer allocation and reduction work. The upstream benchmarking utility is
+imported; no Mamba kernel or alternate operator equation is vendored.
+
 ## Selective fusion and precision
 
 1. Packed Q/K/V and the two gate projections use BF16 Tensor Core linear maps.
@@ -27,9 +93,9 @@ and the output projection's mixed-precision boundary.
    and FP32 master weights. Both modalities use channels-last convolution:
    a 1D sequence becomes a 1 x N grid with a 1 x k filter, exactly the same
    centered convolution. V bypasses the filter. A single Triton pass packs
-   Q/K/V, applies optional axial RoPE, and zeros invalid outputs. Its VJP
-   unpacks, masks and applies the conjugate rotation in one pass. The existing
-   BF16 boundary between convolution and RoPE is retained.
+   Q/K/V and zeros invalid outputs. Its VJP unpacks and masks in one pass.
+   The public model supplies no rotation tables; the retained low-level
+   rotation primitive is not used by the vision or language forward path.
 3. Independent token tiles accumulate K^T K and K^T V with BF16 products and
    FP32 accumulation, then reduce partial statistics. A fused kernel adds the
    unit ridge and produces the column-major layout for vendor Cholesky.

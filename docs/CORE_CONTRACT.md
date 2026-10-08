@@ -1,11 +1,12 @@
 # Q/K/V ridge memory and learned query readout
 
-Model contract **23**, source version **0.14.0**. Independent Q/K/V projections,
+Model contract **24**, source version **0.14.0**. Independent Q/K/V projections,
 centered Q/K depthwise convolutions, a shared query map T = I + Delta, and
 per-head RMSNorm and a low-rank sigmoid output gate define one operator.
 There is no input-conditioned core generator, reflected readout, internal value
-skip, V convolution or mode selector. Vision adds fixed axial 2D RoPE after
-Q/K convolution; 1D models retain their existing external position embeddings.
+skip, V convolution or mode selector. Position embeddings belong to the
+surrounding model: vision adds a learned 2D absolute table before the first block;
+1D models retain their existing external position embeddings.
 
 ## Definition
 
@@ -17,7 +18,6 @@ the displayed matrices below retain only the valid rows.
 Q = DWConv_q(X Wq + bq)       [n,r]
 K = DWConv_k(X Wk + bk)       [n,r]
 V = X Wv + bv                 [n,d]
-Q,K = RoPE_2D(Q), RoPE_2D(K)  vision only, before both Gram and KV statistics
 Ak = K / sqrt(n), Aq = Q / sqrt(n)
 R^T R = I + Ak^T Ak           upper Cholesky, positive diagonal
 Pk = Ak R^-1, Pq = Aq R^-1
@@ -51,26 +51,13 @@ neighborhood and padding. See the depthwise definition in
 [FLA ShortConvolution](https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/conv/short_conv.py)
 is causal; its boundary semantics are not reused for this bidirectional filter.
 
-Vision follows the fixed axial convention in
-[RoPE-ViT](https://github.com/naver-ai/rope-vit/blob/main/models/vit_rope.py):
-each head has r/4 adjacent channel pairs for horizontal position, followed by
-r/4 pairs for vertical position, with frequencies `100**(-4*j/r)`. Rank must
-be divisible by four. Coordinates are integer patch indices `(x,y)` in the
-actual row-major `(height,width)` grid; frequencies are shared across heads.
-No frequency training, normalized coordinates, resolution interpolation or
-additional learned position table is used. V is unchanged. In column-vector
-notation, `q_p = Rotation(p) sum_delta D_delta q_raw[p+delta]` (and likewise K).
-The same rotated K enters both K^T K and K^T V. Orthogonal rotation preserves
-each key norm and hence the trace initialization criterion, while changing
-its feature covariance. The ridge system remains positive definite. The
-general T-corrected readout is not claimed to depend only on relative offsets.
-
-Phases are computed in FP32 (FP64 for the oracle), independently of AMP. The
-reference rotates pairs in that dtype and rounds to the projection dtype once.
-CUDA uses the same equations in registers. Derived phase tables are cached by
-both grid dimensions, device and dtype; caches are excluded from checkpoints
-and DDP broadcasts. Warmed tables stay alive across resolution changes so a
-captured training graph can be replayed after evaluation on another grid.
+Vision uses timm's learned absolute patch-position table with shape
+`[1, H_patch*W_patch, D]`, added once after patch embedding and before the
+first block. It initializes with timm's truncated normal (std 0.02), is
+excluded from optimizer weight decay, and is interpolated over the 2D patch
+grid for other image resolutions. There is no CLS position or internal Q/K
+rotation. Both Q/K and V therefore originate from position-augmented inputs.
+The sequence and language adapters retain their external position embeddings.
 
 One packed projection stores independent Q/K/V in the layout
 `[Q_all_heads, K_all_heads, V_all_heads]`. `core_delta` has shape `[H,r,r]`
@@ -97,33 +84,14 @@ Contract 22 adds the low-rank sigmoid output gate and configurable odd Q/K kerne
 Older contracts are rejected rather than silently converted.
 The encoder owns residual connections, MLPs and pooling.
 
-## Coordinate shifts and the learned core
-
-Axial RoPE follows [RoPE-ViT](https://arxiv.org/abs/2403.13298). Its rotations
-preserve each Q/K row norm, hence the trace of the key Gram, but do not preserve
-the Gram's full spectrum when different rows receive different rotations.
-The unit ridge still makes `I + K^T K/n` positive definite.
-
-The following is a deduction for this operator, not a property established by
-the RoPE-ViT experiments. For `T = I`, the readout reduces to
-`O = Q (I + K^T K/n)^-1 K^T V/n`. Shifting all position coordinates by the
-same offset rotates Q and K by a common orthogonal matrix, leaving this readout
-unchanged when content and valid-token membership are held fixed.
-
-For a general learned `T`, write `O = Pq T Pk^T V`. Under that same coordinate
-shift, the Cholesky-whitened frames transform as `Pq' = Pq U`, `Pk' = Pk U`
-for an orthogonal `U` depending on the key statistics and shift. The new output
-is `Pq U T U^T Pk^T V`; an unconstrained shared T need not satisfy `U T U^T = T`.
-Thus the current learned correction does not guarantee coordinate-origin
-invariance. This applies to both Axial and Mixed RoPE. It neither invalidates
-the solve nor establishes a loss of classification accuracy. Full-image
-translation also changes convolution boundary effects, which this argument
-deliberately excludes.
+Contract 24 removes internal Q/K rotation. The vision scaffold adds learned
+2D absolute positions outside the operator. Previous checkpoints retain their
+original position semantics and cannot resume under this contract.
 
 ## Output selection
 
 The gate receives the same masked mixer input X as the projections, before
-convolution and RoPE. Vision supplies Pre-LN activations; BERT retains its
+convolution. Vision supplies Pre-LN activations; BERT retains its
 Post-LN scaffold. Wdown has shape [D,m] and Wup [m,D], with
 `output_gate_rank=m` (default 32), independent of the memory rank r. There is
 no intermediate activation, down bias, head sharing or sequence normalization.
@@ -168,7 +136,7 @@ No key rescaling or normalization is added to the forward pass.
 Loading a checkpoint restores its saved K; it does not reinitialize that tensor.
 The K-only initialization change in source 0.8.1 retained model contract 15.
 The historical source 0.9.0 introduced constrained T under contract 16.
-Current contract 23 uses unconstrained Delta initialized to zero and identity
+Current contract 24 uses unconstrained Delta initialized to zero and identity
 Q/K filters; older contracts are rejected on load.
 
 ## Exact memory interpretation

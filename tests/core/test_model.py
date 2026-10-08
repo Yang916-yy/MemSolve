@@ -99,12 +99,6 @@ def test_identity_plus_delta_matches_explicit_map_and_all_gradients(delta_scale,
             qk.transpose(1, 2).reshape(2, 16, 2, 3), layer.qk_conv.weight,
             padding=kernel_size // 2, groups=16,
         ).flatten(2).transpose(1, 2)
-        # Independent complex-pair RoPE oracle after the convolution. With
-        # rank=4 there is one unit-frequency pair for x and one for y.
-        coordinates = torch.tensor([[col, row] for row in range(2) for col in range(3)], dtype=x.dtype)
-        pairs = torch.view_as_complex(qk.reshape(2, 6, 4, 2, 2).contiguous())
-        phases = torch.polar(torch.ones_like(coordinates), coordinates)[None, :, None, :]
-        qk = torch.view_as_real(pairs * phases).reshape_as(qk)
     projected = torch.cat((qk, v), dim=-1)
     q, k, v = split_qkv(projected, 2, 4)
     raw = ridge_query_readout(q, k, v, explicit_map).transpose(1, 2)
@@ -238,23 +232,18 @@ def test_qk_convolution_requires_explicit_valid_spatial_layout():
         MemSolve(MemSolveConfig(12, 2, 4)).load_state_dict(spatial.state_dict())
 
 
-def test_rope_cache_tracks_both_grid_axes_dtype_and_inference_to_training():
-    model = MemSolve(MemSolveConfig(12, 2, 4, qk_conv_dim=2))
-    x = torch.randn(1, 6, 12)
-    with torch.inference_mode():
-        model(x, spatial_shape=(2, 3))
-    cos, sin = model._rotary_tables(x, (2, 3))
-    assert cos.dtype == sin.dtype == torch.float32
-    assert not torch.is_inference(cos)
-    assert not any('rope' in key for key in model.state_dict())
-    model(x.requires_grad_(), spatial_shape=(2, 3)).sum().backward()
-    assert model._rotary_tables(x, (2, 3))[0] is cos
+def test_2d_identity_filters_do_not_add_position_dependent_rotation():
+    # With identity local filters, changing the grid or permuting tokens must
+    # not change the position-free core. External LPE belongs to the backbone.
+    model = MemSolve(MemSolveConfig(12, 2, 3, qk_conv_dim=2)).double()
+    x = torch.randn(1, 6, 12, dtype=torch.float64, requires_grad=True)
+    y = model(x, spatial_shape=(2, 3))
+    torch.testing.assert_close(y, model(x, spatial_shape=(3, 2)))
+    order = torch.tensor([2, 0, 5, 3, 1, 4])
+    torch.testing.assert_close(y[:, order], model(x[:, order], spatial_shape=(2, 3)))
+    assert model.get_extra_state()['position_encoding'] == 'external'
+    y.square().sum().backward()
     assert torch.isfinite(x.grad).all()
-    model(x, spatial_shape=(3, 2))
-    assert not torch.equal(model._rotary_tables(x, (3, 2))[0], cos)
-    assert model._rotary_tables(x, (2, 3))[0] is cos
-    model.double()(x.detach().double(), spatial_shape=(3, 2))
-    assert model._rotary_tables(x.double(), (3, 2))[0].dtype == torch.float64
 
 
 def test_batch_independence_and_learned_convolution_uses_token_order():
@@ -284,7 +273,7 @@ def test_checkpoint_contract_roundtrip_and_rejects_missing_or_old_semantics():
 
 @pytest.mark.parametrize(
     "kwargs", [{"rank": 0}, {"num_heads": 0}, {"dim": 0}, {"num_heads": 5},
-               {"qk_conv_dim": 3}, {"qk_conv_dim": 2, "rank": 6},
+               {"qk_conv_dim": 3},
                {"qk_conv_kernel_size": 0}, {"qk_conv_kernel_size": 2},
                {"output_gate_rank": 0}]
 )

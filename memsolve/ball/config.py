@@ -32,8 +32,6 @@ class MemSolveConfig:
             raise ValueError("qk_conv_dim must be 1 (sequence) or 2 (patch grid)")
         if self.qk_conv_kernel_size % 2 != 1:
             raise ValueError("qk_conv_kernel_size must be odd for centered convolution")
-        if self.qk_conv_dim == 2 and self.rank % 4:
-            raise ValueError("2D axial RoPE requires rank divisible by 4")
 
     @property
     def head_dim(self) -> int:

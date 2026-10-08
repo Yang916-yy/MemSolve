@@ -6,12 +6,12 @@ import torch.nn as nn
 from .config import MemSolveConfig
 from .reference import (
     ridge_query_readout, head_rms_norm, low_rank_gate_logits, sigmoid_output_gate,
-    axial_rotary_tables, convolve_qk, rotary_qk, split_qkv, tensor_core_linear,
+    convolve_qk, split_qkv, tensor_core_linear,
     readout_linear,
 )
 
 
-_CONTRACT_VERSION = 23
+_CONTRACT_VERSION = 24
 _SUPPORTED_ACTIVATION_DTYPES = frozenset(
     (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 )
@@ -22,8 +22,8 @@ class MemSolve(nn.Module):
 
     The learned core is shared across samples. The memory, key Gram and
     queries depend on the input. Centered depthwise convolutions give Q/K
-    local context before the global solve, followed by axial 2D RoPE for
-    patch grids. V remains a tokenwise projection.
+    local context before the global solve. Position embeddings belong to the
+    surrounding model. V remains a tokenwise projection.
     A low-rank sigmoid gate selects normalized readout channels before Wo.
     This mixer has no internal content skip.
     """
@@ -50,11 +50,6 @@ class MemSolve(nn.Module):
         self.gate_down = nn.Linear(config.dim, config.output_gate_rank, bias=False)
         self.gate_up = nn.Linear(config.output_gate_rank, config.dim, bias=True)
         self.w_o = nn.Linear(config.dim, config.dim, bias=config.bias)
-        # Fixed tables are derived state, excluded from checkpoints and DDP
-        # buffer broadcasts. Rebuild on changes of grid, device or oracle dtype.
-        # Keep each warmed geometry alive: a captured graph may still use its
-        # tables after an eager evaluation at another resolution.
-        self._rope_cache = {}
         self.init_weights()
 
     @torch.no_grad()
@@ -97,9 +92,7 @@ class MemSolve(nn.Module):
             "qk_conv": "centered_depthwise_bias_free_identity_init",
             "output_gate_rank": config.output_gate_rank,
             "output_gate": "low_rank_linear_sigmoid_post_rms_pre_wo_with_bias",
-            "position_encoding": (
-                "rope_2d_axial_theta100_after_qk_conv" if config.qk_conv_dim == 2 else "external"
-            ),
+            "position_encoding": "external",
             "core": "identity_plus_learned_shared_query_delta",
             "readout": "query_memory_head_rmsnorm_shared_affine_eps_1e-6",
             "numerics": "bf16_qkv_fp16_readout_fp32_solve_v2",
@@ -107,15 +100,6 @@ class MemSolve(nn.Module):
 
     def get_extra_state(self) -> dict[str, object]:
         return self._contract_state()
-
-    def _rotary_tables(self, x, spatial_shape):
-        dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
-        key = (spatial_shape, x.device, dtype)
-        if key not in self._rope_cache:
-            self._rope_cache[key] = axial_rotary_tables(
-                self.config.rank, spatial_shape, device=x.device, dtype=dtype,
-            )
-        return self._rope_cache[key]
 
     def set_extra_state(self, state: object) -> None:
         expected = self._contract_state()
@@ -233,16 +217,13 @@ class MemSolve(nn.Module):
                 .to(torch.float64 if x.dtype == torch.float64 else torch.float32)
                 .clamp_min(1)
             )
-        cos, sin = self._rotary_tables(x, spatial_shape) if config.qk_conv_dim == 2 else (None, None)
         if implementation == "cuda":
             from . import cuda
 
-            projected = cuda.local_qk(projected, self.qk_conv.weight, cos=cos, sin=sin,
+            projected = cuda.local_qk(projected, self.qk_conv.weight,
                                       valid_mask=mask, spatial_shape=spatial_shape)
         else:
             projected = convolve_qk(projected, self.qk_conv.weight, spatial_shape)
-            if config.qk_conv_dim == 2:
-                projected = rotary_qk(projected, config.num_heads, cos, sin)
         if mask is not None and implementation == "reference":
             # Neighbors may write into an invalid position. It must not enter
             # either the key statistics or the readout, even with input bias.

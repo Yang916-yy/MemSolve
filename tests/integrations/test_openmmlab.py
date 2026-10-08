@@ -48,11 +48,11 @@ def _tiny_imagenet_checkpoint(
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
+            "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
             "class_token": False,
             "layer_scale": False,
             "pooling": "token_ln_mean",
-            "position_encoding": "rope_2d_axial",
+            "position_encoding": "learned_2d",
             "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": 32,
@@ -252,7 +252,7 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
     )
 
 
-def test_backbone_reuses_qk_filters_and_rebuilds_rope_at_a_larger_resolution(
+def test_backbone_reuses_qk_filters_and_interpolates_positions_at_a_larger_resolution(
     tiny_backbone: openmmlab.MemSolveViTBackbone,
     tmp_path: Path,
 ) -> None:
@@ -279,7 +279,8 @@ def test_backbone_reuses_qk_filters_and_rebuilds_rope_at_a_larger_resolution(
     torch.save(_tiny_imagenet_checkpoint(source, image_size=32), checkpoint)
 
     target.load_pretrained(checkpoint)
-    assert target.encoder.pos_embed is None
+    torch.testing.assert_close(target.encoder.pos_embed, interpolate_position_embedding(
+        source.encoder.pos_embed, target.encoder.pos_embed))
     torch.testing.assert_close(target.blocks[0].attn.mixer.qk_conv.weight,
                                source.blocks[0].attn.mixer.qk_conv.weight)
     with torch.no_grad():

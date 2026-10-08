@@ -176,7 +176,7 @@ class _TimmMemSolveMixer(nn.Module):
 
 
 class MemSolveViT(nn.Module):
-    """MemSolve-ViT: ViT³-derived scaffold with Q/K conv, 2D RoPE and SwiGLU.
+    """MemSolve-ViT: Q/K conv, learned 2D patch positions and SwiGLU.
 
     mlp_ratio specifies the equivalent two-projection MLP weight budget.
     SwiGLU uses two-thirds of that hidden width, rounded up to 16 channels.
@@ -255,7 +255,7 @@ class MemSolveViT(nn.Module):
         self.encoder = VisionTransformer(
             img_size=image_size, patch_size=patch_size, num_classes=num_classes,
             embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio,
-            qkv_bias=bias, proj_bias=bias, class_token=False, pos_embed="none",
+            qkv_bias=bias, proj_bias=bias, class_token=False, pos_embed="learn",
             global_pool="avg", fc_norm=False, init_values=None,
             dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
             drop_path_rate=drop_path_rate, norm_layer=partial(nn.LayerNorm, eps=norm_eps),
@@ -263,7 +263,7 @@ class MemSolveViT(nn.Module):
         )
 
     def get_extra_state(self) -> dict[str, object]:
-        return {"version": 4, "architecture": "vit3_qkconv_rope2d", "ffn": "swiglu",
+        return {"version": 5, "architecture": "vit3_qkconv_lpe2d", "ffn": "swiglu",
                 "pooling": "token_ln_mean", "class_token": False, "layer_scale": False}
 
     def set_extra_state(self, state: object) -> None:

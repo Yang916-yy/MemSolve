@@ -23,9 +23,9 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("variant,width,heads,rank,count", [
-    ("tiny", 192, 6, 16, 5_427_112),
-    ("small", 384, 6, 32, 20_622_184),
-    ("base", 768, 12, 48, 83_940_328),
+    ("tiny", 192, 6, 16, 5_427_880),
+    ("small", 384, 6, 32, 20_623_720),
+    ("base", 768, 12, 48, 83_943_400),
 ])
 def test_registered_vision_models(variant, width, heads, rank, count):
     timm = pytest.importorskip("timm")
@@ -144,7 +144,11 @@ def test_constant_droppath_and_resolution_weight_transfer():
     for model in (source, target):
         for block in model.blocks:
             assert block.drop_path1.drop_prob == block.drop_path2.drop_prob == .1
-    target.load_state_dict(source.state_dict(), strict=True)
+    from experiments.imagenet import interpolate_position_embedding
+    state = source.state_dict()
+    state["encoder.pos_embed"] = interpolate_position_embedding(
+        state["encoder.pos_embed"], target.encoder.pos_embed)
+    target.load_state_dict(state, strict=True)
     target.eval()
     with torch.no_grad():
         out = target(torch.randn(1, 3, 224, 224))
@@ -334,7 +338,31 @@ def test_shared_scaffold_applies_linear_drop_path_without_layerscale():
     assert all(isinstance(block.ls1, torch.nn.Identity) and isinstance(block.ls2, torch.nn.Identity) for block in model.blocks)
 
 
-def test_rope_scaffold_has_no_cpe_and_masks_local_qk_input():
+def test_learned_positions_enter_before_blocks_and_receive_gradients():
+    model = create_memsolve_vit(
+        image_size=32, patch_size=16, num_classes=10, embed_dim=32,
+        depth=1, num_heads=2, rank=16, mlp_ratio=2, bias=True,
+        dynamic_img_size=True,
+    ).eval()
+    images = torch.randn(2, 3, 32, 48)
+    seen = []
+    hook = model.blocks[0].register_forward_pre_hook(
+        lambda _module, inputs: seen.append(inputs[0])
+    )
+    output = model(images)
+    hook.remove()
+    from timm.layers import resample_abs_pos_embed
+    positions = resample_abs_pos_embed(
+        model.encoder.pos_embed, (2, 3), num_prefix_tokens=0,
+    )
+    patches = model.patch_embed(images).reshape(2, 6, 32)
+    torch.testing.assert_close(seen[0], patches + positions)
+    output.square().sum().backward()
+    grad = model.encoder.pos_embed.grad
+    assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
+def test_learned_position_scaffold_has_no_cpe_and_masks_local_qk_input():
     pytest.importorskip("timm")
     from integrations.timm import create_memsolve_vit, VisionTokenLayout
     torch.manual_seed(137)
@@ -343,10 +371,10 @@ def test_rope_scaffold_has_no_cpe_and_masks_local_qk_input():
         depth=1, num_heads=2, rank=16, mlp_ratio=2,
         bias=True,
     )
-    assert model.encoder.pos_embed is None
+    assert model.encoder.pos_embed.shape == (1, model.patch_embed.num_patches, model.num_features)
     block = model.blocks[0]
     assert not hasattr(block, 'cpe')
-    assert block.attn.mixer.get_extra_state()['position_encoding'] == 'rope_2d_axial_theta100_after_qk_conv'
+    assert block.attn.mixer.get_extra_state()['position_encoding'] == 'external'
     with torch.no_grad():
         block.attn.mixer.qk_conv.weight.add_(torch.randn_like(block.attn.mixer.qk_conv.weight) * .1)
     # Observe exactly the tensor entering the first normalization.
@@ -393,7 +421,7 @@ def test_mean_pooling_uses_token_norm_and_excludes_invalid_patches():
     ).eval()
     encoder = model.encoder
     assert encoder.cls_token is None and encoder.num_prefix_tokens == 0
-    assert encoder.pos_embed is None
+    assert encoder.pos_embed.shape == (1, 4, 32)
     assert isinstance(encoder.norm, torch.nn.LayerNorm)
     assert isinstance(encoder.fc_norm, torch.nn.Identity)
     images = torch.randn(2, 3, 32, 32)

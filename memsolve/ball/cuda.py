@@ -1,12 +1,160 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
 import importlib.util
 
 import torch
 
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
 _CUDA_CONTRACT_VERSION = 19
+
+
+@dataclass(frozen=True)
+class _LaunchConfig:
+    tokens: int
+    warps: int
+    stages: int = 1
+
+
+_TUNE_LAUNCHES = ContextVar("memsolve_tune_launches", default=False)
+# Only scalar metadata is retained: never keep a training tensor or graph alive.
+_LAUNCH_PLANS: dict[tuple, dict] = {}
+
+
+@contextmanager
+def autotune():
+    """Measure token-kernel configurations during eager forward/backward warmup.
+
+    Use before CUDA Graph capture and preferably on an otherwise idle GPU.
+    Results are cached per device and workload for this process. Normal calls
+    only validate resources and keep the existing schedule when it fits.
+    """
+    token = _TUNE_LAUNCHES.set(True)
+    try:
+        yield
+    finally:
+        _TUNE_LAUNCHES.reset(token)
+
+
+def launch_report() -> list[dict]:
+    """Return JSON-compatible resource/timing records, without GPU synchronization."""
+    from copy import deepcopy
+
+    return deepcopy(list(_LAUNCH_PLANS.values()))
+
+
+@lru_cache(maxsize=None)
+def _device_resources(index: int) -> tuple:
+    prop = torch.cuda.get_device_properties(index)
+    return (
+        index, str(prop.uuid), prop.major, prop.minor,
+        prop.shared_memory_per_block_optin,
+        prop.shared_memory_per_multiprocessor, prop.regs_per_multiprocessor,
+    )
+
+
+def _launch_candidates(default: _LaunchConfig) -> tuple[_LaunchConfig, ...]:
+    # Bounded search, inspired by Mamba-2's Triton launch configurations.
+    # Keep arithmetic/dtypes fixed. Smaller tiles provide lower-resource options;
+    # two stages are an optional latency-hiding alternative, never mandatory.
+    return tuple(dict.fromkeys((
+        default,
+        _LaunchConfig(default.tokens, 2 if default.warps == 4 else 4),
+        _LaunchConfig(max(16, default.tokens // 2), default.warps),
+        _LaunchConfig(16, 4),
+        _LaunchConfig(default.tokens, default.warps, 2),
+    )))
+
+
+def _launch_token(kind, kernel, device, signature, default, prepare):
+    # A tensor on cuda:1 must never reuse cuda:0's resource plan or compile for
+    # cuda:0 merely because that device happens to be current in the caller.
+    with torch.cuda.device(device):
+        return _launch_token_on_device(kind, kernel, device, signature, default, prepare)
+
+
+def _launch_token_on_device(kind, kernel, device, signature, default, prepare):
+    """Select a schedule, then allocate exactly its partial buffers and launch.
+
+    prepare(config) returns (arguments, grid, finish, workspace_bytes). finish
+    includes partial reduction, so tuning measures the whole token operation,
+    not a kernel that wins by exporting more work to a later reduction.
+    Every candidate overwrites its outputs; none updates model parameters.
+    """
+    from triton.runtime.errors import OutOfResources
+
+    resources = _device_resources(device.index)
+    key = (resources, kind, signature)
+    plan = _LAUNCH_PLANS.get(key)
+    tuning = _TUNE_LAUNCHES.get()
+    if plan is not None and (not tuning or plan["tuned"]):
+        config = _LaunchConfig(**plan["selected"])
+        args, grid, finish, _ = prepare(config)
+        kernel[grid](*args, num_warps=config.warps, num_stages=config.stages)
+        return finish()
+
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MemSolve launch configuration is cold: run eager forward/backward "
+                "warmup for this shape before CUDA Graph capture"
+            )
+        records = []
+        winner = None
+        best_ms = float("inf")
+        for config in _launch_candidates(default):
+            options = dict(num_warps=config.warps, num_stages=config.stages)
+            record = {"config": asdict(config)}
+            args = finish = None
+            try:
+                # Smaller token tiles use less on-chip storage but may need
+                # MORE global partial-buffer memory. An oversized tuning
+                # candidate must not discard another viable schedule.
+                args, grid, finish, workspace = prepare(config)
+                record["workspace_bytes"] = workspace
+                compiled = kernel.warmup(*args, grid=grid, **options)
+                shared = compiled.metadata.shared
+                record["shared_bytes"] = shared
+                if shared > resources[4]:
+                    raise OutOfResources(shared, resources[4], "shared memory")
+                # Load through Triton's public launch path, which also validates
+                # thread/tensor-memory limits and populates register metadata.
+                kernel[grid](*args, **options)
+                record.update(registers=compiled.n_regs, spills=compiled.n_spills)
+                if tuning:
+                    from triton.testing import do_bench_cudagraph
+
+                    def run():
+                        kernel[grid](*args, **options)
+                        return finish()
+
+                    record["milliseconds"] = do_bench_cudagraph(run, rep=10)
+                    if record["milliseconds"] < best_ms:
+                        winner, best_ms = config, record["milliseconds"]
+                else:
+                    winner = config
+                records.append(record)
+            except (OutOfResources, torch.cuda.OutOfMemoryError) as error:
+                record["rejected"] = str(error)
+                records.append(record)
+            # Do not retain the last candidate's workspace during the next one.
+            del args, finish
+            if winner is not None and not tuning:
+                break
+        if winner is None:
+            raise RuntimeError(
+                f"No resource-compatible MemSolve {kind} configuration on {device}: {records}"
+            )
+        _LAUNCH_PLANS[key] = {
+            "device": list(resources), "kernel": kind, "signature": list(signature),
+            "selected": asdict(winner), "tuned": tuning, "candidates": records,
+        }
+    args, grid, finish, _ = prepare(winner)
+    kernel[grid](*args, num_warps=winner.warps, num_stages=winner.stages)
+    return finish()
 
 
 def is_available() -> bool:
@@ -546,38 +694,29 @@ def _statistics(projected, heads, rank, counts, gradient=None):
     # BF16 forward statistics fit 256 tokens per tile; short sequences then
     # need no partial-sum kernels. FP32 adjoints retain smaller live tiles.
     bt = (32 if rank > 32 else 128) if gradient is not None else 256
-    tiles = (length + bt - 1) // bt
-    options = dict(device=projected.device, dtype=torch.float32)
-    cross = torch.empty((batch * heads, tiles, rank, dim), **options)
-    gram = (
-        torch.empty((batch * heads, tiles, rank, rank), **options)
-        if gradient is None
-        else cross
-    )
-    _token_kernels()[0][(batch * heads * tiles,)](
-        projected,
-        gradient,
-        counts,
-        gram,
-        cross,
-        length,
-        heads,
-        rank,
-        dim,
-        tiles,
-        gradient is not None,
-        counts is not None,
-        _block_size(rank),
-        min(128, _block_size(dim)),
-        bt,
-        num_warps=4,
-        num_stages=1,
-    )
-    cross = (cross[:, 0] if tiles == 1 else cross.sum(1)).view(batch, heads, rank, dim)
-    return (
-        ((gram[:, 0] if tiles == 1 else gram.sum(1)).view(batch, heads, rank, rank), cross)
-        if gradient is None
-        else cross
+    def prepare(config):
+        tiles = (length + config.tokens - 1) // config.tokens
+        options = dict(device=projected.device, dtype=torch.float32)
+        cross = torch.empty((batch * heads, tiles, rank, dim), **options)
+        gram = torch.empty((batch * heads, tiles, rank, rank), **options) if gradient is None else cross
+        args = (projected, gradient, counts, gram, cross, length, heads, rank, dim,
+                tiles, gradient is not None, counts is not None,
+                _block_size(rank), min(128, _block_size(dim)), config.tokens)
+
+        def finish():
+            reduced = (cross[:, 0] if tiles == 1 else cross.sum(1)).view(batch, heads, rank, dim)
+            if gradient is not None:
+                return reduced
+            return (gram[:, 0] if tiles == 1 else gram.sum(1)).view(batch, heads, rank, rank), reduced
+
+        workspace = (cross.numel() + (gram.numel() if gradient is None else 0)) * 4
+        return args, (batch * heads * tiles,), finish, workspace
+
+    return _launch_token(
+        "statistics_grad" if gradient is not None else "statistics", _token_kernels()[0],
+        projected.device, (batch, length, heads, rank, dim, counts is not None,
+                           str(gradient.dtype) if gradient is not None else "none"),
+        _LaunchConfig(bt, 4), prepare,
     )
 
 
@@ -751,30 +890,29 @@ def _forward(projected, core_map, counts, norm_weight=None, gate_logits=None, *,
         output = torch.empty(
             (batch, length, heads * dim), device=projected.device, dtype=storage_dtype,
         )
-        _token_kernels()[3][(batch * heads * ((length + 31) // 32),)](
-            projected, coefficient, counts, norm_weight, None, output, None, None, gate_logits, None,
-            length, heads, rank, dim, counts is not None, False, gate_logits is not None,
-            _block_size(rank), _block_size(dim), 32, num_warps=4, num_stages=1,
+        def prepare(config):
+            args = (projected, coefficient, counts, norm_weight, None, output, None, None, gate_logits, None,
+                    length, heads, rank, dim, counts is not None, False, gate_logits is not None,
+                    _block_size(rank), _block_size(dim), config.tokens)
+            return args, (batch * heads * ((length + config.tokens - 1) // config.tokens),), lambda: output, 0
+
+        _launch_token(
+            "normalized_readout", _token_kernels()[3], projected.device,
+            (batch, length, heads, rank, dim, counts is not None, gate_logits is not None, str(storage_dtype)),
+            _LaunchConfig(32, 4), prepare,
         )
         return output, (coefficient, *tape)
     output = torch.empty(
         (batch, length, heads * dim), device=projected.device, dtype=torch.float32
     )
-    _token_kernels()[1][(batch * heads * ((length + 127) // 128),)](
-        projected,
-        coefficient,
-        counts,
-        output,
-        length,
-        heads,
-        rank,
-        dim,
-        counts is not None,
-        _block_size(rank),
-        min(128, _block_size(dim)),
-        128,
-        num_warps=4,
-        num_stages=1,
+    def prepare(config):
+        args = (projected, coefficient, counts, output, length, heads, rank, dim,
+                counts is not None, _block_size(rank), min(128, _block_size(dim)), config.tokens)
+        return args, (batch * heads * ((length + config.tokens - 1) // config.tokens),), lambda: output, 0
+
+    _launch_token(
+        "readout", _token_kernels()[1], projected.device,
+        (batch, length, heads, rank, dim, counts is not None), _LaunchConfig(128, 4), prepare,
     )
     return output, (coefficient, *tape)
 
@@ -783,6 +921,9 @@ class _QKVMix(torch.autograd.Function):
     @staticmethod
     def forward(ctx, projected, core_map, counts, norm_weight, gate_logits,
                 output_weight, output_bias, output_dtype):
+        # Autograd may execute backward on a worker thread; Python ContextVars
+        # do not propagate there. Carry the warmup request on this graph only.
+        ctx.tune_launches = _TUNE_LAUNCHES.get()
         output, saved = _forward(projected, core_map, counts, norm_weight, gate_logits,
             storage_dtype=torch.float16 if output_weight is not None else torch.bfloat16)
         value16 = weight16 = None
@@ -797,6 +938,11 @@ class _QKVMix(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, gradient):
+        with autotune() if ctx.tune_launches else nullcontext():
+            return _QKVMix._backward(ctx, gradient)
+
+    @staticmethod
+    def _backward(ctx, gradient):
         from .reference import _ieee_fp32_matmul
 
         projected, counts, norm_weight, gate_logits, value16, weight16, coefficient, *tape = ctx.saved_tensors
@@ -815,24 +961,29 @@ class _QKVMix(torch.autograd.Function):
         if norm_weight is not None:
             # FLA-style small tiles. Store the gain VJP early and reload the
             # compact coefficient inside the kernel to keep live ranges short.
-            bt = 32
-            tiles = (length + bt - 1) // bt
-            partial = torch.empty(
-                (batch, heads, tiles, dim), device=projected.device, dtype=torch.float32,
+            def prepare(config):
+                tiles = (length + config.tokens - 1) // config.tokens
+                partial = torch.empty(
+                    (batch, heads, tiles, dim), device=projected.device, dtype=torch.float32,
+                )
+                coefficient_partial = torch.empty(
+                    (batch, heads, tiles, rank, dim), device=projected.device, dtype=torch.float32,
+                )
+                args = (projected, coefficient, counts, norm_weight, gradient,
+                        projected_gradient, partial, coefficient_partial, gate_logits, gate_gradient,
+                        length, heads, rank, dim, counts is not None, True, gate_logits is not None,
+                        _block_size(rank), _block_size(dim), config.tokens)
+
+                def finish():
+                    return partial.sum((0, 1, 2)), coefficient_partial.sum(2)
+
+                return args, (batch * heads * tiles,), finish, (partial.numel() + coefficient_partial.numel()) * 4
+
+            norm_gradient, coefficient_gradient = _launch_token(
+                "normalized_readout_grad", _token_kernels()[3], projected.device,
+                (batch, length, heads, rank, dim, counts is not None, gate_logits is not None, str(gradient.dtype)),
+                _LaunchConfig(32, 2), prepare,
             )
-            coefficient_partial = torch.empty(
-                (batch, heads, tiles, rank, dim), device=projected.device, dtype=torch.float32,
-            )
-            _token_kernels()[3][(batch * heads * tiles,)](
-                projected, coefficient, counts, norm_weight, gradient,
-                projected_gradient, partial, coefficient_partial, gate_logits, gate_gradient,
-                length, heads, rank, dim, counts is not None, True, gate_logits is not None,
-                _block_size(rank), _block_size(dim), bt, num_warps=2, num_stages=1,
-            )
-            # Shared affine weights accumulate gradients from every head.
-            norm_gradient = partial.sum((0, 1, 2))
-            coefficient_gradient = coefficient_partial.sum(2)
-            del coefficient_partial, partial
             gradient = None
         else:
             coefficient_gradient = _statistics(projected, heads, rank, counts, gradient)
@@ -844,25 +995,19 @@ class _QKVMix(torch.autograd.Function):
             gram_gradient, cross_gradient, core_gradient = _compact_backward(
                 tape, coefficient_gradient
             )
-        _token_kernels()[2][(batch * heads * ((length + 31) // 32),)](
-            projected,
-            gradient,
-            coefficient,
-            gram_gradient.contiguous(),
-            cross_gradient.contiguous(),
-            counts,
-            projected_gradient,
-            length,
-            heads,
-            rank,
-            dim,
-            counts is not None,
-            norm_weight is None,
-            _block_size(rank),
-            min(128, _block_size(dim)),
-            32,
-            num_warps=2 if rank <= 32 else 4,
-            num_stages=1,
+        gram_gradient, cross_gradient = gram_gradient.contiguous(), cross_gradient.contiguous()
+
+        def prepare(config):
+            args = (projected, gradient, coefficient, gram_gradient, cross_gradient, counts,
+                    projected_gradient, length, heads, rank, dim, counts is not None,
+                    norm_weight is None, _block_size(rank), min(128, _block_size(dim)), config.tokens)
+            return args, (batch * heads * ((length + config.tokens - 1) // config.tokens),), lambda: None, 0
+
+        _launch_token(
+            "token_grad", _token_kernels()[2], projected.device,
+            (batch, length, heads, rank, dim, counts is not None, norm_weight is None,
+             str(gradient.dtype) if gradient is not None else "none"),
+            _LaunchConfig(32, 2 if rank <= 32 else 4), prepare,
         )
         return (projected_gradient, core_gradient, None, norm_gradient, gate_gradient,
                 output_weight_gradient, output_bias_gradient, None)

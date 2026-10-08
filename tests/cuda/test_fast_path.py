@@ -369,6 +369,144 @@ def test_cuda_contract_and_public_rejections():
         )
 
 
+@pytest.mark.parametrize("candidate", range(5))
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_launch_candidates_preserve_reference_forward_and_gradients(monkeypatch, candidate, rank):
+    # Force each candidate, independent of timing noise: no fast but numerically
+    # invalid schedule may enter the tuning search. Include ragged token tiles,
+    # masks, wide values and strong keys, with both raw and RMS readouts.
+    original = cuda._launch_candidates
+    monkeypatch.setattr(cuda, "_LAUNCH_PLANS", {})
+
+    def only_candidate(default):
+        choices = original(default)
+        return (choices[min(candidate, len(choices) - 1)],)
+
+    monkeypatch.setattr(cuda, "_launch_candidates", only_candidate)
+    test_direct_qkv_forward_and_all_adjoints_against_fp64(rank, 257, 80, 8, .3)
+    test_fused_readout_norm_and_all_adjoints_match_fp64(rank, 257, 80, 8, 1)
+    test_fused_gate_rounds_once_and_matches_all_adjoints(rank)
+    test_fp16_projected_readout_matches_oracle_and_retains_small_gradients(rank)
+    # The sensitive near-radial RMS VJP must pass even with a 16-token tile.
+    if rank == 16:
+        test_fused_readout_norm_and_all_adjoints_match_fp64(16, 1, 7, 1, 1)
+        test_direct_qkv_forward_and_all_adjoints_against_fp64(16, 17, 7, 64, .3)
+
+
+def test_resource_selection_uses_compiled_shared_memory_and_fails_explicitly(monkeypatch):
+    torch.manual_seed(186)
+    monkeypatch.setattr(cuda, "_LAUNCH_PLANS", {})
+    real_resources = cuda._device_resources
+    resources = real_resources(0)
+    # Simulated hardware limit; actual kernels still execute on the real GPU.
+    monkeypatch.setattr(cuda, "_device_resources", lambda index: (*resources[:4], 16384, *resources[5:]))
+    x = torch.randn(2, 197, 192, device="cuda", dtype=torch.bfloat16)
+    a, b = cuda._statistics(x, 1, 64, None)
+    records = cuda.launch_report()
+    assert any("rejected" in item for item in records[0]["candidates"])
+    assert records[0]["selected"]["tokens"] < 256
+    q, k, v = split_qkv(x.double(), 1, 64)
+    torch.testing.assert_close(a.double(), k.mT @ k / 197, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(b.double(), k.mT @ v / 197**.5, rtol=1e-4, atol=1e-6)
+    cuda._LAUNCH_PLANS.clear()
+    monkeypatch.setattr(cuda, "_device_resources", lambda index: (*resources[:4], 0, *resources[5:]))
+    with pytest.raises(RuntimeError, match="No resource-compatible"):
+        cuda._statistics(x, 1, 64, None)
+
+
+def test_autotuned_launches_cache_without_tensors_and_replay_graph(monkeypatch):
+    import json
+    from triton import testing
+
+    monkeypatch.setattr(cuda, "_LAUNCH_PLANS", {})
+    torch.manual_seed(184)
+    x = torch.randn(2, 37, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    core = torch.eye(16, device="cuda").repeat(2, 1, 1).requires_grad_()
+    gain = torch.ones(16, device="cuda", requires_grad=True)
+
+    def step():
+        y = cuda.fast_mix(x, core, norm_weight=gain)
+        return y, torch.autograd.grad(y, (x, core, gain), torch.ones_like(y))
+
+    with cuda.autotune():
+        expected, grads = step()
+    expected = expected.detach()
+    records = cuda.launch_report()
+    assert len(records) == 4 and all(row["tuned"] for row in records)
+    json.dumps(records)  # Reports/caches must not retain tensors or closures.
+    assert all("registers" in row["candidates"][0] for row in records)
+
+    def no_retuning(*args, **kwargs):
+        raise AssertionError("a warmed shape must not benchmark again")
+
+    monkeypatch.setattr(testing, "do_bench_cudagraph", no_retuning)
+    with cuda.autotune():
+        step()
+    # Autograd warmup must share the capture stream on recent PyTorch versions.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual, actual_grads = step()
+    graph.replay()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for a, b in zip(actual_grads, grads):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_launch_plans_are_isolated_between_devices(monkeypatch):
+    torch.manual_seed(188)
+    monkeypatch.setattr(cuda, "_LAUNCH_PLANS", {})
+    first = torch.randn(1, 17, 48, device="cuda:0", dtype=torch.bfloat16)
+    second = first.to("cuda:1")
+    a = cuda._statistics(first, 1, 16, None)
+    # Deliberately leave device 0 current while dispatching device 1's inputs.
+    with torch.cuda.device(0):
+        b = cuda._statistics(second, 1, 16, None)
+        assert torch.cuda.current_device() == 0
+    assert len(cuda.launch_report()) == 2
+    assert {row["device"][0] for row in cuda.launch_report()} == {0, 1}
+    for x, y in zip(a, b):
+        torch.testing.assert_close(x, y.to(x.device), rtol=1e-5, atol=1e-6)
+
+
+def test_uncached_capture_requires_eager_warmup(monkeypatch):
+    monkeypatch.setattr(cuda, "_LAUNCH_PLANS", {})
+    x = torch.zeros(1, 17, 48, device="cuda", dtype=torch.bfloat16)
+    # Exercise the pre-launch guard without invalidating a live CUDA capture.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="eager forward/backward warmup"):
+        cuda._statistics(x, 1, 16, None)
+    assert not cuda.launch_report()
+
+
+def test_launch_search_skips_candidate_workspace_oom(monkeypatch):
+    torch.manual_seed(189)
+    monkeypatch.setattr(cuda, "_LAUNCH_PLANS", {})
+    launch = cuda._launch_token
+
+    def limited_launch(kind, kernel, device, signature, default, prepare):
+        def limited_prepare(config):
+            if config.tokens == 256:
+                raise torch.cuda.OutOfMemoryError("simulated candidate allocation failure")
+            return prepare(config)
+        return launch(kind, kernel, device, signature, default, limited_prepare)
+
+    monkeypatch.setattr(cuda, "_launch_token", limited_launch)
+    x = torch.randn(1, 129, 48, device="cuda", dtype=torch.bfloat16)
+    gram, cross = cuda._statistics(x, 1, 16, None)
+    q, k, v = split_qkv(x.double(), 1, 16)
+    torch.testing.assert_close(gram.double(), k.mT @ k / 129, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(cross.double(), k.mT @ v / 129**.5, rtol=1e-4, atol=1e-6)
+    plan, = cuda.launch_report()
+    assert plan["selected"]["tokens"] == 128
+    assert "allocation failure" in plan["candidates"][0]["rejected"]
+
+
 def test_graph_training_replays_fused_adamw_and_matches_eager():
     torch.manual_seed(113)
     model = MemSolve(MemSolveConfig(64, 2, 16)).cuda()

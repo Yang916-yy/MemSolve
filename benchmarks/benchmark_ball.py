@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+import json
+from pathlib import Path
 import statistics
 import time
 
@@ -23,6 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--graph", action="store_true", help="Capture a complete gradient-accumulation cycle.")
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--autotune", action="store_true",
+                        help="Tune MemSolve token launches during eager warmup, before Graph capture.")
+    parser.add_argument("--launch-report", type=Path,
+                        help="Write selected launch configs, resource usage and tuning times as JSON.")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
@@ -93,6 +100,10 @@ def main() -> None:
         raise ValueError("warmup must be nonnegative; steps and repeats must be positive")
     if args.grad_accum <= 0:
         raise ValueError("grad_accum must be positive")
+    if (args.autotune or args.launch_report) and (args.operator != "memsolve" or args.implementation != "cuda"):
+        raise ValueError("launch tuning/reporting requires MemSolve implementation=cuda")
+    if args.autotune and args.warmup < 1:
+        raise ValueError("autotune requires at least one eager warmup step")
     if args.steps % args.grad_accum:
         raise ValueError("steps must be divisible by grad_accum")
     spatial_shape = None if args.spatial_shape is None else tuple(args.spatial_shape)
@@ -172,11 +183,12 @@ def main() -> None:
             x.grad = None
 
     clear_parameter_gradients()
-    for step_index in range(args.warmup):
-        clear_input_gradient()
-        step()
-        if (step_index + 1) % args.grad_accum == 0:
-            clear_parameter_gradients()
+    with cuda.autotune() if args.autotune else nullcontext():
+        for step_index in range(args.warmup):
+            clear_input_gradient()
+            step()
+            if (step_index + 1) % args.grad_accum == 0:
+                clear_parameter_gradients()
     clear_parameter_gradients()
     clear_input_gradient()
     torch.cuda.synchronize()
@@ -229,6 +241,12 @@ def main() -> None:
         gpu_samples.append(start_event.elapsed_time(end_event) / args.steps)
 
     properties = torch.cuda.get_device_properties(device)
+    if args.launch_report:
+        args.launch_report.parent.mkdir(parents=True, exist_ok=True)
+        args.launch_report.write_text(json.dumps({
+            "torch": torch.__version__, "cuda": torch.version.cuda,
+            "launches": cuda.launch_report(),
+        }, indent=2) + "\n")
     implementation = args.implementation if args.operator == "memsolve" else "torch_mha"
     rank = str(args.rank) if args.operator == "memsolve" else "na"
     position = "rope_2d" if args.operator == "memsolve" and spatial_shape is not None else "external"

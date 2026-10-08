@@ -377,7 +377,7 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         "num_classes": defaults["num_classes"],
         "mlp_ratio": defaults["mlp_ratio"],
         "norm_eps": defaults["norm_eps"],
-        "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
+        "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
@@ -510,8 +510,8 @@ def _validate_run(
     _probability(model["drop_path_rate"], "drop_path_rate")
 
     for key, expected in {
-        "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu", "layer_scale": False, "class_token": False,
-        "pooling": "token_ln_mean", "position_encoding": "rope_2d_axial",
+        "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu", "layer_scale": False, "class_token": False,
+        "pooling": "token_ln_mean", "position_encoding": "learned_2d",
     }.items():
         if model.get(key) != expected:
             raise ValueError(f"the vision scaffold requires {key}={expected!r}")
@@ -2716,7 +2716,15 @@ def _load_finetune(path: Path, *, model: nn.Module, run: ImageNetRun) -> dict[st
     ) or contract["operator"] != run.operator:
         raise ValueError("finetune checkpoint architecture/operator does not match this model")
     weights = checkpoint.get("selected_weights", "model")
-    _unwrap_model(model).load_state_dict(_checkpoint_model_state(checkpoint, weights=weights), strict=True)
+    target = _unwrap_model(model)
+    state_dict = dict(_checkpoint_model_state(checkpoint, weights=weights))
+    position_key = "encoder.pos_embed"
+    source_position = state_dict.get(position_key)
+    target_position = target.state_dict().get(position_key)
+    if isinstance(source_position, torch.Tensor) and isinstance(target_position, torch.Tensor):
+        if source_position.shape != target_position.shape:
+            state_dict[position_key] = interpolate_position_embedding(source_position, target_position)
+    target.load_state_dict(state_dict, strict=True)
     return {"checkpoint": str(path.resolve()), "source_phase": contract["phase"],
             "source_weights": weights,
             "source_image_size": source_model["image_size"], "source_epoch": checkpoint.get("epoch"),

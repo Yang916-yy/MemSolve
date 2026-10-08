@@ -254,7 +254,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "patch_size": 16,
         "num_classes": 1000,
         "mlp_ratio": 4.0,
-        "architecture": "vit3_qkconv_rope2d_mean_swiglu_v4", "ffn": "swiglu",
+        "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
@@ -265,7 +265,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "rank": 32,
         "drop_path_rate": 0.1,
         "drop_path_schedule": "linear",
-        "position_encoding": "rope_2d_axial",
+        "position_encoding": "learned_2d",
     }
     assert (run.train["epochs"], run.train["optimizer"], run.train["augmentation"]) == (
         300,
@@ -1164,7 +1164,7 @@ def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
     run = load_run(parse_args(['--tier', 'base', '--data-root', str(tmp_path),
                               '--output', str(tmp_path / 'run')]))
     assert run.train['ema'] is True and run.train['ema_decay'] == .99996
-    model = create_memsolve_vit(image_size=16, num_classes=2, embed_dim=32,
+    model = create_memsolve_vit(image_size=192, num_classes=2, embed_dim=32,
         depth=1, num_heads=2, rank=16, mlp_ratio=4., bias=True)
     initial = copy.deepcopy(model)
     ema = imagenet.build_model_ema(model, run)
@@ -1218,6 +1218,19 @@ def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
     assert source['source_weights'] == 'model_ema'
     for loaded, shadow in zip(fresh.parameters(), ema.module.parameters()):
         torch.testing.assert_close(loaded, shadow, rtol=0, atol=0)
+    # The formal Base transition must resize ordinary or EMA patch positions.
+    larger = create_memsolve_vit(image_size=224, num_classes=2, embed_dim=32,
+        depth=1, num_heads=2, rank=16, mlp_ratio=4., bias=True)
+    for selection, owner in [('model', model), ('model_ema', ema.module)]:
+        payload['selected_weights'] = selection
+        torch.save(payload, path)
+        imagenet._load_finetune(path, model=larger, run=ft)
+        expected = imagenet.interpolate_position_embedding(
+            owner.encoder.pos_embed, larger.encoder.pos_embed)
+        torch.testing.assert_close(larger.encoder.pos_embed, expected)
+        torch.testing.assert_close(larger.encoder.patch_embed.proj.weight,
+                                   owner.encoder.patch_embed.proj.weight)
+    assert 'encoder.pos_embed' in imagenet._no_weight_decay(larger)
     # Resume always restores raw optimizer-owned weights, even from EMA best.
     assert _load_resume(path, **kwargs) == (5, 73.5, 72.0)
     for loaded, raw in zip(target.parameters(), model.parameters()):
@@ -1485,6 +1498,7 @@ def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_p
                                 dataset_size=1_281_167, requested_grad_accum=None)
     assert run.config_path == imagenet.ROPEVIT_CONFIG
     if phase == 'pretrain':
+        assert run.train['warmup_epochs'] == 10
         assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (192, 400, .003)
         assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.1, .03)
         assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (512, 2, 2048)
@@ -1493,6 +1507,7 @@ def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_p
         assert run.train['repeated_aug'] and run.train['augmentation'] == 'three_augment'
         optimizer = 'apex.lamb.fused'
     else:
+        assert run.train['warmup_epochs'] == 5
         assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (224, 20, 1e-5)
         assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.2, .1)
         assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (256, 1, 512)
@@ -1505,6 +1520,30 @@ def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_p
     assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer=optimizer) == 'ropevit-derived'
     run.model['drop_path_rate'] = .3
     assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer=optimizer) == 'explicitly-modified'
+
+
+@pytest.mark.parametrize('tier', ['tiny', 'small', 'base'])
+def test_default_pretraining_warmup_counts_optimizer_updates(tmp_path, tier):
+    run = load_run(parse_args(['--tier', tier, '--data-root', str(tmp_path),
+                              '--output', str(tmp_path / tier)]))
+    plans = [resolve_batching_plan(run, _cpu_state(world_size=2),
+             dataset_size=1_281_167, requested_grad_accum=2)]
+    run.train['batch_size'] = 1024
+    plans.append(resolve_batching_plan(run, _cpu_state(world_size=2),
+                 dataset_size=1_281_167, requested_grad_accum=1))
+    assert all(plan.updates_per_epoch == 625 for plan in plans)
+    assert run.train['warmup_epochs'] == 10
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(()))], lr=run.train['lr'])
+    scheduler = build_scheduler(optimizer, run, plans[0].updates_per_epoch)
+    assert optimizer.param_groups[0]['lr'] == run.train['warmup_lr']
+    scheduler.step_update(5 * 625)
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(
+        (run.train['lr'] + run.train['warmup_lr']) / 2)
+    scheduler.step_update(10 * 625 - 1)
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(
+        run.train['warmup_lr'] + (run.train['lr'] - run.train['warmup_lr']) * 6249 / 6250)
+    scheduler.step_update(400 * 625)
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(run.train['min_lr'])
 
 
 def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tmp_path):

@@ -7,7 +7,7 @@ num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
 norm_eps = 1.0e-6
-position_encoding = "rope_2d_axial"
+position_encoding = "learned_2d"
 epochs = 300
 warmup_epochs = 20
 warmup_lr = 1.0e-6
@@ -55,7 +55,7 @@ drop_path_rate = 0.0
 input_size = 224
 
 [tiers.small]
-# SwiGLU gate width 1024 (packed input projection 2048): 20,622,184 parameters with head.
+# SwiGLU gate width 1024 (packed input projection 2048): 20,697,448 parameters with head.
 # Inherits mlp_ratio=4.0: gate width = (8/3) * embed_dim.
 embed_dim = 384
 depth = 12

@@ -30,7 +30,7 @@ from integrations.timm import MemSolveViT
 
 def build_model(*, seed: int = 0, implementation: str = "reference") -> nn.Module:
     torch.manual_seed(seed)
-    # Same Q/K convolution + 2D RoPE scaffold as ImageNet, no CLS or LayerScale.
+    # Same Q/K convolution + learned 2D positions scaffold as ImageNet, no CLS or LayerScale.
     return MemSolveViT(
         image_size=224, patch_size=16, num_classes=101,
         embed_dim=384, depth=12, num_heads=6, rank=32,
@@ -136,7 +136,7 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     contract = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "resume"}
     contract.update(ffn="swiglu", gate_width=1024, architecture="MemSolve-S/16", dim=384, depth=12, heads=6, rank=32,
-                    position_encoding="qk-dwconv-3x3-rope2d-axial-theta100-token-ln-mean-no-cls",
+                    position_encoding="qk-dwconv-3x3-learned2d-token-ln-mean-no-cls",
                     precision="bf16-autocast-fp32-core", implementation=args.implementation,
                     pretrained=False, weight_decay=0.05, label_smoothing=0.1,
                     warmup_epochs=min(3, args.epochs), evaluation="official-test-curve-fixed-final-epoch",

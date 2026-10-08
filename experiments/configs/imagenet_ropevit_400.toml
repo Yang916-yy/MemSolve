@@ -1,7 +1,8 @@
-# MemSolve-ViT-T/S/B: RoPE-ViT's 400-epoch training recipes.
+# MemSolve-ViT-T/S/B: adaptation of RoPE-ViT's 400-epoch training recipes.
 # https://github.com/naver-ai/rope-vit/blob/main/deit/README.md
 # Official effective batches, learning rates and EMA. Local adaptations: BF16,
-# update-based cosine schedule and indexed WebDataset with virtual RA groups.
+# 10-epoch update-based linear warmup, cosine schedule and indexed WebDataset
+# with virtual RA groups. Resolution fine-tuning retains 5 warmup epochs.
 # Tiny borrows the Small recipe; upstream does not list a Tiny training command.
 [defaults]
 recipe = "ropevit_400"
@@ -9,10 +10,10 @@ num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
 norm_eps = 1.0e-6
-position_encoding = "rope_2d_axial"
+position_encoding = "learned_2d"
 drop_path_schedule = "constant"
 epochs = 400
-warmup_epochs = 5
+warmup_epochs = 10
 warmup_lr = 1.0e-6
 min_lr = 1.0e-5
 weight_decay = 0.03
@@ -82,6 +83,7 @@ lr = 0.003
 [tiers.base.finetune]
 input_size = 224
 epochs = 20
+warmup_epochs = 5
 drop_path_rate = 0.2
 batch_size = 256
 effective_batch = 512

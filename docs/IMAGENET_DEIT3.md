@@ -57,19 +57,24 @@ EMA stays outside the CUDA Graph and updates once per accumulated optimizer step
 The shadow is copied before compile installs bound forward wrappers and synchronized
 after DDP initialization, so its evaluation reads its own parameters on every rank.
 
-The MemSolve backbone, BF16 AMP with FP32 parameters, per-update cosine scheduling
-and indexed WebDataset, plus dual ordinary/EMA validation, are local adaptations.
-Pretraining uses 10 epochs of linear warmup, counted in optimizer updates:
-6,250 updates at global batch 2,048 and 625 updates per epoch. Accumulation
-microbatches do not advance the scheduler. This replaces the upstream nominal
-5-epoch warmup; the total remains 400 epochs, including warmup, and the existing
-full-run cosine time base is retained (`warmup_prefix=False`). Base resolution
-fine-tuning retains 5 warmup epochs. Ten-epoch per-step linear warmup has
-precedents in [DINO](https://github.com/facebookresearch/dino/blob/main/main_dino.py)
-and [BEiT v2](https://github.com/microsoft/unilm/blob/master/beit2/PRETRAINING.md);
-those self-supervised recipes do not establish its benefit for MemSolve or LAMB.
-Upstream steps its scheduler per
-epoch. These differences make this a **RoPE-ViT-derived protocol**.
+The learning-rate schedule follows upstream's
+[`main.py`](https://github.com/naver-ai/rope-vit/blob/main/deit/main.py):
+`timm.scheduler.CosineLRScheduler` with nominal 5-epoch warmup, the full-run
+cosine time base (`warmup_prefix=False`), and `scheduler.step(epoch)` **after**
+each training epoch using its zero-based index. There is no per-update LR change.
+For Small, the learning rates actually used in epochs 1–7 are approximately
+`1e-6, 1e-6, 0.0008008, 0.0016006, 0.0024004, 0.0032002, 0.00399846`.
+Thus the first two epochs retain the initial LR, and epoch 7 first uses the
+near-peak cosine LR. Total pretraining remains 400 epochs. Base fine-tuning also
+uses the upstream nominal 5-epoch warmup and epoch-end stepping.
+The resolved `lr_schedule = "epoch"` is included in checkpoint contracts.
+Checkpoints preserve the next epoch's LR; resume restores it without an extra
+scheduler step. Epoch metrics record the LR used as `lr` and the following
+training epoch's LR as `next_lr`. Other recipes retain their per-update schedules.
+
+The MemSolve backbone, BF16 AMP with FP32 parameters, indexed WebDataset and
+dual ordinary/EMA validation remain local adaptations. These differences make
+this a **RoPE-ViT-derived protocol**, not an identical upstream reproduction.
 
 The virtual groups use the repeat-before-rank-split sampler described below,
 with eight independent Mixup/CutMix draws per effective update. The model
@@ -241,7 +246,7 @@ microbatches run sequentially, with loss divided by two before each backward.
 DDP `no_sync` suppresses the first reduction; the final backward synchronizes
 the accumulated gradient. Both micros use equal shapes. Activations can be
 reused within the graph; input buffers and small outputs cover both micros.
-The optimizer, clipping, augmentation and update-based scheduler stay outside
+The optimizer, clipping, augmentation and learning-rate scheduler stay outside
 the graph and run once per effective batch.
 
 The first DDP prewarm uses synchronized backward before enabling `no_sync`,

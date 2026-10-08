@@ -124,8 +124,8 @@ DropPath, optimizer, augmentation and schedule.
 T/S train at 224px for 400 epochs; Base trains at 192px for 400 epochs and
 fine-tunes at 224px for 20 epochs. Pretraining uses fused LAMB, 3-Augment,
 DeiT BCE and global batch 2048; Base fine-tuning uses fused AdamW and batch 512.
-Pretraining uses a local 10-epoch linear warmup counted in optimizer updates;
-Base fine-tuning retains 5 warmup epochs.
+The LR schedule follows upstream: nominal 5-epoch warmup and one zero-based
+`step(epoch)` after each training epoch, for both pretraining and fine-tuning.
 EMA uses upstream's constant decay 0.99996 and updates after optimizer steps.
 Validation records ordinary and EMA metrics, with separate `checkpoint_best.pt`
 and `checkpoint_best_ema.pt` files. Fine-tuning loads the selected weight set;

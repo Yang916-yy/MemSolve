@@ -1498,7 +1498,7 @@ def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_p
                                 dataset_size=1_281_167, requested_grad_accum=None)
     assert run.config_path == imagenet.ROPEVIT_CONFIG
     if phase == 'pretrain':
-        assert run.train['warmup_epochs'] == 10
+        assert run.train['warmup_epochs'] == 5
         assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (192, 400, .003)
         assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.1, .03)
         assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (512, 2, 2048)
@@ -1523,27 +1523,67 @@ def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_p
 
 
 @pytest.mark.parametrize('tier', ['tiny', 'small', 'base'])
-def test_default_pretraining_warmup_counts_optimizer_updates(tmp_path, tier):
+def test_default_schedule_matches_upstream_epoch_end_trajectory_and_resume(tmp_path, tier):
+    import math
+
     run = load_run(parse_args(['--tier', tier, '--data-root', str(tmp_path),
                               '--output', str(tmp_path / tier)]))
-    plans = [resolve_batching_plan(run, _cpu_state(world_size=2),
-             dataset_size=1_281_167, requested_grad_accum=2)]
-    run.train['batch_size'] = 1024
-    plans.append(resolve_batching_plan(run, _cpu_state(world_size=2),
-                 dataset_size=1_281_167, requested_grad_accum=1))
-    assert all(plan.updates_per_epoch == 625 for plan in plans)
-    assert run.train['warmup_epochs'] == 10
+    assert run.train['warmup_epochs'] == 5
+    assert run.train['lr_schedule'] == 'epoch'
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(()))], lr=run.train['lr'])
-    scheduler = build_scheduler(optimizer, run, plans[0].updates_per_epoch)
-    assert optimizer.param_groups[0]['lr'] == run.train['warmup_lr']
-    scheduler.step_update(5 * 625)
-    assert optimizer.param_groups[0]['lr'] == pytest.approx(
-        (run.train['lr'] + run.train['warmup_lr']) / 2)
-    scheduler.step_update(10 * 625 - 1)
-    assert optimizer.param_groups[0]['lr'] == pytest.approx(
-        run.train['warmup_lr'] + (run.train['lr'] - run.train['warmup_lr']) * 6249 / 6250)
-    scheduler.step_update(400 * 625)
-    assert optimizer.param_groups[0]['lr'] == pytest.approx(run.train['min_lr'])
+    scheduler = build_scheduler(optimizer, run, 625)
+    restored_opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(()))], lr=run.train['lr'])
+    # Physical batching/update count must not alter the epoch-based schedule.
+    restored = build_scheduler(restored_opt, run, 1250)
+    for epoch in range(400):
+        # Upstream calls step(epoch) AFTER the preceding training epoch.
+        t = max(0, epoch - 1)
+        if t < 5:
+            expected = 1e-6 + (run.train['lr'] - 1e-6) * t / 5
+        else:
+            expected = 1e-5 + (run.train['lr'] - 1e-5) * (1 + math.cos(math.pi * t / 400)) / 2
+        assert optimizer.param_groups[0]['lr'] == pytest.approx(expected)
+        assert restored_opt.param_groups[0]['lr'] == optimizer.param_groups[0]['lr']
+        scheduler.step_update((epoch + 1) * 625)  # No per-update LR change.
+        assert optimizer.param_groups[0]['lr'] == pytest.approx(expected)
+        scheduler.step(epoch)
+        if epoch in (0, 3, 5, 199):
+            restored = build_scheduler(restored_opt, run, 1250)
+            restored_opt.load_state_dict(optimizer.state_dict())
+            restored.load_state_dict(scheduler.state_dict())
+        else:
+            restored.step(epoch)
+
+
+@pytest.mark.parametrize('grad_accum', [1, 2])
+def test_training_keeps_epoch_lr_constant_and_steps_after_last_update(tmp_path, grad_accum):
+    run = load_run(parse_args(['--tier', 'small', '--data-root', str(tmp_path),
+                              '--output', str(tmp_path / 'run')]))
+    # Exercise the actual training loop without image-model or CUDA dependencies.
+    run.train.update(bce_loss=False, clip_grad=0., optimizer='sgd')
+    model = torch.nn.Linear(2, 5)
+    optimizer = torch.optim.SGD(model.parameters(), lr=run.train['lr'])
+    scheduler = build_scheduler(optimizer, run, 2)
+    def unexpected_update(*args, **kwargs):
+        raise AssertionError('epoch schedule must not advance per update')
+    scheduler.step_update = unexpected_update
+    seen = []
+    hook = optimizer.register_step_pre_hook(lambda opt, args, kwargs: seen.append(opt.param_groups[0]['lr']))
+    plan = BatchingPlan(world_size=1, physical_batch_size=2,
+        effective_batch_size=2 * grad_accum, grad_accum=grad_accum,
+        samples_per_epoch=4 * grad_accum, updates_per_epoch=2)
+    batch = (torch.zeros(2, 2), torch.tensor([0, 1]))
+    for epoch in range(7):
+        used_lr = optimizer.param_groups[0]['lr']
+        train_epoch(model, [batch] * plan.microbatches_per_epoch, None,
+                    torch.nn.CrossEntropyLoss(), optimizer, None, scheduler,
+                    epoch=epoch, state=_cpu_state(), run=run, batching_plan=plan, print_freq=0)
+        assert seen[-2:] == [used_lr, used_lr]
+        expected_next = (1e-6 + (.004 - 1e-6) * epoch / 5 if epoch < 5 else
+            1e-5 + (.004 - 1e-5) * (1 + __import__('math').cos(__import__('math').pi * epoch / 400)) / 2)
+        assert optimizer.param_groups[0]['lr'] == pytest.approx(expected_next)
+    assert seen[:4] == [1e-6] * 4  # First two complete epochs retain the initial LR.
+    hook.remove()
 
 
 def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tmp_path):

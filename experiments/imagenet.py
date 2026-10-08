@@ -388,6 +388,7 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
     }
     train = {**defaults, **phase_values}
     train.pop("input_size")
+    train.setdefault("lr_schedule", "update")
     overrides: list[str] = []
     for argument, key in (
         (args.epochs, "epochs"),
@@ -533,6 +534,8 @@ def _validate_run(
 
     if train.get("execution", "eager") not in {"eager", "graph", "compile-graph"}:
         raise ValueError("unsupported training execution")
+    if train.get("lr_schedule", "update") not in {"epoch", "update"}:
+        raise ValueError("lr_schedule must be 'epoch' or 'update'")
     _positive_int(train["epochs"], "epochs")
     _positive_int(train["batch_size"], "batch_size")
     _positive_int(train["effective_batch"], "effective_batch")
@@ -2007,17 +2010,19 @@ def build_scheduler(
     _positive_int(updates_per_epoch, "updates_per_epoch")
     from timm.scheduler import CosineLRScheduler
 
+    in_epochs = run.train.get("lr_schedule", "update") == "epoch"
+    time_scale = 1 if in_epochs else updates_per_epoch
     return CosineLRScheduler(
         optimizer,
-        t_initial=int(run.train["epochs"]) * updates_per_epoch,
+        t_initial=int(run.train["epochs"]) * time_scale,
         lr_min=float(run.train["min_lr"]),
         cycle_mul=1.0,
         cycle_decay=1.0,
         cycle_limit=1,
-        warmup_t=int(run.train["warmup_epochs"]) * updates_per_epoch,
+        warmup_t=int(run.train["warmup_epochs"]) * time_scale,
         warmup_lr_init=float(run.train["warmup_lr"]),
         warmup_prefix=False,
-        t_in_epochs=False,
+        t_in_epochs=in_epochs,
     )
 
 
@@ -2348,8 +2353,8 @@ def train_epoch(
                 model_ema.update(_unwrap_model(model))
             if graph_step is None:
                 model.zero_grad(set_to_none=True)
-            # Match upstream zero-based update indexing, once per accumulated batch.
-            scheduler.step_update(epoch * batching_plan.updates_per_epoch + optimizer_updates)
+            if run.train.get("lr_schedule", "update") == "update":
+                scheduler.step_update(epoch * batching_plan.updates_per_epoch + optimizer_updates)
             optimizer_updates += 1
 
         batch = logits.shape[0]
@@ -2388,6 +2393,10 @@ def train_epoch(
         raise RuntimeError("ImageNet train loader ended before the resolved batching plan")
     if optimizer_updates != batching_plan.updates_per_epoch:
         raise RuntimeError("ImageNet epoch ended without complete optimizer updates")
+    if run.train.get("lr_schedule", "update") == "epoch":
+        # RoPE-ViT main.py steps the zero-based epoch AFTER training. Retain its
+        # initial-LR plateau and save the resulting next-epoch LR in checkpoints.
+        scheduler.step(epoch)
     return _reduce_metrics(metric_totals, state)
 
 
@@ -2866,6 +2875,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         for epoch in range(start_epoch, int(run.train["epochs"])):
             epoch_started = time.perf_counter()
+            epoch_lr = optimizer.param_groups[0]["lr"]
             train_loss, train_acc1, train_acc5 = train_epoch(
                 model,
                 train_loader,
@@ -2890,7 +2900,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "train_acc1": train_acc1,
                 "train_acc5": train_acc5,
                 **validation,
-                "lr": optimizer.param_groups[0]["lr"],
+                "lr": (epoch_lr if run.train.get("lr_schedule", "update") == "epoch"
+                       else optimizer.param_groups[0]["lr"]),
+                **({"next_lr": optimizer.param_groups[0]["lr"]}
+                   if run.train.get("lr_schedule", "update") == "epoch" else {}),
                 "seconds": time.perf_counter() - epoch_started,
             }
             is_best = False

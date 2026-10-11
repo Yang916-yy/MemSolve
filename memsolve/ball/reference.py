@@ -2,102 +2,18 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import lru_cache
+import math
 
 import torch
 import torch.nn.functional as functional
 from torch.autograd.function import once_differentiable
 
 
+_SOFTPLUS_ONE_OFFSET = math.log(math.expm1(1.0))
+
+
 def _calculation_dtype(value: torch.Tensor) -> torch.dtype:
     return torch.float64 if value.dtype == torch.float64 else torch.float32
-
-
-def axial_rotary_tables(rank, spatial_shape, *, device, dtype):
-    """RoPE-ViT axial convention: x pairs, then y pairs; theta=100.
-
-    Frequencies are 100**(-4*j/rank), j=0..rank/4-1, shared by heads.
-    Coordinates follow the row-major patch grid without normalization or
-    interpolation. Compute phases in FP32 (FP64 for the mathematical oracle).
-    See naver-ai/rope-vit, models/vit_rope.py: compute_axial_cis.
-    """
-    height, width = spatial_shape
-    with torch.inference_mode(False), torch.no_grad(), torch.autocast(device.type, enabled=False):
-        frequencies = 100.0 ** (-torch.arange(0, rank, 4, device=device, dtype=dtype) / rank)
-        index = torch.arange(height * width, device=device)
-        x, y = (index % width).to(dtype), (index // width).to(dtype)
-        phase = torch.cat((x[:, None] * frequencies, y[:, None] * frequencies), dim=-1)
-        return phase.cos(), phase.sin()
-
-
-def rotary_qk(projected, num_heads, cos, sin):
-    """Rotate adjacent Q/K pairs after convolution, leaving packed V intact.
-
-    The real-pair form equals multiplication by exp(i*phase). Production
-    arithmetic uses FP32 and rounds once to the input projection dtype.
-    """
-    rank = 2 * cos.shape[-1]
-    qk_width = 2 * num_heads * rank
-    qk, value = projected.split((qk_width, projected.shape[-1] - qk_width), dim=-1)
-    with torch.autocast(projected.device.type, enabled=False):
-        pairs = qk.reshape(*projected.shape[:2], 2 * num_heads, rank // 2, 2)
-        even, odd = pairs.to(_calculation_dtype(projected)).unbind(-1)
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
-        return torch.cat((rotated.reshape_as(qk).to(projected.dtype), value), dim=-1)
-
-
-def convolve_qk(
-    projected: torch.Tensor,
-    weight: torch.Tensor,
-    spatial_shape: tuple[int, int] | None = None,
-) -> torch.Tensor:
-    """Centered depthwise Q/K filtering of packed [Q, K, V]; V is unchanged.
-
-    The caller zeros invalid projected rows before and after this operation.
-    Coordinates are preserved: masking a token does not close a sequence gap.
-    Native PyTorch/cuDNN convolutions operate in the projection dtype (BF16,
-    or FP64 for the oracle), independently of ambient autocast. Master weights
-    and their accumulated gradients remain FP32 in production.
-    """
-    channels = weight.shape[0]
-    qk, value = projected.split((channels, projected.shape[-1] - channels), dim=-1)
-    with torch.autocast(projected.device.type, enabled=False):
-        weight = weight.to(projected.dtype)
-        if spatial_shape is None:
-            qk = functional.conv1d(
-                qk.transpose(1, 2), weight, padding=weight.shape[-1] // 2, groups=channels,
-            ).transpose(1, 2)
-        else:
-            # NHWC -> channels-last NCHW lets cuDNN use its depthwise kernels.
-            qk = qk.reshape(projected.shape[0], *spatial_shape, channels)
-            qk = functional.conv2d(
-                qk.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last),
-                weight, padding=tuple(size // 2 for size in weight.shape[2:]), groups=channels,
-            ).flatten(2).transpose(1, 2)
-        return torch.cat((qk, value), dim=-1)
-
-
-def low_rank_gate_logits(x, down_weight, up_weight, up_bias):
-    """Logits for the post-RMS gate: (x Wdown) Wup + b.
-
-    Two ordinary GEMMs factorize the gate projection; there is no hidden
-    activation or gate normalization. PyTorch owns sigmoid/multiply/autograd,
-    so torch.compile can fuse the pointwise work. Gate location/activation
-    follow Qiu et al., Gated Attention (2025); low rank is our cost choice.
-    Projection operands/stores are BF16 in production, with FP32 master
-    parameters and gradient accumulation. FP64 inputs retain the oracle.
-    """
-    dtype = torch.float64 if x.dtype == torch.float64 else torch.bfloat16
-    hidden = tensor_core_linear(x, down_weight, output_dtype=dtype)
-    return tensor_core_linear(hidden, up_weight, up_bias, output_dtype=dtype)
-
-
-def sigmoid_output_gate(normalized, logits):
-    """FP32 sigmoid/multiply with one output rounding; FP64 for the oracle."""
-    with torch.autocast(normalized.device.type, enabled=False):
-        calc_dtype = _calculation_dtype(normalized)
-        gated = normalized.to(calc_dtype) * torch.sigmoid(logits.to(calc_dtype))
-        return gated.to(normalized.dtype)
 
 
 @lru_cache(maxsize=1)
@@ -108,121 +24,64 @@ def _biased_gemm_kernel():
 
     @jit
     def kernel(
-        X,
-        W,
-        B,
-        Y,
-        M,
-        N,
-        K: tl.constexpr,
-        XM: tl.constexpr,
-        XK: tl.constexpr,
-        WK: tl.constexpr,
-        WN: tl.constexpr,
-        BS: tl.constexpr,
-        BM: tl.constexpr,
-        BN: tl.constexpr,
-        BK: tl.constexpr,
-        HAS_BIAS: tl.constexpr = True,
-        BF16_INPUTS: tl.constexpr = False,
-        SPLIT_K: tl.constexpr = 1,
+        X, W, B, Y,
+        M, N, K: tl.constexpr,
+        XM: tl.constexpr, XK: tl.constexpr,
+        WK: tl.constexpr, WN: tl.constexpr, BS: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     ):
-        # Group eight row tiles to reuse operands in L2 (upstream Triton GEMM).
-        pid = tl.program_id(0)
-        num_m, num_n = tl.cdiv(M, BM), tl.cdiv(N, BN)
-        group = pid // (8 * num_n)
-        first_m = group * 8
-        group_m = tl.minimum(num_m - first_m, 8)
-        local = pid % (8 * num_n)
-        rows = (first_m + local % group_m) * BM + tl.arange(0, BM)
-        columns = (local // group_m) * BN + tl.arange(0, BN)
+        rows = tl.program_id(0) * BM + tl.arange(0, BM)
+        columns = tl.program_id(1) * BN + tl.arange(0, BN)
         inner = tl.arange(0, BK)
-        split = tl.program_id(1)
         accumulator = tl.full((BM, BN), 0, tl.float32)
-        for start in range(tl.cdiv(K, BK * SPLIT_K)):
-            indices = (start * SPLIT_K + split) * BK + inner
+        for start in range(tl.cdiv(K, BK)):
+            indices = start * BK + inner
             left = tl.load(
                 X + rows[:, None] * XM + indices[None, :] * XK,
-                (rows[:, None] < M) & (indices[None, :] < K),
-                0,
+                (rows[:, None] < M) & (indices[None, :] < K), 0,
             )
             right = tl.load(
                 W + columns[None, :] * WN + indices[:, None] * WK,
-                (columns[None, :] < N) & (indices[:, None] < K),
-                0,
+                (columns[None, :] < N) & (indices[:, None] < K), 0,
             )
-            if BF16_INPUTS:
-                left, right = left.to(tl.bfloat16), right.to(tl.bfloat16)
             accumulator = tl.dot(left, right, accumulator)
-        bias = tl.load(B + columns * BS, columns < N, 0) if HAS_BIAS else 0.
+        bias = tl.load(B + columns * BS, columns < N, 0)
         tl.store(
-            Y + split * M * N + rows[:, None] * N + columns[None, :],
-            accumulator + (bias[None, :] if HAS_BIAS else 0.),
+            Y + rows[:, None] * N + columns[None, :],
+            accumulator + bias[None, :],
             (rows[:, None] < M) & (columns[None, :] < N),
         )
-
     return kernel
 
 
 def _biased_gemm(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    bias: torch.Tensor | None,
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor,
     output_dtype: torch.dtype,
-    *,
-    bf16_inputs: bool = False,
-    split_k: int = 1,
 ) -> torch.Tensor:
     # AB + bias: FP32 accumulation/addition, then one output rounding.
     # Blocked GEMM follows Triton's official matrix-multiplication tutorial:
     # https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
     rows, inner = left.shape
     columns = right.shape[1]
-    output = torch.empty((split_k, rows, columns), device=left.device, dtype=output_dtype)
+    output = torch.empty((rows, columns), device=left.device, dtype=output_dtype)
     if rows == 0 or columns == 0:
-        return output[0]
-    # A 32-wide K tile avoids wasting half the work on low-rank gate logits.
-    # Four warps also improve the full QKV/Wo shapes on SM80, without spills.
-    bm, bn, bk = (128, 64 if inner <= 32 else 128, 32) if rows >= 128 else (32, 64, 32)
-    if split_k > 1:
-        assert bias is None and output_dtype == torch.float32
-        bm, bn = 64, 64
-    _biased_gemm_kernel()[(((rows + bm - 1) // bm) * ((columns + bn - 1) // bn), split_k)](
-        left,
-        right,
-        bias,
-        output,
-        rows,
-        columns,
-        inner,
-        *left.stride(),
-        *right.stride(),
-        0 if bias is None else bias.stride(0),
-        bm,
-        bn,
-        bk,
-        bias is not None,
-        bf16_inputs,
-        split_k,
-        num_warps=4,
-        num_stages=3,
+        return output
+    _biased_gemm_kernel()[((rows + 63) // 64, (columns + 63) // 64)](
+        left, right, bias, output, rows, columns, inner,
+        *left.stride(), *right.stride(), bias.stride(0),
+        64, 64, 32, num_warps=4,
     )
-    return output[0] if split_k == 1 else output.sum(0)
+    return output
 
 
 def _wide_gemm(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    output_dtype: torch.dtype = torch.float32,
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor | None = None,
+    *, output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """16-bit operands with FP32 accumulation, independent of ambient AMP policy."""
+    """BF16 operands with FP32 accumulation, independent of ambient AMP policy."""
     matmul = torch.backends.cuda.matmul
-    setting = ("allow_fp16_reduced_precision_reduction" if left.dtype == torch.float16
-               else "allow_bf16_reduced_precision_reduction")
-    previous = getattr(matmul, setting)
-    setattr(matmul, setting, False)
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    matmul.allow_bf16_reduced_precision_reduction = False
     try:
         with torch.autocast(device_type="cuda", enabled=False):
             if bias is not None:
@@ -230,70 +89,11 @@ def _wide_gemm(
                     return _biased_gemm(left, right, bias, output_dtype)
                 return torch.ops.aten.addmm.dtype(bias, left, right, torch.float32)
             operation = torch.bmm if left.ndim == 3 else torch.mm
-            if output_dtype == torch.bfloat16 and left.dtype == torch.bfloat16:
+            if output_dtype == torch.bfloat16 and bias is None:
                 return operation(left, right)
             return operation(left, right, out_dtype=torch.float32)
     finally:
-        setattr(matmul, setting, previous)
-
-
-def _readout_linear_forward(value, weight, bias, output_dtype):
-    """FP16 readout/Wo operands, FP32 dot and bias, one public output cast.
-
-    The value is post-RMS/sigmoid, bounded by sqrt(head_dim)*abs(gamma).
-    Only the forward operands use FP16; these tensors never form an autograd
-    boundary. Master weights and the backward GEMM accumulation remain FP32.
-    """
-    value16, weight16 = value.to(torch.float16), weight.to(torch.float16)
-    output = _wide_gemm(value16.reshape(-1, value.shape[-1]), weight16.mT,
-                        bias, output_dtype=output_dtype)
-    return output.to(output_dtype).reshape(*value.shape[:-1], weight.shape[0]), value16, weight16
-
-
-def _readout_linear_backward(gradient, value16, weight16, has_bias):
-    """BF16 VJP storage preserves exponent range; all dot products accumulate FP32."""
-    grad = gradient.reshape(-1, weight16.shape[0])
-    with torch.autocast(gradient.device.type, enabled=False):
-        # Reuse the tiled projection GEMM; cast its operands in registers instead
-        # of materializing BF16 copies of the saved FP16 forward activation.
-        value = value16.reshape(-1, value16.shape[-1])
-        dv = _biased_gemm(grad, weight16, None, torch.bfloat16, bf16_inputs=True).reshape_as(value16)
-        # Parallel split-K, as in CUTLASS, gives a small D x D weight gradient
-        # enough CTAs when the reduction spans a large batch of tokens.
-        dw = _biased_gemm(grad.mT, value, None, torch.float32, bf16_inputs=True,
-                         split_k=min(16, max(1, (grad.shape[0] + 1023) // 1024)))
-        db = gradient.sum(tuple(range(gradient.ndim - 1)), dtype=torch.float32) if has_bias else None
-    return dv, dw, db
-
-
-class _ReadoutLinear(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, value, weight, bias, output_dtype):
-        output, value16, weight16 = _readout_linear_forward(value, weight, bias, output_dtype)
-        ctx.save_for_backward(value16, weight16)
-        ctx.has_bias = bias is not None
-        return output
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, gradient):
-        return (*_readout_linear_backward(gradient, *ctx.saved_tensors, ctx.has_bias), None)
-
-
-def readout_linear(value, weight, bias=None, *, output_dtype):
-    """Project the FP32 normalized/gated readout without a half-gradient edge.
-
-    GPU production: FP16 forward, BF16 backward operands/VJP storage and FP32
-    accumulation. Autograd restores the input VJP to the FP32 input dtype.
-    CPU and FP64 retain ordinary reference arithmetic. Callers must provide
-    the normalized/gated value in FP32 (FP64 for the mathematical oracle).
-    """
-    if value.is_cuda and value.dtype != torch.float64:
-        if value.dtype != torch.float32 or weight.dtype != torch.float32:
-            raise TypeError("readout_linear requires FP32 activations and master weights")
-        return _ReadoutLinear.apply(value, weight, bias, output_dtype)
-    with torch.autocast(value.device.type, enabled=False):
-        return functional.linear(value, weight, bias).to(output_dtype)
+        matmul.allow_bf16_reduced_precision_reduction = previous
 
 
 def _tensor_core_batches(
@@ -304,16 +104,12 @@ def _tensor_core_batches(
 
     batch_shape = torch.broadcast_shapes(left.shape[:-2], right.shape[:-2])
     rows, inner, columns = left.shape[-2], left.shape[-1], right.shape[-1]
-    left_batches = (
-        left.to(dtype=torch.bfloat16)
-        .expand(batch_shape + (rows, inner))
-        .reshape(-1, rows, inner)
-    )
-    right_batches = (
-        right.to(dtype=torch.bfloat16)
-        .expand(batch_shape + (inner, columns))
-        .reshape(-1, inner, columns)
-    )
+    left_batches = left.to(dtype=torch.bfloat16).expand(
+        batch_shape + (rows, inner)
+    ).reshape(-1, rows, inner)
+    right_batches = right.to(dtype=torch.bfloat16).expand(
+        batch_shape + (inner, columns)
+    ).reshape(-1, inner, columns)
     return left_batches, right_batches, batch_shape
 
 
@@ -424,9 +220,7 @@ class _TensorCoreLinear(torch.autograd.Function):
                 flat_gradient,
                 weight,
                 output_dtype=(
-                    torch.bfloat16
-                    if ctx.value_dtype == torch.bfloat16
-                    else torch.float32
+                    torch.bfloat16 if ctx.value_dtype == torch.bfloat16 else torch.float32
                 ),
             ).reshape(ctx.value_shape)
             grad_value = grad_value.to(dtype=ctx.value_dtype)
@@ -469,6 +263,41 @@ def _ieee_fp32_matmul(device: torch.device):
         matmul.fp32_precision = previous
 
 
+class _FP32FactorGram(torch.autograd.Function):
+    """Evaluate F F^T and its first-order VJP with full FP32 products."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        factor: torch.Tensor,
+    ) -> torch.Tensor:
+        value = factor.to(dtype=torch.float32)
+        ctx.save_for_backward(value)
+        ctx.factor_dtype = factor.dtype
+        with torch.autocast(device_type=factor.device.type, enabled=False):
+            with _ieee_fp32_matmul(factor.device):
+                return torch.matmul(value, value.mT)
+
+    @staticmethod
+    @once_differentiable
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None]:
+        if not ctx.needs_input_grad[0]:
+            return (None,)
+
+        (factor,) = ctx.saved_tensors
+        with torch.autocast(device_type=factor.device.type, enabled=False):
+            with _ieee_fp32_matmul(factor.device):
+                gradient = torch.matmul(
+                    grad_output.to(dtype=torch.float32)
+                    + grad_output.mT.to(dtype=torch.float32),
+                    factor,
+                )
+        return (gradient.to(dtype=ctx.factor_dtype),)
+
+
 def tensor_core_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Multiply matrices under the canonical BF16-multiplicand/FP32-accumulation contract.
 
@@ -496,6 +325,96 @@ def tensor_core_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         return torch.matmul(left.to(dtype=torch.float32), right.to(dtype=torch.float32))
 
     return _TensorCoreBmm.apply(left, right)
+
+
+def _fp32_factor_gram(factor: torch.Tensor) -> torch.Tensor:
+    """Evaluate the accretive F F^T term without the BF16/FP32 rounding boundary.
+
+    This is algebraically the same factor Gram as the reference definition.
+    The complete CUDA operator uses FP32 FMA here because the compact factor is
+    small and this avoids quantizing its learned lower-triangular coordinates.
+    """
+
+    if factor.dtype == torch.float64:
+        return torch.matmul(factor, factor.mT)
+    if factor.device.type != "cuda":
+        value = factor.to(dtype=torch.float32)
+        return torch.matmul(value, value.mT)
+    return _FP32FactorGram.apply(factor)
+
+
+class _FP32CompactMatmul(torch.autograd.Function):
+    """Compact correction products and VJPs without BF16 operand rounding."""
+
+    @staticmethod
+    def forward(ctx, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(left, right)
+        with torch.autocast(device_type=left.device.type, enabled=False):
+            with _ieee_fp32_matmul(left.device):
+                return left @ right
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        left, right = ctx.saved_tensors
+        with torch.autocast(device_type=left.device.type, enabled=False):
+            with _ieee_fp32_matmul(left.device):
+                gradient = grad_output.to(dtype=left.dtype)
+                grad_left = (
+                    (gradient @ right.mT).sum_to_size(left.shape)
+                    if ctx.needs_input_grad[0] else None
+                )
+                grad_right = (
+                    (left.mT @ gradient).sum_to_size(right.shape)
+                    if ctx.needs_input_grad[1] else None
+                )
+        return grad_left, grad_right
+
+
+def _compact_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if left.device.type == "cuda" and left.dtype == torch.float32:
+        return _FP32CompactMatmul.apply(left, right)
+    return left @ right
+
+
+class _FP32CoreCorrection(torch.autograd.Function):
+    """Residual-form forward with the simplified resolvent VJP.
+
+    For D = (I+K)^-1 (I-K) Z and V = (I+K)^-T dD,
+    dZ = 2 V - dD and dK = -V (D+Z)^T. This avoids separately
+    differentiating both occurrences of K in the residual-form solve.
+    """
+
+    @staticmethod
+    def forward(ctx, generator: torch.Tensor, state: torch.Tensor | None) -> torch.Tensor:
+        with torch.autocast(device_type=generator.device.type, enabled=False):
+            identity = torch.eye(generator.shape[-1], device=generator.device, dtype=generator.dtype)
+            system = identity + generator
+            if state is None:
+                state = identity
+                rhs = identity - generator
+            else:
+                with _ieee_fp32_matmul(generator.device):
+                    rhs = (identity - generator) @ state
+            lu, pivots, _info = torch.linalg.lu_factor_ex(system, check_errors=True)
+            correction = torch.linalg.lu_solve(lu, pivots, rhs)
+            ctx.save_for_backward(lu, pivots, correction + state)
+        return correction
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        lu, pivots, twice_equilibrium = ctx.saved_tensors
+        with torch.autocast(device_type=lu.device.type, enabled=False):
+            gradient = grad_output.to(dtype=lu.dtype)
+            adjoint = torch.linalg.lu_solve(lu, pivots, gradient, adjoint=True)
+            with _ieee_fp32_matmul(lu.device):
+                grad_generator = (
+                    -(adjoint @ twice_equilibrium.mT)
+                    if ctx.needs_input_grad[0] else None
+                )
+            grad_state = 2.0 * adjoint - gradient if ctx.needs_input_grad[1] else None
+        return grad_generator, grad_state
 
 
 def tensor_core_linear(
@@ -562,100 +481,314 @@ def tensor_core_linear(
     return output if output_dtype is None else output.to(dtype=output_dtype)
 
 
-def split_qkv(projected: torch.Tensor, num_heads: int, rank: int):
-    """Unpack independent Q, K and V into [B,H,N,R/D]."""
-    batch, length, width = projected.shape
-    value_dim = width - 2 * num_heads * rank
-    if value_dim <= 0 or value_dim % num_heads:
-        raise ValueError("packed QKV must have width 2*H*R + H*D")
-    query, key, value = projected.split(
-        (num_heads * rank, num_heads * rank, value_dim), -1
-    )
-    return tuple(
-        t.reshape(batch, length, num_heads, -1).transpose(1, 2)
-        for t in (query, key, value)
-    )
+def qr_soft_frame(relation: torch.Tensor) -> torch.Tensor:
+    """Map relation coordinates to the QR soft frame P."""
 
+    if relation.ndim < 2:
+        raise ValueError("relation must have at least two matrix dimensions")
+    if not relation.is_floating_point():
+        raise TypeError("relation must be a floating-point tensor")
 
-def ridge_query_readout(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    core_map: torch.Tensor,
-    valid_counts: torch.Tensor | None = None,
-) -> torch.Tensor:
-    r"""Canonical explicit-frame oracle, returning [B,H,N,D].
+    calc_dtype = _calculation_dtype(relation)
+    with torch.autocast(device_type=relation.device.type, enabled=False):
+        value = relation.to(dtype=calc_dtype)
+        length, rank = value.shape[-2:]
+        if length == 0 or rank == 0:
+            return value
 
-    A_k=K/sqrt(n), A_q=Q/sqrt(n), R^T R=I+A_k^T A_k.
-    P_k=A_k R^-1, P_q=A_q R^-1, Z=P_k^T V.
-    T=core_map is learned per head, shared across samples.
-    O=(P_q T) Z; T transforms queries in the key-statistic coordinates.
-    The model supplies T=I+Delta, with a zero-initialized learned Delta.
-    This primitive accepts any finite T, including singular matrices.
-    Invalid Q/K/V rows must be zero before this boundary.
-    """
-    if query.ndim != 4 or query.shape != key.shape:
-        raise ValueError("query and key must have identical [B,H,N,R] shapes")
-    if value.ndim != 4 or value.shape[:3] != key.shape[:3]:
-        raise ValueError("value must have shape [B,H,N,D]")
-    batch, heads, length, rank = key.shape
-    if min(batch, heads, length, rank, value.shape[-1]) <= 0:
-        raise ValueError("QKV dimensions must be positive")
-    if core_map.shape != (heads, rank, rank):
-        raise ValueError("core_map must have shape [H,R,R]")
-    if valid_counts is not None and valid_counts.shape != (batch,):
-        raise ValueError("valid_counts must have shape [B]")
-    calc_dtype = _calculation_dtype(query)
-    with (
-        torch.autocast(device_type=query.device.type, enabled=False),
-        _ieee_fp32_matmul(query.device),
-    ):
-        query, key, value = (t.to(calc_dtype) for t in (query, key, value))
-        counts = (
-            query.new_full((batch,), float(length))
-            if valid_counts is None
-            else valid_counts.to(calc_dtype)
+        scale = (
+            value.abs()
+            .amax(dim=(-2, -1), keepdim=True)
+            .clamp_min(1.0)
+            .detach()
         )
-        scale = counts.sqrt().view(batch, 1, 1, 1)
-        # Accumulate statistics before normalization, matching the no-frame
-        # implementation without rounding normalized token features to BF16.
-        identity = torch.eye(rank, dtype=calc_dtype, device=query.device)
-        gram = (key.mT @ key) / counts.view(batch, 1, 1, 1)
-        factor, _ = torch.linalg.cholesky_ex(identity + gram, check_errors=False)
-        key_frame = torch.linalg.solve_triangular(
-            factor, key.mT / scale, upper=False
-        ).mT
-        query_frame = torch.linalg.solve_triangular(
-            factor, query.mT / scale, upper=False
-        ).mT
-        state = key_frame.mT @ value
-        mapping = core_map.to(dtype=calc_dtype)
-        return query_frame @ (mapping @ state)
+        eye = torch.eye(rank, dtype=calc_dtype, device=value.device)
+        augmented = torch.cat(
+            (
+                value / scale,
+                eye.expand(value.shape[:-2] + (rank, rank)) / scale,
+            ),
+            dim=-2,
+        )
+        orthogonal, factor = torch.linalg.qr(augmented, mode="reduced")
+        diagonal = torch.diagonal(factor, dim1=-2, dim2=-1)
+        signs = torch.where(
+            diagonal < 0,
+            -torch.ones_like(diagonal),
+            torch.ones_like(diagonal),
+        ).detach()
+        return (orthogonal * signs.unsqueeze(-2))[..., :length, :]
 
 
-def head_rms_norm(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """FP32 (FP64 for the oracle) RMS normalization per token and head.
+def bounded_complement(raw: torch.Tensor) -> torch.Tensor:
+    """Map learned complement coordinates to the strict contractive interior.
 
-    value is [B,N,H,D], weight is [D] and is shared across heads, as in FLA's
-    Gated DeltaNet output RMSNorm. The fixed epsilon is 1e-6; neither a token
-    mask nor another head enters the normalization statistics.
+    ``tanh`` rounds to exactly ``+/-1`` in FP32 for otherwise reachable raw
+    coordinates.  Evaluate its logistic identity so the tail VJP remains
+    representable, then reserve one dtype ULP from the boundary.
     """
-    if weight.shape != (value.shape[-1],):
-        raise ValueError("RMSNorm weight must have shape [D], shared across heads")
-    calc_dtype = _calculation_dtype(value)
-    with torch.autocast(device_type=value.device.type, enabled=False):
-        value = value.to(calc_dtype)
-        normalized = functional.rms_norm(value, (value.shape[-1],), eps=1e-6)
-        return normalized * weight.to(calc_dtype)
+
+    if not raw.is_floating_point():
+        raise TypeError("complement coordinates must be a floating-point tensor")
+
+    calc_dtype = _calculation_dtype(raw)
+    with torch.autocast(device_type=raw.device.type, enabled=False):
+        value = raw.to(dtype=calc_dtype)
+        interior_scale = 1.0 - torch.finfo(calc_dtype).eps
+        # Select safe exponent inputs explicitly. Clamp's boundary subgradient
+        # can be zero at raw=0, although this smooth map has derivative 1-eps.
+        positive_exponent = torch.exp(-2.0 * torch.where(value >= 0, value, 0.0))
+        negative_exponent = torch.exp(2.0 * torch.where(value < 0, value, 0.0))
+        positive = (1.0 - positive_exponent) / (1.0 + positive_exponent)
+        negative = (negative_exponent - 1.0) / (1.0 + negative_exponent)
+        return interior_scale * torch.where(value >= 0.0, positive, negative)
+
+
+def accretive_generator(raw: torch.Tensor, *, skew_coupling: bool = True) -> torch.Tensor:
+    r"""Build K = L L^T + Omega from compact raw coordinates."""
+
+    if raw.ndim < 2:
+        raise ValueError("raw must have at least two matrix dimensions")
+    if raw.shape[-2] != raw.shape[-1]:
+        raise ValueError("raw must be square in its final two dimensions")
+    if not raw.is_floating_point():
+        raise TypeError("raw must be a floating-point tensor")
+
+    calc_dtype = _calculation_dtype(raw)
+    with torch.autocast(device_type=raw.device.type, enabled=False):
+        value = raw.to(dtype=calc_dtype)
+        rank = value.shape[-1]
+        if rank == 0:
+            return value
+
+        diagonal = torch.diagonal(value, dim1=-2, dim2=-1)
+        factor = torch.tril(value, diagonal=-1) + torch.diag_embed(
+            functional.softplus(diagonal + _SOFTPLUS_ONE_OFFSET)
+        )
+        if not skew_coupling:
+            return _fp32_factor_gram(factor)
+        upper = torch.triu(value, diagonal=1)
+        skew = upper - upper.mT
+        return _fp32_factor_gram(factor) + skew
+
+
+def accretive_equilibrium_mix(
+    frame: torch.Tensor,
+    generator: torch.Tensor | None,
+    compact_state: torch.Tensor,
+    content: torch.Tensor,
+    eta: torch.Tensor,
+) -> torch.Tensor:
+    r"""Apply the complement or accretive-equilibrium compact token mix.
+
+    The complement base and learned correction are
+
+        correction = (I + K)^-1 (I - K) Z,
+        Y = eta (C - P Z) + P correction.
+
+    This equals the reflected-resolvent readout because
+    (I + K)^-1 (I - K) = 2 (I + K)^-1 - I. The two frame
+    products are fused as P (correction - eta Z). Shared K is solved
+    once per head, with gradients retained and no cross-forward cache.
+    Z = P^T C; generator=None means zero correction, equivalent to K=I.
+    """
+
+    if frame.ndim != 4:
+        raise ValueError("frame must have shape [B, H, N, R]")
+    if content.ndim != 4:
+        raise ValueError("content must have shape [B, H, N, D]")
+
+    batch, heads, length, rank = frame.shape
+    if content.shape[:3] != (batch, heads, length):
+        raise ValueError("frame and content must agree on [B, H, N]")
+    if compact_state.shape != (batch, heads, rank, content.shape[-1]):
+        raise ValueError(
+            "compact_state must have shape "
+            f"{(batch, heads, rank, content.shape[-1])}, "
+            f"got {tuple(compact_state.shape)}"
+        )
+    if eta.shape != (heads,):
+        raise ValueError(f"eta must have shape [{heads}], got {tuple(eta.shape)}")
+    if (
+        frame.dtype != content.dtype
+        or compact_state.dtype != content.dtype
+        or eta.dtype != content.dtype
+        or frame.device != content.device
+        or compact_state.device != content.device
+        or eta.device != content.device
+    ):
+        raise ValueError("frame, compact_state, content, and eta must share dtype and device")
+
+    eta_batch = eta.view(1, heads, 1, 1)
+    if generator is None:
+        compact = -eta_batch * compact_state
+    else:
+        if not generator.is_floating_point():
+            raise TypeError("generator must be a floating-point tensor")
+        if generator.dtype != content.dtype or generator.device != content.device:
+            raise ValueError("generator must share content dtype and device")
+        if generator.ndim == 3:
+            if generator.shape != (heads, rank, rank):
+                raise ValueError(
+                    f"shared generator must have shape {(heads, rank, rank)}, "
+                    f"got {tuple(generator.shape)}"
+                )
+        elif generator.ndim == 4:
+            if generator.shape != (batch, heads, rank, rank):
+                raise ValueError(
+                    f"batched generator must have shape {(batch, heads, rank, rank)}, "
+                    f"got {tuple(generator.shape)}"
+                )
+        else:
+            raise ValueError("generator must have shape [H, R, R] or [B, H, R, R]")
+
+        # Keep the small-system products in FP32, like the solve itself.
+        # Avoid adding a BF16 operand-rounding boundary to the correction.
+        with torch.autocast(device_type=content.device.type, enabled=False):
+            fp32_cuda = generator.device.type == "cuda" and generator.dtype == torch.float32
+            if not fp32_cuda:
+                identity = torch.eye(rank, dtype=content.dtype, device=content.device)
+                system = identity + generator
+                deviation = identity - generator
+            if generator.ndim == 3:
+                # [H,R,R] solve, rather than B copies of the same system.
+                if fp32_cuda:
+                    correction_map = _FP32CoreCorrection.apply(generator, None)
+                else:
+                    correction_map = torch.linalg.solve(system, deviation)
+                correction = _compact_matmul(correction_map, compact_state)
+            else:
+                if fp32_cuda:
+                    correction = _FP32CoreCorrection.apply(generator, compact_state)
+                else:
+                    correction = torch.linalg.solve(system, deviation @ compact_state)
+            compact = correction - eta_batch * compact_state
+
+    return eta_batch * content + tensor_core_matmul(frame, compact)
+
+
+def compact_equilibrium_diagnostics(
+    frame: torch.Tensor,
+    generator: torch.Tensor,
+    compact_state: torch.Tensor,
+    eta: torch.Tensor,
+    adjoint_rhs: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    r"""Measure the exact realized gain and solve/adjoint certificate ratios.
+
+    The returned tensors have shape ``[B, H]``.  Calculations use FP64 on the
+    realized compact factors so diagnostics measure the mathematical operator
+    without adding low-precision eigensolver or norm error.  For the supported
+    training envelope ``N >= R``, the token gain is recovered from the full
+    ``R x R`` certificate block and never materializes an ``N x N`` map.
+    """
+
+    if frame.ndim != 4:
+        raise ValueError("frame must have shape [B, H, N, R]")
+    if generator.ndim not in (3, 4):
+        raise ValueError("generator must have shape [H, R, R] or [B, H, R, R]")
+    if compact_state.ndim != 4 or adjoint_rhs.ndim != 4:
+        raise ValueError("compact_state and adjoint_rhs must have shape [B, H, R, D]")
+
+    batch, heads, length, rank = frame.shape
+    if length < rank:
+        raise ValueError(
+            "compact diagnostics require sequence length N >= rank R, got "
+            f"N={length}, R={rank}"
+        )
+    expected_state_shape = (batch, heads, rank, compact_state.shape[-1])
+    if compact_state.shape != expected_state_shape:
+        raise ValueError(
+            f"compact_state must have shape {expected_state_shape}, "
+            f"got {tuple(compact_state.shape)}"
+        )
+    if adjoint_rhs.shape != compact_state.shape:
+        raise ValueError(
+            "adjoint_rhs must match compact_state, got "
+            f"{tuple(adjoint_rhs.shape)} and {tuple(compact_state.shape)}"
+        )
+    if eta.shape != (heads,):
+        raise ValueError(f"eta must have shape [{heads}], got {tuple(eta.shape)}")
+    if generator.ndim == 3:
+        if generator.shape != (heads, rank, rank):
+            raise ValueError(
+                f"shared generator must have shape {(heads, rank, rank)}, "
+                f"got {tuple(generator.shape)}"
+            )
+        generator = generator.unsqueeze(0).expand(batch, -1, -1, -1)
+    elif generator.shape != (batch, heads, rank, rank):
+        raise ValueError(
+            f"batched generator must have shape {(batch, heads, rank, rank)}, "
+            f"got {tuple(generator.shape)}"
+        )
+    tensors = (generator, compact_state, eta, adjoint_rhs)
+    if any(value.device != frame.device for value in tensors):
+        raise ValueError("all diagnostic inputs must share a device")
+    if any(not value.is_floating_point() for value in (frame, *tensors)):
+        raise TypeError("all diagnostic inputs must be floating-point tensors")
+
+    with torch.autocast(device_type=frame.device.type, enabled=False):
+        frame64 = frame.to(dtype=torch.float64)
+        generator64 = generator.to(dtype=torch.float64)
+        compact64 = compact_state.to(dtype=torch.float64)
+        rhs64 = adjoint_rhs.to(dtype=torch.float64)
+        eta64 = eta.to(dtype=torch.float64).view(1, heads)
+
+        identity = torch.eye(rank, dtype=torch.float64, device=frame.device)
+        system = generator64 + identity
+        equilibrium = torch.linalg.solve(system, compact64)
+        adjoint = torch.linalg.solve(system.mT, rhs64)
+
+        symmetric_system = 0.5 * (system + system.mT)
+        mu = torch.linalg.eigvalsh(symmetric_system)[..., 0]
+
+        frame_gram = frame64.mT @ frame64
+        gram_values, gram_vectors = torch.linalg.eigh(frame_gram)
+        scales = torch.sqrt(gram_values.clamp_min(0.0))
+        inverse_system = torch.linalg.solve(
+            system,
+            identity.expand(batch, heads, rank, rank),
+        )
+        reflected = 2.0 * inverse_system - identity
+        eta_matrix = eta64[..., None, None] * identity
+        rotated = gram_vectors.mT @ (reflected - eta_matrix) @ gram_vectors
+        certificate_block = eta_matrix + scales.diag_embed() @ rotated @ scales.diag_embed()
+        token_gain = torch.linalg.svdvals(certificate_block)[..., 0]
+        if length > rank:
+            token_gain = torch.maximum(token_gain, eta64.abs())
+
+        state_denominator = torch.linalg.vector_norm(
+            compact64, dim=(-2, -1)
+        ).clamp_min(torch.finfo(torch.float64).tiny)
+        adjoint_denominator = torch.linalg.vector_norm(
+            rhs64, dim=(-2, -1)
+        ).clamp_min(torch.finfo(torch.float64).tiny)
+        state_ratio = (
+            torch.linalg.vector_norm(equilibrium, dim=(-2, -1))
+            / state_denominator
+        )
+        adjoint_ratio = (
+            torch.linalg.vector_norm(adjoint, dim=(-2, -1))
+            / adjoint_denominator
+        )
+
+    return {
+        "q": token_gain,
+        "contraction_slack": 1.0 - token_gain,
+        "mu": mu,
+        "state_ratio": state_ratio,
+        "adjoint_ratio": adjoint_ratio,
+        "state_bound_usage": mu * state_ratio,
+        "adjoint_bound_usage": mu * adjoint_ratio,
+    }
 
 
 __all__ = [
-    "axial_rotary_tables",
-    "rotary_qk",
-    "convolve_qk",
-    "ridge_query_readout",
-    "head_rms_norm",
-    "split_qkv",
+    "accretive_equilibrium_mix",
+    "accretive_generator",
+    "bounded_complement",
+    "compact_equilibrium_diagnostics",
+    "qr_soft_frame",
     "tensor_core_linear",
     "tensor_core_matmul",
 ]

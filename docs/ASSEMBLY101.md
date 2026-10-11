@@ -1,6 +1,12 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # Assembly101 data and evaluation protocol
 
-> Current source uses model contract 24 and CUDA contract 19. External position
+> Current source uses model contract 26 and native CUDA ABI 12. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -117,8 +123,8 @@ Identity in the pinned code; retain that actual behavior in both arms.
 
 The experimental arms replace the nine `stage1.layers[i].ltc_attn`
 modules with full-sequence MemSolve, dim=64, heads=1, rank=16 or 32, bias=True,
-using the current independent Q/K/V operator. Historical experiments used the
-previous Dynamic operator. Later stages and local operations remain upstream-owned.
+using the restored accretive operator in equilibrium mode. Historical experiment
+records retain their original source and training contracts. Later stages and local operations remain upstream-owned.
 This changes both the long-term mixer and its connectivity: original LTContext
 uses 64 interleaved subsequences; full-sequence MemSolve mixes all timestamps.
 Report parameter counts and acknowledge differing internal projections,

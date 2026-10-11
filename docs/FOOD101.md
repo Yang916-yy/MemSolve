@@ -1,11 +1,16 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # Food-101 runner
 
 `python -m experiments.food101` trains a MemSolve-ViT-S/16 classifier from scratch.
-The current QKV ridge-query model uses width 384,
-depth 12, six heads, rank 32, SwiGLU gate width 1024 (MLP budget ratio 4.0) and 224-pixel inputs. It shares the
-ImageNet Q/K-convolution-plus-2D-RoPE, no-CLS/no-LayerScale scaffold, token-LN mean pooling and
-linear DropPath up to 0.1. Initialization is deterministic for a fixed seed. Old Dynamic/Static/Zero
-measurements belong to their recorded source contracts.
+The restored model uses width384, depth12, six heads, rank32, a GELU MLP of
+width1584, per-block CPE and token-LN mean pooling without LayerScale. Linear DropPath reaches0.1.
+Initialization is deterministic for a fixed seed. Historical measurements keep
+their recorded source contracts; no new Food-101 experiment has been launched.
 The runner defaults to `--implementation cuda`; `reference` is also available.
 
 The default schedule is 30 epochs, batch size 256, AdamW with peak learning rate

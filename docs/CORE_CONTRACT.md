@@ -1,269 +1,61 @@
-# Q/K/V ridge memory and learned query readout
+# MemSolve accretive-equilibrium operator
 
-Model contract **24**, source version **0.14.0**. Independent Q/K/V projections,
-centered Q/K depthwise convolutions, a shared query map T = I + Delta, and
-per-head RMSNorm and a low-rank sigmoid output gate define one operator.
-There is no input-conditioned core generator, reflected readout, internal value
-skip, V convolution or mode selector. Position embeddings belong to the
-surrounding model: vision adds a learned 2D absolute table before the first block;
-1D models retain their existing external position embeddings.
+MemSolve uses the no-RankRotary relation/content operator restored from
+`e769a9a`, with two modes: `equilibrium` (default) and `complement`.
+Model checkpoint contract **26** and native CUDA ABI **12** require matching
+source and artifacts. Old mode names are not aliases. Historical checkpoints
+and their source snapshots retain their original contracts.
 
 ## Definition
 
-For one head, n valid tokens, key/query rank r and value width d:
-convolution uses the original sequence/grid coordinates, with padding masked;
-the displayed matrices below retain only the valid rows.
+For each head, n is the number of valid tokens. A packed projection produces
+relation B and content C. There is no independent query projection, Q/K
+convolution, internal positional rotation, output RMSNorm or channel gate.
 
 ```text
-Q = DWConv_q(X Wq + bq)       [n,r]
-K = DWConv_k(X Wk + bk)       [n,r]
-V = X Wv + bv                 [n,d]
-Ak = K / sqrt(n), Aq = Q / sqrt(n)
-R^T R = I + Ak^T Ak           upper Cholesky, positive diagonal
-Pk = Ak R^-1, Pq = Aq R^-1
-Z = Pk^T V
-T = I + core_delta           [r,r], shared across samples
-O = Pq T Z
-Gout = sigmoid((X Wdown) Wup + bg)  [n,D], D = H*d
-Y = (concat_h[RMSNorm_h(O)] * Gout) Wo + bo
+A = B / sqrt(n)
+R^T R = I + A^T A                  positive-diagonal upper factor
+P = A R^-1                        soft frame
+Z = P^T C
+L = tril(U,-1) + diag(softplus(diag(U) + log(expm1(1))))
+Omega = triu(U,1) - triu(U,1)^T
+J = L L^T + Omega
+F = solve(I + J, I - J)
+eta = interior_tanh(eta_raw)
+Y = eta (C - P Z) + P F Z         equilibrium
+Y = eta (C - P Z)                 complement
+output = concat_heads(Y) Wo + bo
 ```
 
-DWConv is centered, stride one, zero padded, bias free, and has no activation.
-Sequence models default to independent width-3 filters per Q/K channel. Vision defaults to
-3×3 filters on the explicit patch grid, including rectangular grids. Q and K
-share a grouped convolution launch, not weights; V bypasses the convolution.
-The added work is linear in token count. The ridge equations use the filtered
-Q/K, so the memory interpretation and positive-definite system are unchanged.
+In `equilibrium`, U is learned independently per head and shared across
+samples. F is solved once per head in each forward and reused across the
+batch; it is not cached across optimizer updates. The token operator remains
+input-dependent through P. This mode was previously called Static.
 
-Filters initialize to one at the center and zero elsewhere, preserving the
-initial projection function and K variance while allowing every tap to learn.
-This is an initialization choice, not a claim of an optimal local prior.
-`qk_conv_kernel_size=k` is a positive odd integer (default 3); padding is k//2.
-A kernel of size 1 is a learned channel scale without neighbor mixing.
-Parameters add `2*H*r*k` per 1D layer or `2*H*r*k*k` per 2D layer. The core config
-selects `qk_conv_dim=1` (default) or `2`; integrations fix this from the data layout,
-and expose the kernel size separately. 2D forward requires
-`spatial_shape=(height, width)` with `height*width=N`. There are no prefix tokens.
-Both backends use native PyTorch convolution. CUDA evaluates the 1D case as a
-channels-last 1 x N image with a 1 x k filter, preserving its centered
-neighborhood and padding. See the depthwise definition in
-[PyTorch Conv2d](https://docs.pytorch.org/docs/2.14/generated/torch.nn.Conv2d.html).
-[FLA ShortConvolution](https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/conv/short_conv.py)
-is causal; its boundary semantics are not reused for this bidirectional filter.
+`complement` omits U, J and the compact core solve. It retains learned relation
+and content projections, eta, and the output projection. It is a nonzero,
+input-dependent content compensation operator. Its equation matches J=I
+(F=0), not J=0. P is a soft frame, so I-PP^T is not generally an orthogonal
+projector. This mode was previously called Zero.
 
-Vision uses timm's learned absolute patch-position table with shape
-`[1, H_patch*W_patch, D]`, added once after patch embedding and before the
-first block. It initializes with timm's truncated normal (std 0.02), is
-excluded from optimizer weight decay, and is interpolated over the 2D patch
-grid for other image resolutions. There is no CLS position or internal Q/K
-rotation. Both Q/K and V therefore originate from position-augmented inputs.
-The sequence and language adapters retain their external position embeddings.
+The former Dynamic content-conditioned core generator has been removed.
+`equilibrium` starts with U=0, giving J=I and F=0; eta starts at 0.9 per head.
+The two modes therefore have the same initial formula when their remaining
+weights match, but equilibrium has trainable core gradients at initialization.
+No initialization, projection or training recipe changes accompany the rename.
 
-One packed projection stores independent Q/K/V in the layout
-`[Q_all_heads, K_all_heads, V_all_heads]`. `core_delta` has shape `[H,r,r]`
-and initializes to zero. Forward forms only the compact T = I + Delta.
-There is no norm constraint, normalized raw proxy or inverse of T.
-Each token/head RMSNorm has epsilon `1e-6` and a learned channel gain gamma
-of shape `[d]`, shared across heads and initialized to ones, without a bias.
-This follows the **full-model** defaults in
-[FLA GatedDeltaNetConfig](https://github.com/fla-org/flash-linear-attention/blob/main/fla/models/gated_deltanet/configuration_gated_deltanet.py),
-which [GatedDeltaNetBlock](https://github.com/fla-org/flash-linear-attention/blob/main/fla/models/gated_deltanet/modeling_gated_deltanet.py)
-passes to the mixer. The standalone layer constructor defaults to `1e-5`,
-but that value is overridden when constructing the full model. Gain shape and
-initialization follow [FLA RMSNorm](https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/layernorm.py).
-Sources inspected 2026-09-23. Only affine parameters are shared; normalization
-statistics remain independent for each token and head. Gradients of gamma
-sum over tokens, batches and heads. This is an upstream convention, not a
-claim of optimality or improved accuracy. Contract 16 had per-head gains;
-contract 17 adopted the standalone epsilon `1e-5`. Contract 18 corrects that
-to the full-model epsilon `1e-6`, retaining shared gains. Contract 19 replaces
-the constrained T parameter with an unconstrained identity-centered Delta.
-Contract 20 adds the centered Q/K convolutions.
-Contract 21 adds vision RoPE after convolution and removes encoder CPE.
-Contract 22 adds the low-rank sigmoid output gate and configurable odd Q/K kernel size.
-Older contracts are rejected rather than silently converted.
-The encoder owns residual connections, MLPs and pooling.
+The reference obtains P via reduced QR of `[A; I]`. CUDA uses an equivalent
+compact factorization and readout without storing token-sized P. Both modes
+mask padded rows and normalize by valid-token count. Completely masked samples
+return zero. At fixed head width and rank, sequence cost is linear; matrix
+factorization sizes depend on rank, not unbounded token length.
 
-Contract 24 removes internal Q/K rotation. The vision scaffold adds learned
-2D absolute positions outside the operator. Previous checkpoints retain their
-original position semantics and cannot resume under this contract.
+## Ownership and model shells
 
-## Output selection
-
-The gate receives the same masked mixer input X as the projections, before
-convolution. Vision supplies Pre-LN activations; BERT retains its
-Post-LN scaffold. Wdown has shape [D,m] and Wup [m,D], with
-`output_gate_rank=m` (default 32), independent of the memory rank r. There is
-no intermediate activation, down bias, head sharing or sequence normalization.
-The up bias has shape [D], independently of the QKV/output `bias` setting.
-The gate adds `2*D*m+D` parameters per layer and linear work in sequence length.
-
-Gate location and sigmoid follow [Gated Attention](https://arxiv.org/abs/2505.06708)
-and its [official implementation](https://github.com/qiuzh20/gated_attention/blob/main/modeling_qwen3.py).
-The post-RMS placement follows [FLA Gated DeltaNet](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/gated_deltanet.py),
-which uses a SiLU gate instead. Low-rank factorization is our cost choice, not
-a claim that either upstream establishes rank 32 or a MemSolve accuracy gain.
-The reference uses Tensor Core GEMMs and PyTorch sigmoid/multiply/autograd.
-CUDA fuses sigmoid selection with the readout and RMSNorm, retaining the
-reference's BF16 rounding boundaries in both forward and backward. The
-compact solver remains outside TorchInductor; no extra native dependency
-is introduced.
-
-Both gate factors keep ordinary Linear/framework weight initialization; the
-up bias is zero. Initial gates are near 0.5, not identity-preserving. No factor
-of two, bias saturation, zero-initialized factor or checkpoint conversion is
-introduced. Sigmoid is soft suppression, not guaranteed exact sparsity or
-sparse execution. Multiplication follows head RMSNorm so normalization cannot
-undo suppression, and precedes Wo so channels are selected before mixing heads.
-The gate changes the emitted features; it does not change the ridge objective,
-key statistics, memory solve or learned shared T.
-
-## Key initialization
-
-Since source 0.8.1, K projection entries are initialized independently from
-Normal(0, 1/dim), where the second argument denotes variance; K bias is zero.
-For unit-variance normalized inputs, this sets the expected mean eigenvalue of
-K^T K/n to one, keeping the initialization scale independent of model width.
-This is a statistical initialization criterion, not an accuracy guarantee.
-
-`MemSolve.init_weights()` owns this rule and initializes the Q/K filters to
-identity. It runs on direct construction and after timm's depth-first initialization of child
-Linear modules. Q/V, both gate factors and the output projection keep their existing initializer
-(default Linear outside vision; timm std=0.02 and zero bias in the vision
-factory). Delta and RMSNorm gains are not changed by this method.
-No key rescaling or normalization is added to the forward pass.
-
-Loading a checkpoint restores its saved K; it does not reinitialize that tensor.
-The K-only initialization change in source 0.8.1 retained model contract 15.
-The historical source 0.9.0 introduced constrained T under contract 16.
-Current contract 24 uses unconstrained Delta initialized to zero and identity
-Q/K filters; older contracts are rejected on load.
-
-## Exact memory interpretation
-
-Define the ridge memory and the adjusted query by
-
-```text
-Mstar = argmin_M 0.5 ||V-Ak M||_F^2 + 0.5 ||M||_F^2
-      = (I+Ak^T Ak)^-1 Ak^T V
-Qeff = Aq R^-1 T R
-O = Qeff Mstar
-```
-
-This equals the operator above, including gradients through R. Qeff and Mstar
-are explanatory variables, not additional runtime computations. The memory is
-the exact global ridge solution; T changes its query readout in the coordinates
-set by the input's key statistics. Arbitrary T is not claimed to be the inverse
-Hessian of that ridge objective. Intention already studies global ridge/query
-readout; DeltaNet supplies the online error-correction connection and MesaNet
-the regression/TTT connection. This operator is not an exact bidirectional
-expansion of DeltaNet's ordered recurrence.
-
-R, Z and the memory remain input-dependent even though T is shared. For finite
-inputs, I+Ak^T Ak is positive definite in exact arithmetic. Singular T is valid
-because it is never inverted. T has no fixed spectral or Frobenius bound.
-Positive definiteness of the ridge system does not establish a contraction
-of the normalized mixer or network.
-
-## Identity-centered parameterization and training
-
-Delta initializes to zero, so T starts at I and the initial readout is exactly
-Aq (I+Ak^T Ak)^-1 Ak^T V. More generally,
-
-```text
-O = O_ridge + Pq Delta Pk^T V
-O_ridge = Aq (I+Ak^T Ak)^-1 Ak^T V
-```
-
-This is an algebraic decomposition, not two runtime readouts. The reference
-and CUDA primitives both receive the effective T and evaluate the same compact
-products as before. Since dT/dDelta is the identity, dLoss/dDelta = dLoss/dT.
-The T reparameterization in contract 19 preserved contract 18's parameter count
-and identity initial function; contract 20 additionally learns Q/K filters.
-
-Use ordinary [PyTorch AdamW](https://docs.pytorch.org/docs/2.14/generated/torch.optim.AdamW.html)
-without model-specific hooks. Delta belongs to the regular weight-decay group.
-The [ViT³-derived ImageNet recipe](IMAGENET_VIT3.md) uses fused AdamW with
-weight decay 0.05. The [DeiT III-derived recipes](IMAGENET_DEIT3.md) use fused
-LAMB for pretraining and fused AdamW for resolution fine-tuning, with
-recipe-specific decay. For AdamW, if u is the bias-corrected adaptive gradient
-update, the effective map changes as
-
-```text
-Delta_next = (1 - lr * wd) Delta - lr * u
-T_next = I + (1 - lr * wd) (T - I) - lr * u
-```
-
-Thus decoupled weight decay pulls T toward I, not zero. This is an identity
-prior in the update; it is not an assertion that AdamW exactly optimizes an
-L2-regularized objective or that learned Delta necessarily improves accuracy.
-There is no gradient projection, step retraction, moment transport or custom
-optimizer state. Standard optimizer state_dict handles resume and AMP skips.
-
-Any real T is representable as I + Delta. Q -> s Q, T -> T/s remains an exact
-scale freedom of the unregularized forward function. This parameterization
-does not remove that freedom; it prioritizes ordinary optimization and an
-identity-centered decay rule over a sphere constraint. No L2 normalization is
-added to Q, K or V. The new optimization trajectory differs from contract 18,
-so old training checkpoints are rejected.
-
-## Equivalent implementation without P
-
-```text
-G = K^T K / n
-Bkv = K^T V / sqrt(n)
-F F^T = I + G                 F = R^T
-Z = solve_triangular(F, Bkv)
-M = solve_triangular(F^T, T Z)
-O = Q M / sqrt(n)
-```
-
-CUDA reuses the compact inverse of the Cholesky factor in FP32 GEMMs,
-including its analytic VJP; the reference retains direct triangular solves.
-These evaluate the same equations. No J, L, Omega,
-shared-core LU or inverse-map adjoint is evaluated. This algorithm covers
-N<r, N=r and N>r and never materializes token-sized P.
-
-For upstream E at O, token adjoints are
-
-```text
-dM = Q^T E / sqrt(n)
-dQ = E M^T / sqrt(n)
-dK = K (dG+dG^T) / n + V dBkv^T / sqrt(n)
-dV = K dBkv / sqrt(n)
-```
-
-The compact adjoint differentiates both triangular solves and Cholesky.
-If dU is the gradient at U=T Z, dT=sum_samples(dU Z^T) and dZ=T^T dU.
-The reference and CUDA operator return ordinary derivatives with respect to T;
-the model passes them unchanged to Delta through the identity addition.
-
-## Masking and precision
-
-Boolean [B,N] masks exclude rows before/after biased projection and after Q/K
-convolution. Counts clamp to one for entirely masked samples. Invalid outputs are zeroed after output
-projection; excluded NaNs cannot enter neighboring rows. Gaps retain their
-original coordinates; compacting a gapped sequence changes its neighborhoods.
-Learned convolutions are not equivariant to arbitrary token permutations.
-Other position operations must separately honor masks.
-
-FP64 is the mathematical oracle. Production QKV/gate projections use BF16
-operands and FP32 accumulation. Q/K convolution uses BF16 activations and cast
-weights with FP32 master parameters. Statistics, factors, compact products,
-raw readout, RMS reductions and optimizer updates use FP32. RMS gain, sigmoid
-and gating multiplication share FP32 arithmetic without an intermediate BF16
-rounding. The gated readout rounds once to FP16 and Wo uses FP16 forward
-operands, FP32 accumulation and FP32 bias before the public output cast.
-
-The non-affine head-normalized readout is bounded by sqrt(head_dim); the gated
-affine value is bounded by abs(gamma_i)*sqrt(head_dim). This is range-safe for
-ordinary trained gains, not an unconditional bound on learned gamma or Wo.
-FP16 forward intermediates stay inside a custom autograd boundary. Wo backward
-uses BF16 operands/storage for the readout VJP and FP32 accumulation, so small
-gradients are not forced through FP16. Operand casts are fused into the GEMM;
-large reductions for dWo use split-K with FP32 partial sums. RMS and solve
-backward arithmetic stays FP32; QKV/logit gradients store BF16. Master parameter
-gradients remain FP32. CPU reference arithmetic stays FP32, and FP64 inputs
-retain the mathematical oracle. Public output dtype follows input dtype.
-Old model contracts are rejected, including under strict=False. Historical
-paper/results retain their recorded operators, not this contract.
+`reference.py` owns these equations; `model.py` owns learned parameters.
+The default visual shell has residual CPE, GELU, token-LN mean pooling,
+no LayerScale and linear stochastic depth. S uses MLP ratio 4.125; T/B use 4.
+See [architecture](ARCHITECTURE.md) and [CUDA contract](CUDA_CONTRACT.md).
+Historical Base used RankRotary and a different training protocol; its result
+is not an exact reproduction of this configuration. Experiment records retain
+their original labels rather than being relabeled as current measurements.

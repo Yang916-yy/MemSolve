@@ -25,6 +25,7 @@ from experiments.imagenet import (
 )
 from experiments.train_openmmlab import _configure_checkpoint
 from integrations.timm import VisionSpec, MemSolveViT
+from memsolve import CoreMode
 
 
 pytestmark = pytest.mark.integration
@@ -48,12 +49,6 @@ def _tiny_imagenet_checkpoint(
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
-            "class_token": False,
-            "layer_scale": False,
-            "pooling": "token_ln_mean",
-            "position_encoding": "learned_2d",
-            "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": 32,
             "depth": 4,
@@ -62,8 +57,7 @@ def _tiny_imagenet_checkpoint(
             "drop_path_rate": 0.0,
         },
         "operator": {
-            "qk_conv_kernel_size": 3,
-            "output_gate_rank": 32,
+            "core_mode": "equilibrium",
             "bias": True,
             "implementation": "reference",
         },
@@ -81,6 +75,7 @@ def _tiny_imagenet_checkpoint(
                 "shards": IMAGENET_VALIDATION_SHARDS,
             },
             "streaming": {
+                "worker_rng": "epoch-rank-worker-v1",
                 "shard_order": "global-epoch-permutation-then-rank-stride-worker-quota",
                 "sample_shuffle": {
                     "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
@@ -89,7 +84,6 @@ def _tiny_imagenet_checkpoint(
                 "source_views": 3,
                 "repeated_augmentation_placement": "rank-local-physical-batch-interleave",
                 "validation_partition": "worker-stride-full-per-rank",
-                "worker_rng": "epoch-rank-worker-v1",
             },
         },
         "batching": {
@@ -125,6 +119,8 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.MemSolveViTBackb
         image_size=32,
         rank=4,
         out_indices=(0, 1, 2, 3),
+        core_mode=CoreMode.EQUILIBRIUM,
+
         implementation="reference",
     ).eval()
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())
@@ -233,9 +229,12 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
         depth=4,
         num_heads=4,
         rank=4,
+        core_mode=CoreMode.EQUILIBRIUM,
+        position_encoding="learned",
+
         bias=True,
         implementation="reference",
-        drop_path_rate=0.0, mlp_ratio=4.0,
+        drop_path_rate=0.0,
     )
     checkpoint = tmp_path / "imagenet.pt"
     torch.save(_tiny_imagenet_checkpoint(source), checkpoint)
@@ -252,7 +251,7 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
     )
 
 
-def test_backbone_reuses_qk_filters_and_interpolates_positions_at_a_larger_resolution(
+def test_backbone_interpolates_a_smaller_pretrain_position_table(
     tiny_backbone: openmmlab.MemSolveViTBackbone,
     tmp_path: Path,
 ) -> None:
@@ -261,6 +260,8 @@ def test_backbone_reuses_qk_filters_and_interpolates_positions_at_a_larger_resol
         image_size=48,
         rank=4,
         out_indices=(0, 1, 2, 3),
+        core_mode=CoreMode.EQUILIBRIUM,
+
         implementation="reference",
     ).eval()
     source = MemSolveViT(
@@ -271,20 +272,23 @@ def test_backbone_reuses_qk_filters_and_interpolates_positions_at_a_larger_resol
         depth=4,
         num_heads=4,
         rank=4,
+        core_mode=CoreMode.EQUILIBRIUM,
+        position_encoding="learned",
+
         bias=True,
         implementation="reference",
-        drop_path_rate=0.0, mlp_ratio=4.0,
+        drop_path_rate=0.0,
     )
     checkpoint = tmp_path / "imagenet-32px.pt"
     torch.save(_tiny_imagenet_checkpoint(source, image_size=32), checkpoint)
 
+    expected = interpolate_position_embedding(
+        source.encoder.pos_embed,
+        target.encoder.pos_embed,
+    )
     target.load_pretrained(checkpoint)
-    torch.testing.assert_close(target.encoder.pos_embed, interpolate_position_embedding(
-        source.encoder.pos_embed, target.encoder.pos_embed))
-    torch.testing.assert_close(target.blocks[0].attn.mixer.qk_conv.weight,
-                               source.blocks[0].attn.mixer.qk_conv.weight)
-    with torch.no_grad():
-        assert all(torch.isfinite(f).all() for f in target(torch.randn(1, 3, 48, 48)))
+
+    torch.testing.assert_close(target.encoder.pos_embed, expected)
 
 
 def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
@@ -299,6 +303,9 @@ def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
         depth=4,
         num_heads=4,
         rank=4,
+        core_mode=CoreMode.EQUILIBRIUM,
+        position_encoding="learned",
+
         bias=True,
         implementation="reference",
         drop_path_rate=0.0,
@@ -357,6 +364,7 @@ def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
             "rank": rank,
             "out_indices": out_indices,
             "implementation": "cuda",
+            "core_mode": "equilibrium",
         }
         assert config["model"]["neck"] == {
             "in_channels": [channels] * 4,
@@ -393,7 +401,7 @@ def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
         assert backbone["rank"] == rank
         assert backbone["out_indices"] == out_indices
         assert backbone["implementation"] == "cuda"
-        assert "core_mode" not in backbone
+        assert backbone["core_mode"] == "equilibrium"
         assert config["model"]["decode_head"] == {
             "in_channels": [channels] * 4,
             "channels": decoder_channels,

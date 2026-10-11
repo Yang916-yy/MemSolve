@@ -2,55 +2,31 @@
 
 **Full-context associative memory through compact equilibrium solves.**
 
-MemSolve turns the associations in a complete input into a shared memory and
-reads that memory with independent queries. Inspired by error-correcting memory
-and test-time regression, it computes a global ridge solution with a direct
-solve in feature space. At fixed rank, forward and backward costs grow linearly
-with sequence length.
-
-The repository provides a PyTorch reference, a Triton/CUDA implementation, and
-vision and BERT integrations. The public package is `memsolve-operator`, imported
-as `memsolve`. MemSolve names the operator; MemSolve-ViT and MemSolve-BERT
-name its vision and language integrations.
+This research checkout restores the no-RankRotary LSSO operator from `e769a9a`.
+Its visual shell uses ordinary ViT3-style mean readout and residuals. Names remain **MemSolve**,
+**MemSolve-ViT** and **MemSolve-BERT**. The independent-Q/K/V redesign is retained
+in Git history, not mixed into this implementation.
 
 ## How it works
 
-For one head, let `Q` and `K` be independently projected and depthwise-filtered
-features, and `V` a tokenwise value projection. Q/K filters are centered width-3
-for sequences or 3×3 on an explicit image patch grid, initialized to identity.
-Vision adds a learned 2D absolute position table to patch embeddings before
-the first block. The operator does not rotate Q/K.
-Let `n` be its valid-token count. Set `Aq = Q / sqrt(n)` and
-`Ak = K / sqrt(n)`. The global memory is
+Each head projects relation B and content C, forms a soft frame P from
+`B / sqrt(valid_tokens)`, and compresses content as `Z = P^T C`.
+The default `equilibrium` mode learns an accretive compact generator
+`J = L L^T + Omega` shared across samples. Its exact readout is
 
 ```text
-M* = argmin_M  0.5 ||V - Ak M||²_F + 0.5 ||M||²_F
-   = (I + Akᵀ Ak)⁻¹ Akᵀ V
+S = solve(I + J, Z)
+Y = eta C + P [2 S - (1 + eta) Z]
 ```
 
-All valid positions contribute to the same memory. The matrix to factor is
-`r × r`, independent of sequence length. The current readout adds a learned
-correction in coordinates defined by the key statistics:
+The compact core map is solved once per head and reused across the batch.
+`complement` removes the learned compact readout, retaining `eta (C - P P^T C)`. The scalar complement eta is learned
+per head. There is no independent query, Q/K convolution, internal positional
+rotation, output RMSNorm or output gate.
 
-```text
-Rᵀ R = I + Akᵀ Ak
-Pq = Aq R⁻¹,  Pk = Ak R⁻¹
-T = I + Delta                         # one learned matrix per head
-O = Pq T Pkᵀ V = Aq M* + Pq Delta Pkᵀ V
-```
-
-`Delta` starts at zero, so the initial readout is exactly the ridge solution
-queried by `Aq`. Key statistics and memory depend on the input; `Delta` is shared
-across samples. Per-token, per-head RMSNorm is followed by a low-rank sigmoid
-channel gate and the output projection. The gate is `sigmoid((X Wdown) Wup + b)`;
-its bottleneck width defaults to 32, independent of memory rank. RMSNorm's learned
-channel gain is shared across heads; gate values are token/channel specific.
-
-The fast path evaluates an equivalent compact form without materializing `Pq`,
-`Pk` or a token-by-token interaction matrix. It uses PyTorch Cholesky/triangular
-solves and selectively fused Triton kernels. See the
-[core equations](docs/CORE_CONTRACT.md) and [CUDA contract](docs/CUDA_CONTRACT.md)
-for the gradient, masking and precision details.
+The reference uses QR; the native path evaluates an equivalent compact form
+without materializing token-size P. See [the equations](docs/CORE_CONTRACT.md),
+[architecture](docs/ARCHITECTURE.md), and [CUDA contract](docs/CUDA_CONTRACT.md).
 
 ## Install and use
 
@@ -65,8 +41,15 @@ python -m pip install -e '.[vision]'
 
 Use `.[nlp]` for the BERT workflows or `.[sequence]` for genomic/LRA training.
 Framework integrations and experiment entrypoints run from the source checkout.
-The operator requires no custom CUDA extension, MathDx or CMake build; the
-LAMB recipes (including the T/S default) separately require NVIDIA Apex for fused LAMB.
+The restored native backend requires the matching extension: Torch
+`2.14.0+cu132`, CUDA 13.2, MathDx 26.06.1 and CMake >=3.25. For this machine:
+
+```bash
+PYTHON=/cywang/vision-venv/bin/python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
+```
+
+The reference also runs on CUDA and needs no extension. LAMB training recipes
+separately require NVIDIA Apex.
 
 ```python
 import torch
@@ -82,9 +65,9 @@ y_reference = layer(x, implementation="reference")
 ```
 
 CUDA supports ranks **16 / 32 / 48 / 64** and boolean validity masks.
-Parameters remain FP32; the operator uses BF16 QKV/gate projections, FP16 readout/Wo, and FP32 statistics,
-solves and normalization. Public outputs follow the input dtype. Unsupported
-contracts fail explicitly; numerical boundaries are recorded in the CUDA guide.
+Parameters remain FP32. The restored native implementation uses BF16 packed
+projections with FP32 compact statistics/solves; public outputs follow the input
+dtype. See the CUDA guide for exact precision and supported boundaries.
 
 Train with an ordinary optimizer, for example fused AdamW:
 
@@ -93,30 +76,25 @@ optimizer = torch.optim.AdamW(layer.parameters(), lr=1e-3, fused=True)
 # loss.backward(); optimizer.step()
 ```
 
-Repository launchers place `core_delta` in the regular weight-decay group.
-Under AdamW, this pulls `T` toward identity. No model-specific optimizer hook
-or norm constraint is required.
-
 ## Vision models
 
-All three models use patch size 16, 12 blocks, independent 3×3 depthwise Q/K
-filters and a learned 2D absolute patch position table,
-Pre-LayerNorm blocks, packed SwiGLU, and token-LayerNorm followed by mean pooling.
-The SwiGLU branch width is `8/3` of the embedding width. There is no CLS token
-or LayerScale. Position embeddings reuse timm initialization and bicubic grid
-interpolation; there is no per-layer residual CPE.
+The default visual scaffold uses ordinary ViT3-style readout and residuals:
+patch16, 12 blocks, residual 3x3 depthwise CPE in every block, Pre-LayerNorm,
+GELU MLP and per-token final LayerNorm followed by mean pooling.
+Like ordinary ViT3, it has no CLS token or LayerScale.
+There is no RankRotary or absolute patch position table.
 
-`output_gate_rank=32` controls the output gate bottleneck. `qk_conv_kernel_size=3`
-controls the centered odd-width neighborhood (width k for 1D, k×k for 2D).
-Vision adapters fix the convolution dimension to 2; sequence/BERT adapters use 1.
+| Model | Width | Heads | Rank | MLP width |
+| --- | ---: | ---: | ---: | ---: |
+| MemSolve-ViT-T | 192 | 6 | 16 | 768 |
+| MemSolve-ViT-S | 384 | 6 | 32 | 1584 |
+| MemSolve-ViT-B | 768 | 12 | 48 | 3072 |
 
-| Model | Width | Heads | Rank | SwiGLU branch width | Parameters¹ |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| MemSolve-ViT-T | 192 | 6 | 16 | 512 | 5,464,744 |
-| MemSolve-ViT-S | 384 | 6 | 32 | 1024 | 20,697,448 |
-| MemSolve-ViT-B | 768 | 12 | 48 | 2048 | 84,090,856 |
+S has **19,876,336** parameters including its 1,000-class head. The operator
+is restored from historical Small; mean pooling and removal of LayerScale
+change that run's visual scaffold, so its measured accuracy is not inherited. The historical Base result used a different
+position mechanism; it is not an exact result for this restored configuration.
 
-¹ At 224px, including the learned position table and 1,000-class ImageNet head.
 Training recipes specify their own
 DropPath, optimizer, augmentation and schedule.
 
@@ -144,7 +122,9 @@ timm. The registered names are `memsolve_vit_tiny`, `memsolve_vit_small` and
 ```python
 import timm
 import integrations.timm  # registers MemSolve-ViT
+from memsolve.ball import cuda
 
+cuda.load()
 model = timm.create_model(
     "memsolve_vit_small", pretrained=False, img_size=224,
     implementation="cuda",
@@ -158,9 +138,9 @@ specified. No pretrained weights for this model contract are published yet.
 ## Text model
 
 **MemSolve-BERT** retains BERT's embeddings, Post-LayerNorm residuals and tied
-MLM head, with MemSolve mixers and SwiGLU FFNs. It uses centered 1D Q/K
-convolution and learned absolute positions. The default Base geometry is
-width 768, 12 layers, 12 heads and rank 32, with 103,214,394 MLM parameters.
+MLM head, with MemSolve mixers and SwiGLU FFNs. It uses learned absolute positions and the restored
+relation/content mixer without short convolution. The default Base geometry is
+width 768, 12 layers, 12 heads and rank 32.
 
 ```python
 from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
@@ -193,8 +173,8 @@ evaluation. Both modalities call the same MemSolve operator and CUDA path.
 
 ## Research status and provenance
 
-Current model checkpoint contract: **24**; CUDA algorithm contract: **19**;
-source version: **0.14.0**. The current API is `MemSolve` / `MemSolveConfig`.
+Current model checkpoint contract: **26**; native CUDA contract: **12**;
+source version: **0.15.0**. The current API is `MemSolve` / `MemSolveConfig`.
 Older model checkpoints and the former `lsso` namespace are not supported.
 
 The [paper draft](paper/main.pdf) carries the MemSolve title, but its technical
@@ -209,6 +189,6 @@ of DeltaNet and MesaNet. Global ridge regression with query readout also has
 prior foundations in Intention. The current operator is not an exact
 bidirectional expansion of DeltaNet's ordered recurrence.
 
-Code is licensed under [Apache-2.0](LICENSE). The grouped RMSNorm implementation
-adapts FLA code under MIT; its attribution and license are in [NOTICE](NOTICE).
+Code is licensed under [Apache-2.0](LICENSE). Upstream and historical
+attribution notices remain in [NOTICE](NOTICE).
 The CUDA guide records the upstream sources and reuse boundaries.

@@ -527,8 +527,7 @@ class SequenceBlock(nn.Module):
         mlp_ratio: float,
         dropout: float,
         bias: bool,
-        qk_conv_kernel_size: int = 3,
-        output_gate_rank: int = 32,
+        core_mode: str = "equilibrium",
     ) -> None:
         super().__init__()
         self.mixer_kind = mixer
@@ -541,8 +540,7 @@ class SequenceBlock(nn.Module):
                     num_heads=num_heads,
                     rank=rank,
                     bias=bias,
-                    qk_conv_kernel_size=qk_conv_kernel_size,
-                    output_gate_rank=output_gate_rank,
+                    core_mode=core_mode,
                 )
             )
         elif mixer in ("mha", "mha_rope"):
@@ -616,8 +614,7 @@ class SequenceEncoder(nn.Module):
         dropout: float,
         bias: bool,
         grid_shape: tuple[int, int] | None = None,
-        qk_conv_kernel_size: int = 3,
-        output_gate_rank: int = 32,
+        core_mode: str = "equilibrium",
     ) -> None:
         super().__init__()
         if max_length <= 0:
@@ -664,8 +661,7 @@ class SequenceEncoder(nn.Module):
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 bias=bias,
-                qk_conv_kernel_size=qk_conv_kernel_size,
-                output_gate_rank=output_gate_rank,
+                core_mode=core_mode,
             )
             for _ in range(depth)
         )
@@ -895,8 +891,7 @@ def _make_parser() -> argparse.ArgumentParser:
 
 
     parser.add_argument("--rank", type=int)
-    parser.add_argument("--qk-conv-kernel-size", type=int, default=3)
-    parser.add_argument("--output-gate-rank", type=int, default=32)
+    parser.add_argument("--core-mode", choices=("equilibrium", "complement"), default="equilibrium")
     parser.add_argument("--dim", type=int)
     parser.add_argument("--depth", type=int)
     parser.add_argument("--heads", type=int)
@@ -1175,8 +1170,7 @@ def build_model(args: argparse.Namespace, bundle: DatasetBundle) -> nn.Module:
         dropout=args.dropout,
         bias=args.bias,
         grid_shape=grid_shape,
-        qk_conv_kernel_size=args.qk_conv_kernel_size,
-        output_gate_rank=args.output_gate_rank,
+        core_mode=args.core_mode,
     )
     if bundle.paired:
         if args.pooling != "mean":
@@ -1293,7 +1287,7 @@ def _runtime_metadata(device: torch.device, *, cuda_enabled: bool) -> dict[str, 
             }
         )
     if cuda_enabled:
-        metadata["memsolve_cuda_contract"] = cuda_backend._CUDA_CONTRACT_VERSION
+        metadata["memsolve_cuda_contract"] = cuda_backend._NATIVE_CONTRACT_VERSION
     return metadata
 
 

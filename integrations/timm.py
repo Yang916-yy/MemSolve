@@ -1,7 +1,4 @@
-"""MemSolve-ViT models and timm registration, backed by the shared operator.
-
-Import this module before calling timm.create_model("memsolve_vit_small").
-"""
+"""Thin timm VisionTransformer adapter for MemSolve."""
 
 from __future__ import annotations
 
@@ -13,7 +10,7 @@ from typing import Any, Literal, Sequence, cast
 import torch
 import torch.nn as nn
 
-from memsolve import MemSolve, MemSolveConfig
+from memsolve import CoreMode, MemSolve, MemSolveConfig
 
 
 _Implementation = Literal["reference", "cuda"]
@@ -21,7 +18,7 @@ _Implementation = Literal["reference", "cuda"]
 
 @dataclass(frozen=True)
 class VisionSpec:
-    """Geometry and stochastic depth for a MemSolve vision scale."""
+    """Geometry and stochastic depth for one restored visual scale."""
 
     embed_dim: int
     depth: int
@@ -48,11 +45,10 @@ class VisionTokenLayout:
     """Token validity for the vision mixer."""
 
     valid_mask: torch.Tensor | None
-    grid_size: tuple[int, int] | None = None
 
 
 def vision_spec(variant: str) -> VisionSpec:
-    """Return the MemSolve vision geometry; large is for optional feature adapters."""
+    """Return the restored visual geometry."""
 
     try:
         return _VISION_SPECS[variant]
@@ -64,7 +60,7 @@ def vision_spec(variant: str) -> VisionSpec:
 
 
 def vision_default_rank(variant: str) -> int:
-    """Return the default MemSolve rank for a vision scale."""
+    """Return the agreed CUDA-fast MemSolve rank for a DeiT III scale."""
 
     vision_spec(variant)
     return _VISION_DEFAULT_RANKS[variant]
@@ -107,8 +103,7 @@ class _TimmMemSolveMixer(nn.Module):
         num_heads: int,
         *,
         rank: int,
-        qk_conv_kernel_size: int = 3,
-        output_gate_rank: int = 32,
+        core_mode: CoreMode,
         implementation: _Implementation,
         qkv_bias: bool,
         qk_norm: bool,
@@ -136,10 +131,8 @@ class _TimmMemSolveMixer(nn.Module):
                 dim=dim,
                 num_heads=num_heads,
                 rank=rank,
+                core_mode=core_mode,
                 bias=qkv_bias,
-                qk_conv_dim=2,
-                qk_conv_kernel_size=qk_conv_kernel_size,
-                output_gate_rank=output_gate_rank,
             )
         )
         if device is not None or dtype is not None:
@@ -165,162 +158,253 @@ class _TimmMemSolveMixer(nn.Module):
                 "not a generic attention mask"
             )
         valid_mask = None if layout is None else layout.valid_mask
-        # Both implementations use the same AMP input/output boundary. timm's
-        # FP32 residual stream must not make the oracle skip the output cast.
+        # Both backends receive the same activation dtype under AMP; otherwise
+        # FP32 residuals change the reference input and output rounding boundary.
         if x.is_cuda and torch.is_autocast_enabled("cuda"):
             x = x.to(torch.get_autocast_dtype("cuda"))
         return self.mixer(
             x, valid_mask=valid_mask, implementation=self.implementation,
-            spatial_shape=None if layout is None else layout.grid_size,
         )
+
+
+def _create_vision_encoder(
+    *,
+    image_size: int,
+    patch_size: int,
+    num_classes: int,
+    embed_dim: int,
+    depth: int,
+    num_heads: int,
+    rank: int,
+    mlp_ratio: float,
+    core_mode: CoreMode | str = CoreMode.EQUILIBRIUM,
+    bias: bool,
+    implementation: _Implementation,
+    drop_path_rate: float,
+    norm_eps: float,
+    dynamic_img_size: bool,
+    dynamic_img_pad: bool,
+    position_encoding: str = "cpe",
+    drop_path_schedule: str = "linear",
+) -> nn.Module:
+    """Build the ViT3-style CPE/GELU encoder with token-LN mean pooling.
+
+    Like the pinned upstream ordinary ViT3, blocks have no LayerScale and
+    the token sequence has no CLS prefix. Recipes select stochastic depth.
+    """
+
+    if position_encoding not in {"learned", "cpe"}:
+        raise ValueError("position_encoding must be learned or cpe")
+    if position_encoding == "cpe" and (dynamic_img_size or dynamic_img_pad):
+        raise ValueError("CPE currently requires the configured fixed image grid")
+    if drop_path_schedule not in {"constant", "linear"}:
+        raise ValueError("drop_path_schedule must be constant or linear")
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
+        raise ValueError("depth must be a positive integer")
+    if not 0.0 <= drop_path_rate < 1.0:
+        raise ValueError("drop_path_rate must be in [0, 1)")
+    if norm_eps != 1e-6:
+        raise ValueError("the vision scaffold requires norm_eps = 1e-6")
+
+    from timm.models.vision_transformer import Block, VisionTransformer
+
+    _require_timm_attention_mask_api(VisionTransformer)
+
+    mode = CoreMode(core_mode)
+    resolved_implementation = _validate_implementation(implementation)
+
+    class ConfiguredMixer(_TimmMemSolveMixer):
+        def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(
+                dim,
+                num_heads,
+                rank=rank,
+                core_mode=mode,
+                implementation=resolved_implementation,
+                **kwargs,
+            )
+
+    class ConstantDropPathBlock(Block):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["drop_path"] = drop_path_rate
+            super().__init__(*args, **kwargs)
+
+    block_type = ConstantDropPathBlock if drop_path_schedule == "constant" else Block
+
+    class CPEBlock(block_type):
+        # ViT³ / CPVT residual CPE, using PyTorch's cuDNN depthwise convolution.
+        # Keep this spatial operation outside the MemSolve mixer.
+        def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
+            super().__init__(dim, *args, **kwargs)
+            self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+
+        def forward(self, x, attn_mask=None, is_causal=False):
+            side = image_size // patch_size
+            if x.shape[1] != side * side:
+                raise ValueError("CPE requires the configured patch grid")
+            if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
+                raise ValueError("CPE accepts only the vision token validity layout")
+            valid = None if attn_mask is None else attn_mask.valid_mask
+            patches = x
+            if valid is not None:
+                patches = torch.where(valid[..., None], patches, 0)
+            spatial = patches.reshape(x.shape[0], side, side, x.shape[2]).permute(0, 3, 1, 2)
+            # NHWC tokens give a channels-last convolution view; cuDNN owns dispatch.
+            local = self.cpe(spatial).flatten(2).transpose(1, 2)
+            patches = patches + local
+            if valid is not None:
+                patches = torch.where(valid[..., None], patches, 0)
+            x = patches
+            return super().forward(x, attn_mask=attn_mask, is_causal=is_causal)
+
+    encoder = VisionTransformer(
+        img_size=image_size,
+        patch_size=patch_size,
+        num_classes=num_classes,
+        global_pool="avg",
+        class_token=False, fc_norm=False,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        mlp_ratio=mlp_ratio,
+        qkv_bias=bias,
+        proj_bias=bias,
+        no_embed_class=True,
+        pos_embed="none" if position_encoding == "cpe" else "learn",
+        dynamic_img_size=dynamic_img_size,
+        dynamic_img_pad=dynamic_img_pad,
+        init_values=None,
+        drop_path_rate=drop_path_rate,
+        norm_layer=partial(nn.LayerNorm, eps=norm_eps),
+        block_fn=CPEBlock if position_encoding == "cpe" else block_type,
+        attn_layer=ConfiguredMixer,
+    )
+    return encoder
 
 
 class MemSolveViT(nn.Module):
-    """MemSolve-ViT: Q/K conv, learned 2D patch positions and SwiGLU.
-
-    mlp_ratio specifies the equivalent two-projection MLP weight budget.
-    SwiGLU uses two-thirds of that hidden width, rounded up to 16 channels.
-    """
+    """Restored ViT3-derived encoder with CPE, GELU and token-LN mean pooling."""
 
     def __init__(
-        self, *, image_size: int, embed_dim: int, depth: int, num_heads: int,
-        rank: int, patch_size: int = 16, num_classes: int = 1000,
-        mlp_ratio: float = 4.0, bias: bool = True,
-        implementation: _Implementation = "reference", drop_path_rate: float = 0.0,
-        drop_path_schedule: Literal["linear", "constant"] = "linear",
-        norm_eps: float = 1e-6, dynamic_img_size: bool = False,
+        self,
+        *,
+        image_size: int,
+        patch_size: int = 16,
+        num_classes: int = 1000,
+        embed_dim: int,
+        depth: int,
+        num_heads: int,
+        rank: int,
+        mlp_ratio: float = 4.0,
+        core_mode: CoreMode | str = CoreMode.EQUILIBRIUM,
+        bias: bool = True,
+        implementation: _Implementation = "reference",
+        drop_path_rate: float = 0.0,
+        norm_eps: float = 1e-6,
+        dynamic_img_size: bool = False,
         dynamic_img_pad: bool = False,
-        qk_conv_kernel_size: int = 3, output_gate_rank: int = 32,
+        position_encoding: str = "cpe",
+        drop_path_schedule: str = "linear",
     ) -> None:
         super().__init__()
-        resolved = _validate_implementation(implementation)
-        if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
-            raise ValueError("depth must be a positive integer")
-        if not 0.0 <= drop_path_rate < 1.0:
-            raise ValueError("drop_path_rate must be in [0, 1)")
-        if drop_path_schedule not in ("linear", "constant"):
-            raise ValueError("drop_path_schedule must be 'linear' or 'constant'")
-        if norm_eps != 1e-6:
-            raise ValueError("the vision scaffold requires norm_eps = 1e-6")
-        if image_size <= 0 or patch_size <= 0 or image_size % patch_size:
-            raise ValueError("image_size must be positive and divisible by patch_size")
-        if not mlp_ratio > 0:
-            raise ValueError("mlp_ratio must be positive")
-        from timm.layers import GluMlp
-        from timm.models.vision_transformer import Block, VisionTransformer
-        _require_timm_attention_mask_api(VisionTransformer)
-        default_grid = (image_size // patch_size,) * 2
-
-        class ConfiguredMixer(_TimmMemSolveMixer):
-            def __init__(self, dim: int, num_heads: int, **kwargs: Any) -> None:
-                super().__init__(dim, num_heads, rank=rank,
-                                 qk_conv_kernel_size=qk_conv_kernel_size,
-                                 output_gate_rank=output_gate_rank,
-                                 implementation=resolved, **kwargs)
-
-        class ConfiguredSwiGLU(GluMlp):
-            def __init__(self, in_features, hidden_features=None, act_layer=None, **kwargs):
-                budget = hidden_features or in_features
-                gate_width = ((2 * budget // 3 + 15) // 16) * 16
-                super().__init__(
-                    in_features, hidden_features=2 * gate_width,
-                    act_layer=nn.SiLU, gate_last=False, **kwargs,
-                )
-
-            def init_weights(self):
-                # Keep timm's Linear trunc_normal_(std=.02), zero-bias init
-                # for both branches. GluMlp's initializer instead overwrites
-                # the second half, which is the value branch for gate_last=False.
-                pass
-
-        class ConfiguredBlock(Block):
-            def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
-                kwargs["mlp_layer"] = ConfiguredSwiGLU
-                if drop_path_schedule == "constant":
-                    kwargs["drop_path"] = drop_path_rate
-                super().__init__(dim, *args, **kwargs)
-
-            def forward(self, x, attn_mask=None, is_causal=False):
-                if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
-                    raise ValueError("MemSolve accepts only the vision token validity layout")
-                grid = default_grid if attn_mask is None or attn_mask.grid_size is None else attn_mask.grid_size
-                if x.shape[1] != grid[0] * grid[1]:
-                    raise ValueError("MemSolve requires the patch grid without prefix tokens")
-                valid = None if attn_mask is None else attn_mask.valid_mask
-                patches = x if valid is None else torch.where(valid[..., None], x, 0)
-                return super().forward(
-                    patches, attn_mask=VisionTokenLayout(valid, grid), is_causal=is_causal,
-                )
-
-        self.encoder = VisionTransformer(
-            img_size=image_size, patch_size=patch_size, num_classes=num_classes,
-            embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio,
-            qkv_bias=bias, proj_bias=bias, class_token=False, pos_embed="learn",
-            global_pool="avg", fc_norm=False, init_values=None,
-            dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
-            drop_path_rate=drop_path_rate, norm_layer=partial(nn.LayerNorm, eps=norm_eps),
-            block_fn=ConfiguredBlock, attn_layer=ConfiguredMixer,
+        self.position_encoding = position_encoding
+        self.encoder = _create_vision_encoder(
+            image_size=image_size,
+            patch_size=patch_size,
+            num_classes=num_classes,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            rank=rank,
+            mlp_ratio=mlp_ratio,
+            core_mode=core_mode,
+            bias=bias,
+            implementation=implementation,
+            drop_path_rate=drop_path_rate,
+            norm_eps=norm_eps,
+            dynamic_img_size=dynamic_img_size,
+            dynamic_img_pad=dynamic_img_pad,
+            position_encoding=position_encoding,
+            drop_path_schedule=drop_path_schedule,
         )
 
-    def get_extra_state(self) -> dict[str, object]:
-        return {"version": 5, "architecture": "vit3_qkconv_lpe2d", "ffn": "swiglu",
-                "pooling": "token_ln_mean", "class_token": False, "layer_scale": False}
+    def get_extra_state(self):
+        return {"version": 7, "architecture": "accretive_equilibrium_vit",
+                "ffn": "gelu", "pooling": "token_ln_mean", "class_token": False,
+                "layer_scale": False, "position_encoding": self.position_encoding}
 
-    def set_extra_state(self, state: object) -> None:
+    def set_extra_state(self, state):
         if state != self.get_extra_state():
             raise RuntimeError("incompatible MemSolve vision scaffold checkpoint")
 
     @property
-    def blocks(self) -> nn.Module:
-        return self.encoder.blocks
-
-    @property
-    def patch_embed(self) -> nn.Module:
-        return self.encoder.patch_embed
-
-    @property
-    def num_classes(self) -> int:
+    def num_classes(self):
         return self.encoder.num_classes
 
     @property
-    def num_features(self) -> int:
+    def num_features(self):
         return self.encoder.num_features
 
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.encoder.get_classifier()
 
-    def reset_classifier(self, num_classes: int, global_pool: str | None = None) -> None:
+    def reset_classifier(self, num_classes, global_pool=None):
         if global_pool not in (None, "avg"):
-            raise ValueError("MemSolve-ViT uses token-LN followed by mean pooling")
-        self.encoder.reset_classifier(num_classes)
+            raise ValueError("MemSolve-ViT uses token-LN mean pooling")
+        self.encoder.reset_classifier(num_classes, global_pool="avg")
 
-    def _layout(self, x: torch.Tensor, valid_mask: torch.Tensor | None) -> VisionTokenLayout:
-        grid = self.encoder.patch_embed.dynamic_feat_size(x.shape[-2:])
-        if valid_mask is not None:
-            if valid_mask.dtype != torch.bool or valid_mask.shape != (x.shape[0], grid[0] * grid[1]):
-                raise ValueError("valid_mask must be bool [B, number of patches], without CLS")
-            valid_mask = valid_mask.to(device=x.device)
-        return VisionTokenLayout(valid_mask, grid)
+    @property
+    def blocks(self) -> nn.Module:
+        return self.encoder.blocks  # type: ignore[no-any-return]
 
-    def forward(self, x: torch.Tensor, *, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
-        layout = self._layout(x, valid_mask)
+    @property
+    def patch_embed(self) -> nn.Module:
+        return self.encoder.patch_embed  # type: ignore[no-any-return]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        layout = (
+            None
+            if valid_mask is None
+            else VisionTokenLayout(valid_mask)
+        )
         features = self.encoder.forward_features(x, attn_mask=layout)
-        if layout.valid_mask is None:
+        if valid_mask is None:
             return self.encoder.forward_head(features)
-        # Features already passed through per-token final LN. Excluded patches
-        # must not enter mean pooling, including their residual or LN bias.
-        mask = layout.valid_mask
+        mask = valid_mask.to(device=features.device)
         pooled = torch.where(mask[..., None], features, 0).sum(1)
         pooled = pooled / mask.sum(1).clamp_min(1).unsqueeze(-1)
         return self.encoder.head(self.encoder.head_drop(pooled))
 
     def forward_intermediates(
-        self, x: torch.Tensor, *, indices: int | Sequence[int] | None = None,
-        valid_mask: torch.Tensor | None = None, norm: bool = False,
+        self,
+        x: torch.Tensor,
+        *,
+        indices: int | Sequence[int] | None = None,
+        valid_mask: torch.Tensor | None = None,
+        norm: bool = False,
     ) -> list[torch.Tensor]:
+        layout = (
+            None
+            if valid_mask is None
+            else VisionTokenLayout(valid_mask)
+        )
         result = self.encoder.forward_intermediates(
-            x, indices=indices, intermediates_only=True, norm=norm, output_fmt="NCHW",
-            attn_mask=self._layout(x, valid_mask),
+            x,
+            indices=indices,
+            intermediates_only=True,
+            norm=norm,
+            output_fmt="NCHW",
+            attn_mask=layout,
         )
         if not isinstance(result, list):
             raise RuntimeError("timm did not return intermediate feature maps")
@@ -328,45 +412,89 @@ class MemSolveViT(nn.Module):
 
 
 def create_memsolve_vit(
-    *, image_size: int, num_classes: int, embed_dim: int, depth: int, num_heads: int,
-    rank: int, mlp_ratio: float, bias: bool, implementation: _Implementation = "reference",
-    drop_path_rate: float = 0.0, norm_eps: float = 1e-6, patch_size: int = 16,
-    drop_path_schedule: Literal["linear", "constant"] = "linear",
-    dynamic_img_size: bool = False, dynamic_img_pad: bool = False,
-    qk_conv_kernel_size: int = 3, output_gate_rank: int = 32,
+    *,
+    image_size: int,
+    num_classes: int,
+    embed_dim: int,
+    depth: int,
+    num_heads: int,
+    rank: int,
+    mlp_ratio: float,
+    core_mode: CoreMode | str = CoreMode.EQUILIBRIUM,
+    bias: bool,
+    implementation: _Implementation = "reference",
+    drop_path_rate: float = 0.0,
+    norm_eps: float = 1e-6,
+    patch_size: int = 16,
+    dynamic_img_size: bool = False,
+    dynamic_img_pad: bool = False,
+    position_encoding: str = "cpe",
+    drop_path_schedule: str = "linear",
 ) -> MemSolveViT:
-    """Build the canonical MemSolve-ViT classifier or feature encoder."""
+    """Build the ViT3-style MemSolve classifier or feature encoder."""
+
     return MemSolveViT(
-        image_size=image_size, patch_size=patch_size, num_classes=num_classes,
-        embed_dim=embed_dim, depth=depth, num_heads=num_heads, rank=rank,
-        mlp_ratio=mlp_ratio, bias=bias, implementation=implementation,
-        drop_path_rate=drop_path_rate, norm_eps=norm_eps,
+        image_size=image_size,
+        patch_size=patch_size,
+        num_classes=num_classes,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        rank=rank,
+        mlp_ratio=mlp_ratio,
+        core_mode=core_mode,
+        bias=bias,
+        implementation=implementation,
+        drop_path_rate=drop_path_rate,
+        norm_eps=norm_eps,
+        dynamic_img_size=dynamic_img_size,
+        dynamic_img_pad=dynamic_img_pad,
+        position_encoding=position_encoding,
         drop_path_schedule=drop_path_schedule,
-        dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
-        qk_conv_kernel_size=qk_conv_kernel_size, output_gate_rank=output_gate_rank,
     )
 
 
 def create_memsolve_vit_variant(
-    variant: str, *, image_size: int, num_classes: int = 1000, rank: int | None = None,
-    bias: bool = True, implementation: _Implementation = "reference",
-    dynamic_img_size: bool = False, dynamic_img_pad: bool = False,
-    qk_conv_kernel_size: int = 3, output_gate_rank: int = 32,
+    variant: str,
+    *,
+    image_size: int,
+    num_classes: int = 1000,
+    rank: int | None = None,
+    core_mode: CoreMode | str = CoreMode.EQUILIBRIUM,
+    bias: bool = True,
+    implementation: _Implementation = "reference",
+    dynamic_img_size: bool = False,
+    dynamic_img_pad: bool = False,
 ) -> MemSolveViT:
+    """Build a restored MemSolve-ViT scale."""
+
     spec = vision_spec(variant)
     return create_memsolve_vit(
-        image_size=image_size, num_classes=num_classes, embed_dim=spec.embed_dim,
-        depth=spec.depth, num_heads=spec.num_heads,
+        image_size=image_size,
+        num_classes=num_classes,
+        embed_dim=spec.embed_dim,
+        depth=spec.depth,
+        num_heads=spec.num_heads,
         rank=vision_default_rank(variant) if rank is None else rank,
-        mlp_ratio=4.0,
-        bias=bias, implementation=implementation, drop_path_rate=spec.drop_path_rate,
-        dynamic_img_size=dynamic_img_size, dynamic_img_pad=dynamic_img_pad,
-        qk_conv_kernel_size=qk_conv_kernel_size, output_gate_rank=output_gate_rank,
+        mlp_ratio=4.125 if variant == "small" else 4.0,
+        core_mode=core_mode,
+        bias=bias,
+        implementation=implementation,
+        drop_path_rate=spec.drop_path_rate,
+        dynamic_img_size=dynamic_img_size,
+        dynamic_img_pad=dynamic_img_pad,
     )
 
 
-__all__ = ["MemSolveViT", "VisionSpec", "VisionTokenLayout", "create_memsolve_vit",
-           "create_memsolve_vit_variant", "vision_default_rank", "vision_spec"]
+__all__ = [
+    "VisionSpec",
+    "MemSolveViT",
+    "VisionTokenLayout",
+    "create_memsolve_vit",
+    "create_memsolve_vit_variant",
+    "vision_default_rank",
+    "vision_spec",
+]
 
 
 # These describe input preprocessing, not published pretrained weights.
@@ -391,7 +519,7 @@ def _registered_vit(variant: str, pretrained: bool, **kwargs: Any) -> MemSolveVi
     if kwargs.pop("in_chans", 3) != 3:
         raise ValueError("MemSolve-ViT currently expects three input channels")
     if kwargs.pop("global_pool", "avg") != "avg":
-        raise ValueError("MemSolve-ViT uses token-LN followed by mean pooling")
+        raise ValueError("MemSolve-ViT uses token-LN mean pooling")
     if "image_size" in kwargs and "img_size" in kwargs:
         raise ValueError("Pass img_size (timm) or image_size, not both")
     image_size = kwargs.pop("img_size", kwargs.pop("image_size", 224))
@@ -403,7 +531,7 @@ def _registered_vit(variant: str, pretrained: bool, **kwargs: Any) -> MemSolveVi
     defaults = dict(
         image_size=image_size, patch_size=16, embed_dim=spec.embed_dim,
         depth=spec.depth, num_heads=spec.num_heads, rank=vision_default_rank(variant),
-        mlp_ratio=4.0, drop_path_rate=spec.drop_path_rate,
+        mlp_ratio=4.125 if variant == "small" else 4.0, drop_path_rate=spec.drop_path_rate,
     )
     return build_model_with_cfg(
         MemSolveViT, f"memsolve_vit_{variant}", pretrained=False,

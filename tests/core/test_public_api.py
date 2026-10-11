@@ -1,9 +1,25 @@
+from __future__ import annotations
+
+import pytest
+
 import memsolve
-from memsolve import MemSolve, MemSolveConfig
-from memsolve.ball import MemSolve as BallMemSolve, MemSolveConfig as BallConfig
+from memsolve import CoreMode, MemSolve, MemSolveConfig
+from memsolve.ball import CoreMode as BallCoreMode
+from memsolve.ball import MemSolve as BallMemSolve
+from memsolve.ball import MemSolveConfig as BallConfig
 
 
-def test_public_api_is_narrow():
-    assert MemSolve is BallMemSolve and MemSolveConfig is BallConfig
-    assert set(memsolve.__all__) == {"MemSolve", "MemSolveConfig", "__version__"}
-    assert memsolve.__version__ == "0.14.0"
+pytestmark = pytest.mark.core
+
+
+def test_public_api_is_narrow() -> None:
+    assert CoreMode is BallCoreMode
+    assert MemSolve is BallMemSolve
+    assert MemSolveConfig is BallConfig
+    assert set(memsolve.__all__) == {
+        "CoreMode",
+        "MemSolve",
+        "MemSolveConfig",
+        "__version__",
+    }
+    assert memsolve.__version__ == "0.15.0"

@@ -1,21 +1,17 @@
-# Research scope after the Q/K/V refactor
+# Research scope after restoring the accretive operator
 
-The current operator is independent Q/K/V, a learned sample-independent
-identity-plus-delta query map T, centered depthwise Q/K convolution, ridge memory
-readout and per-head RMS normalization.
-It exposes no Dynamic/Static/Zero, skew or complement switches.
+The current operator restores shared relation/content projection, a soft frame,
+a learned shared accretive generator and the scalar content complement.
+`equilibrium` is the default. `complement` omits the learned core, retaining
+`eta (C - P P^T C)`. Both are input-dependent; neither name implies a fixed
+token operator or a zero output. Dynamic has been removed. RankRotary stays absent.
+See [the exact equations](CORE_CONTRACT.md).
 
-The input-conditioned core generator and V convolution remain absent.
-A low-rank sigmoid output gate follows per-head RMSNorm. Q/K use width-3 sequence filters or 3×3 image filters with identity
-initialization. Vision adds learned 2D absolute positions to patch embeddings;
-Q/K are not rotated and there is no residual CPE. Short distillation probes motivate studying the local prior;
-they do not establish gains from full training. V names the value tensor;
-T names the shared query map, so K remains unambiguously the key tensor.
+The visual shell follows the ViT3-style CPE/GELU/mean-pooling model without LayerScale. The intervening independent-Q/K/V, query-delta and output-gate model is
+preserved in Git history. Its probes are not evidence of benefits in this model.
 
-The former Static and Zero experiments describe a different reflected-readout
-architecture. Current T initializes to I, giving O=Pq Z. Existing results must not be
-relabeled as measurements of the current model.
-
-Future architectural interventions require a stated formula, matched training
-budget and an updated mathematical/gradient oracle. Exploratory experiment
-records stay outside this repository.
+Next structural discussion should separate the compact generator, the shared
+write/read geometry and the content complement. No new component ablation or
+long training run is authorized by this restoration. Exploratory records stay
+outside the repository. Historical Base had RankRotary; historical Small did
+not, and their training protocols differed.

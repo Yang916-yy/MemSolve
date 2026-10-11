@@ -249,7 +249,7 @@ def test_byte_vocabulary_preserves_utf8_bytes_and_eos() -> None:
 
 def test_cuda_runtime_metadata_records_the_current_native_contract() -> None:
     metadata = _runtime_metadata(torch.device("cpu"), cuda_enabled=True)
-    assert metadata["memsolve_cuda_contract"] == cuda._CUDA_CONTRACT_VERSION
+    assert metadata["memsolve_cuda_contract"] == cuda._NATIVE_CONTRACT_VERSION
 
 
 def test_nucleotide_tokenizer_does_not_confuse_unknown_with_padding() -> None:

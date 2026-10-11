@@ -1,107 +1,98 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
-from .config import MemSolveConfig
+from .config import CoreMode, MemSolveConfig
 from .reference import (
-    ridge_query_readout, head_rms_norm, low_rank_gate_logits, sigmoid_output_gate,
-    convolve_qk, split_qkv, tensor_core_linear,
-    readout_linear,
+    accretive_equilibrium_mix,
+    accretive_generator,
+    bounded_complement,
+    compact_equilibrium_diagnostics,
+    qr_soft_frame,
+    tensor_core_linear,
+    tensor_core_matmul,
 )
 
 
-_CONTRACT_VERSION = 24
+_CONTRACT_VERSION = 26
+_ETA_INIT = 0.9
+_ETA_INIT_RAW = math.atanh(_ETA_INIT)
 _SUPPORTED_ACTIVATION_DTYPES = frozenset(
     (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 )
 
 
 class MemSolve(nn.Module):
-    """Independent key/value ridge memory with learned query readout.
+    r"""The accretive-equilibrium low-rank token mixer.
 
-    The learned core is shared across samples. The memory, key Gram and
-    queries depend on the input. Centered depthwise convolutions give Q/K
-    local context before the global solve. Position embeddings belong to the
-    surrounding model. V remains a tokenwise projection.
-    A low-rank sigmoid gate selects normalized readout channels before Wo.
-    This mixer has no internal content skip.
+    Each head builds a QR soft frame P, compresses content into Z = P^T C,
+    forms a learned per-head accretive generator, and
+    evaluates its reflected-resolvent equilibrium directly.
+
+    Equilibrium and complement ownership share this one forward
+    path. Position features, if needed, belong to the surrounding encoder.
     """
 
     def __init__(self, config: MemSolveConfig) -> None:
         super().__init__()
         self.config = config
-        self.w_qkv = nn.Linear(
+        self.w_bc = nn.Linear(
             config.dim,
-            2 * config.num_heads * config.rank + config.dim,
+            config.num_heads * config.rank + config.dim,
             bias=config.bias,
         )
-        qk_channels = 2 * config.num_heads * config.rank
-        conv = nn.Conv1d if config.qk_conv_dim == 1 else nn.Conv2d
-        self.qk_conv = conv(
-            qk_channels, qk_channels, config.qk_conv_kernel_size,
-            padding=config.qk_conv_kernel_size // 2, groups=qk_channels, bias=False,
-        )
-        self.core_delta = nn.Parameter(
-            torch.zeros(config.num_heads, config.rank, config.rank)
-        )
-        # Gated DeltaNet/FLA output RMSNorm: one channel gain shared by all heads.
-        self.head_norm_weight = nn.Parameter(torch.ones(config.head_dim))
-        self.gate_down = nn.Linear(config.dim, config.output_gate_rank, bias=False)
-        self.gate_up = nn.Linear(config.output_gate_rank, config.dim, bias=True)
         self.w_o = nn.Linear(config.dim, config.dim, bias=config.bias)
-        self.init_weights()
 
-    @torch.no_grad()
-    def init_weights(self) -> None:
-        """Initialize fan-in K and identity Q/K convolutions; leave Q/V alone.
+        if config.core_mode is CoreMode.EQUILIBRIUM:
+            self.core_base_raw = nn.Parameter(
+                torch.zeros(config.num_heads, config.rank, config.rank)
+            )
+        else:
+            self.register_parameter("core_base_raw", None)
 
-        With unit-variance normalized inputs, Var(Wk)=1/dim gives expected
-        trace(K^T K/n)/rank = 1, balancing key statistics with the unit ridge.
-        timm's depth-first initializer calls this after initializing child
-        Linear modules, so its generic std=0.02 does not override the K rule.
-        """
-        offset = self.config.num_heads * self.config.rank
-        nn.init.normal_(
-            self.w_qkv.weight[offset : 2 * offset],
-            mean=0.0,
-            std=self.config.dim ** -0.5,
+        self.eta_raw = nn.Parameter(
+            torch.full(
+                (config.num_heads,),
+                _ETA_INIT_RAW if config.scalar_complement else 0.0,
+                dtype=torch.float32,
+            ),
+            requires_grad=config.scalar_complement,
         )
-        if self.w_qkv.bias is not None:
-            nn.init.zeros_(self.w_qkv.bias[offset : 2 * offset])
-        # Identity preserves the projection scale at initialization. The Q and
-        # K filters are independent; all neighboring taps remain trainable.
-        self.qk_conv.weight.zero_()
-        center = self.config.qk_conv_kernel_size // 2
-        self.qk_conv.weight[(slice(None), 0) + (center,) * self.config.qk_conv_dim] = 1
-        # Keep ordinary Linear/framework weight initialization in both factors.
-        # A zero bias centers the standard sigmoid near 0.5, not an identity gate.
-        nn.init.zeros_(self.gate_up.bias)
+
+    def complement(self) -> torch.Tensor:
+        """Return the learned per-head complement."""
+
+        if not self.config.scalar_complement:
+            return torch.zeros_like(self.eta_raw)
+        return bounded_complement(self.eta_raw)
 
     def _contract_state(self) -> dict[str, object]:
         config = self.config
         return {
             "version": _CONTRACT_VERSION,
-            "operator": "qkv_ridge_query_readout",
+            "operator": "accretive_equilibrium",
             "dim": config.dim,
             "num_heads": config.num_heads,
             "rank": config.rank,
+            "core_mode": config.core_mode.value,
+            "eta_parameterization": "per_head_interior_tanh",
+            "numerics": "tf32-wbc-ieee-fgram-tc16-v6",
             "bias": config.bias,
-            "qk_conv_dim": config.qk_conv_dim,
-            "qk_conv_kernel_size": config.qk_conv_kernel_size,
-            "qk_conv": "centered_depthwise_bias_free_identity_init",
-            "output_gate_rank": config.output_gate_rank,
-            "output_gate": "low_rank_linear_sigmoid_post_rms_pre_wo_with_bias",
-            "position_encoding": "external",
-            "core": "identity_plus_learned_shared_query_delta",
-            "readout": "query_memory_head_rmsnorm_shared_affine_eps_1e-6",
-            "numerics": "bf16_qkv_fp16_readout_fp32_solve_v2",
+            **({"skew_coupling": False} if not config.skew_coupling else {}),
+            **({"scalar_complement": False} if not config.scalar_complement else {}),
         }
 
     def get_extra_state(self) -> dict[str, object]:
+        """Persist the exact operator contract with tensor state."""
+
         return self._contract_state()
 
     def set_extra_state(self, state: object) -> None:
+        """Reject checkpoints created for a different operator contract."""
+
         expected = self._contract_state()
         if not isinstance(state, dict):
             raise RuntimeError("MemSolve checkpoint is missing its configuration contract")
@@ -116,14 +107,16 @@ class MemSolve(nn.Module):
 
     def _load_from_state_dict(
         self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
+        state_dict: dict[str, object],
+        prefix: str,
+        local_metadata: dict[str, object],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Require the semantic contract even for a non-strict tensor load."""
+
         contract_key = f"{prefix}_extra_state"
         super()._load_from_state_dict(
             state_dict,
@@ -134,47 +127,267 @@ class MemSolve(nn.Module):
             unexpected_keys,
             error_msgs,
         )
-        # Framework adapters may restore serialized metadata in a PyTorch load
-        # pre-hook. Check after those hooks; native checkpoints remain strict.
+
         if contract_key not in state_dict:
             error_msgs.append(
-                f"MemSolve checkpoint is missing its configuration contract ({contract_key!r})"
+                "MemSolve checkpoint is missing its configuration contract "
+                f"({contract_key!r})"
             )
 
     @staticmethod
-    def _validate_mask(valid_mask, *, batch, length, device):
+    def _validate_mask(
+        valid_mask: torch.Tensor | None,
+        *,
+        batch: int,
+        length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
         if valid_mask is None:
-            return None
+            return torch.ones(batch, length, dtype=torch.bool, device=device)
         if valid_mask.shape != (batch, length):
-            raise ValueError(f"valid_mask must have shape {(batch, length)}")
+            raise ValueError(
+                f"valid_mask must have shape {(batch, length)}, "
+                f"got {tuple(valid_mask.shape)}"
+            )
         if valid_mask.dtype != torch.bool:
-            raise TypeError("valid_mask must have dtype torch.bool")
-        return valid_mask.to(device=device).contiguous()
+            raise TypeError(
+                f"valid_mask must have dtype torch.bool, got {valid_mask.dtype}"
+            )
+        return valid_mask.to(device=device)
 
-    def _validate_input(self, x):
-        if x.ndim != 3 or x.shape[-1] != self.config.dim:
-            raise ValueError(f"x must have shape [B, N, {self.config.dim}]")
-        if x.dtype not in _SUPPORTED_ACTIVATION_DTYPES:
-            raise TypeError("x must be a supported floating-point tensor")
-        if x.shape[0] == 0 or x.shape[1] == 0:
-            raise ValueError("batch size and sequence length must be positive")
+    def _forward_cuda(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the explicit strict native implementation of the default operator."""
 
-    def _validate_cuda(self, x):
+        config = self.config
+        if (
+            not config.skew_coupling
+            or not config.scalar_complement
+            or config.rank not in (16, 32, 48, 64)
+        ):
+            raise ValueError(
+                "implementation='cuda' requires skew_coupling=True, scalar_complement=True, "
+                "and rank in {16, 32, 48, 64}"
+            )
         if x.device.type != "cuda":
             raise ValueError("implementation='cuda' requires x to be a CUDA tensor")
         if x.dtype not in (torch.float16, torch.bfloat16):
             raise TypeError(
-                "implementation='cuda' requires float16 or bfloat16 activations"
+                "implementation='cuda' supports x with dtype torch.float16 or "
+                "torch.bfloat16; "
+                f"got {x.dtype}"
             )
-        if self.config.rank not in (16, 32, 48, 64):
-            raise ValueError("implementation='cuda' requires rank in {16,32,48,64}")
+
+
         for name, parameter in self.named_parameters():
-            if parameter.device != x.device or parameter.dtype != torch.float32:
+            if parameter.device != x.device:
+                raise RuntimeError(
+                    f"implementation='cuda' requires {name} on {x.device}, "
+                    f"got {parameter.device}"
+                )
+        for name, parameter in (
+            ("w_bc.weight", self.w_bc.weight),
+            ("w_bc.bias", self.w_bc.bias),
+            ("w_o.weight", self.w_o.weight),
+            ("w_o.bias", self.w_o.bias),
+            ("core_base_raw", self.core_base_raw),
+            ("eta_raw", self.eta_raw),
+        ):
+            if parameter is None:
+                continue
+            if parameter.dtype != torch.float32:
                 raise TypeError(
-                    f"implementation='cuda' requires FP32 {name} on {x.device}"
+                    f"implementation='cuda' requires {name} to use torch.float32, "
+                    f"got {parameter.dtype}"
                 )
             if not parameter.is_contiguous():
-                raise RuntimeError(f"implementation='cuda' requires contiguous {name}")
+                raise RuntimeError(
+                    f"implementation='cuda' requires contiguous {name}"
+                )
+
+        batch, length, _dim = x.shape
+        all_valid = valid_mask is None
+        mask = (
+            None
+            if all_valid
+            else self._validate_mask(
+                valid_mask,
+                batch=batch,
+                length=length,
+                device=x.device,
+            )
+        )
+        if all_valid:
+            valid_counts = None
+        else:
+            assert mask is not None
+            valid_counts = (
+                mask.sum(dim=-1).to(dtype=torch.float32).clamp_min(1.0).contiguous()
+            )
+
+        # The native mixer consumes wide-range BF16 packed coordinates directly.
+        if all_valid:
+            safe_x = x
+        else:
+            assert mask is not None
+            safe_x = torch.where(mask[:, :, None], x, torch.zeros_like(x))
+        projected = tensor_core_linear(
+            safe_x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16
+        )
+        if not all_valid:
+            assert mask is not None
+            projected = torch.where(
+                mask[:, :, None], projected, torch.zeros_like(projected)
+            )
+        if not projected.is_contiguous():
+            raise RuntimeError(
+                "implementation='cuda' requires w_bc to produce contiguous "
+                "projected coordinates"
+            )
+        from . import cuda as cuda_backend
+
+        mixed = cuda_backend.fast_mix(
+            projected,
+            self.core_base_raw if self.core_base_raw is not None else self.eta_raw.new_empty((config.num_heads, config.rank, 0)),
+            self.eta_raw,
+            valid_counts,
+        )
+        output = tensor_core_linear(
+            mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype
+        )
+        if not all_valid:
+            assert mask is not None
+            output = torch.where(mask[:, :, None], output, torch.zeros_like(output))
+        return output
+
+    def _reference_compact_problem(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Construct the canonical compact problem for reference evaluation."""
+
+        config = self.config
+        batch, length, _dim = x.shape
+        all_valid = valid_mask is None
+        mask = (
+            None
+            if all_valid
+            else self._validate_mask(
+                valid_mask,
+                batch=batch,
+                length=length,
+                device=x.device,
+            )
+        )
+        safe_x = (
+            x
+            if all_valid
+            else torch.where(mask[:, :, None], x, torch.zeros_like(x))
+        )
+        projected = tensor_core_linear(
+            safe_x,
+            self.w_bc.weight,
+            self.w_bc.bias,
+            output_dtype=torch.float64 if x.dtype == torch.float64 else torch.bfloat16,
+        )
+        relation, content = projected.split(
+            (config.num_heads * config.rank, config.dim), dim=-1
+        )
+        relation = relation.view(
+            batch, length, config.num_heads, config.rank
+        ).transpose(1, 2)
+        content = content.view(
+            batch, length, config.num_heads, config.head_dim
+        ).transpose(1, 2)
+        if not all_valid:
+            assert mask is not None
+            active = mask[:, None, :, None]
+            relation = torch.where(active, relation, torch.zeros_like(relation))
+            content = torch.where(active, content, torch.zeros_like(content))
+
+        calc_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            relation = relation.to(dtype=calc_dtype)
+            content = content.to(dtype=calc_dtype)
+            valid_count = (
+                torch.full(
+                    (batch,),
+                    float(length),
+                    dtype=calc_dtype,
+                    device=x.device,
+                )
+                if all_valid
+                else mask.sum(dim=-1).to(dtype=calc_dtype).clamp_min(1.0)
+            )
+            relation = relation / valid_count.sqrt().view(batch, 1, 1, 1)
+            frame = qr_soft_frame(relation)
+            compact_state = tensor_core_matmul(frame.mT, content)
+            coordinates = (
+                None if self.core_base_raw is None
+                else self.core_base_raw.to(dtype=calc_dtype)
+            )
+            generator = (
+                None if coordinates is None else accretive_generator(
+                    coordinates, skew_coupling=config.skew_coupling
+                )
+            )
+            eta = self.complement().to(device=x.device, dtype=calc_dtype)
+        return projected, frame, compact_state, content, generator, eta, mask
+
+    @torch.no_grad()
+    def diagnostics(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        *,
+        adjoint_rhs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return per-sample, per-head certificates for the realized operator."""
+
+        self._validate_input(x)
+        if self.config.core_mode is CoreMode.COMPLEMENT:
+            raise ValueError("compact diagnostics require equilibrium mode")
+        _projected, frame, compact_state, _content, generator, eta, _mask = (
+            self._reference_compact_problem(x, valid_mask)
+        )
+        assert generator is not None
+        return compact_equilibrium_diagnostics(
+            frame,
+            generator,
+            compact_state,
+            eta,
+            adjoint_rhs.to(device=x.device, dtype=compact_state.dtype),
+        )
+
+    def _validate_input(self, x: torch.Tensor) -> None:
+        config = self.config
+        if x.ndim != 3 or x.shape[-1] != config.dim:
+            raise ValueError(
+                f"x must have shape [B, N, {config.dim}], got {tuple(x.shape)}"
+            )
+        if not x.is_floating_point():
+            raise TypeError("x must be a floating-point tensor")
+        if x.dtype not in _SUPPORTED_ACTIVATION_DTYPES:
+            raise TypeError(
+                f"MemSolve does not support x with dtype {x.dtype}; use "
+                "torch.float16, torch.bfloat16, torch.float32, or torch.float64"
+            )
+        if x.shape[0] == 0:
+            raise ValueError("batch size must be positive")
+        if x.shape[1] == 0:
+            raise ValueError("sequence length must be positive")
 
     def forward(
         self,
@@ -182,92 +395,51 @@ class MemSolve(nn.Module):
         valid_mask: torch.Tensor | None = None,
         *,
         implementation: str = "reference",
-        spatial_shape: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         self._validate_input(x)
-        if implementation not in ("reference", "cuda"):
-            raise ValueError("implementation must be 'reference' or 'cuda'")
-        if implementation == "cuda":
-            self._validate_cuda(x)
         config = self.config
-        batch, length, _ = x.shape
-        if config.qk_conv_dim == 2:
-            if (not isinstance(spatial_shape, tuple) or len(spatial_shape) != 2
-                    or any(not isinstance(s, int) or isinstance(s, bool) or s <= 0
-                           for s in spatial_shape)
-                    or spatial_shape[0] * spatial_shape[1] != length):
-                raise ValueError("2D Q/K convolution requires spatial_shape=(H, W) with H*W=N")
-        elif spatial_shape is not None:
-            raise ValueError("spatial_shape is only supported for 2D Q/K convolution")
-        mask = self._validate_mask(
-            valid_mask, batch=batch, length=length, device=x.device
-        )
-        safe_x = x if mask is None else torch.where(mask[..., None], x, 0.0)
-        projected = tensor_core_linear(
-            safe_x,
-            self.w_qkv.weight,
-            self.w_qkv.bias,
-            output_dtype=torch.float64 if x.dtype == torch.float64 else torch.bfloat16,
-        )
-        counts = None
-        if mask is not None:
-            projected = torch.where(mask[..., None], projected, 0.0)
-            counts = (
-                mask.sum(-1)
-                .to(torch.float64 if x.dtype == torch.float64 else torch.float32)
-                .clamp_min(1)
-            )
+        batch, length, _dim = x.shape
+
         if implementation == "cuda":
-            from . import cuda
+            return self._forward_cuda(x, valid_mask)
+        if implementation != "reference":
+            raise ValueError(
+                "implementation must be 'reference' or 'cuda', "
+                f"got {implementation!r}"
+            )
 
-            projected = cuda.local_qk(projected, self.qk_conv.weight,
-                                      valid_mask=mask, spatial_shape=spatial_shape)
-        else:
-            projected = convolve_qk(projected, self.qk_conv.weight, spatial_shape)
-        if mask is not None and implementation == "reference":
-            # Neighbors may write into an invalid position. It must not enter
-            # either the key statistics or the readout, even with input bias.
-            projected = torch.where(mask[..., None], projected, 0.0)
-        # Only the compact map is materialized; dT/dDelta is the identity.
-        core_map = self.core_delta + torch.eye(
-            config.rank, device=self.core_delta.device, dtype=self.core_delta.dtype,
+        projected, frame, compact_state, content, generator, eta, mask = (
+            self._reference_compact_problem(x, valid_mask)
         )
-        gate_logits = low_rank_gate_logits(
-            safe_x, self.gate_down.weight,
-            self.gate_up.weight, self.gate_up.bias,
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            output = accretive_equilibrium_mix(
+                frame,
+                generator,
+                compact_state,
+                content,
+                eta,
+            )
+
+        if x.dtype != torch.float64:
+            output = output.to(torch.bfloat16)
+        output = output.transpose(1, 2).contiguous().view(
+            batch, length, config.dim
         )
-        if implementation == "cuda":
-            from . import cuda
-
-            output = cuda.fast_mix(
-                projected, core_map, counts, norm_weight=self.head_norm_weight,
-                gate_logits=gate_logits,
-                output_weight=self.w_o.weight, output_bias=self.w_o.bias, output_dtype=x.dtype,
-            )
-        else:
-            query, key, value = split_qkv(projected, config.num_heads, config.rank)
-            mixed = ridge_query_readout(
-                query, key, value, core_map, counts,
-            ).transpose(1, 2)
-            normalized = head_rms_norm(
-                mixed, self.head_norm_weight,
-            )
-            normalized = normalized.reshape(batch, length, config.dim)
-            normalized = self._gate_output(normalized, gate_logits)
-            output = readout_linear(
-                normalized, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype
-            )
-        return output if mask is None else torch.where(mask[..., None], output, 0.0)
-
-    def _gate_output(self, normalized, logits):
-        # Pure PyTorch reference; the CUDA backend fuses this into its readout.
-        return sigmoid_output_gate(normalized, logits)
+        output = tensor_core_linear(
+            output, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype
+        )
+        if mask is None:
+            return output
+        assert mask is not None
+        return torch.where(mask[:, :, None], output, torch.zeros_like(output))
 
     def extra_repr(self) -> str:
-        c = self.config
-        return (f"dim={c.dim}, num_heads={c.num_heads}, rank={c.rank}, "
-                f"qk_conv_dim={c.qk_conv_dim}, qk_conv_kernel_size={c.qk_conv_kernel_size}, "
-                f"output_gate_rank={c.output_gate_rank}, readout=qkv_ridge_query")
+        config = self.config
+        return (
+            f"dim={config.dim}, num_heads={config.num_heads}, rank={config.rank}, "
+            f"core_mode={config.core_mode.value}, "
+            "eta=per-head-interior-tanh"
+        )
 
 
 __all__ = ["MemSolve"]

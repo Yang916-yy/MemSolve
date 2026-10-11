@@ -14,6 +14,7 @@ model = dict(
         rank=64,
         out_indices=(7, 11, 15, 23),
         implementation="cuda",
+        core_mode="equilibrium",
     ),
     neck=dict(in_channels=[1024, 1024, 1024, 1024]),
 )

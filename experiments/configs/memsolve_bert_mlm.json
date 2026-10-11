@@ -8,10 +8,9 @@
     "intermediate_size": 2048,
     "max_position_embeddings": 512,
     "memsolve_rank": 32,
-    "memsolve_qk_conv_kernel_size": 3,
-    "memsolve_output_gate_rank": 32,
     "memsolve_implementation": "cuda",
-    "ffn_type": "swiglu"
+    "ffn_type": "swiglu",
+    "memsolve_core_mode": "equilibrium"
   },
   "global_batch_size": 4096,
   "train_mask_probability": 0.3,
@@ -23,11 +22,14 @@
     "weight_decay": 0.0125,
     "adam_beta1": 0.9,
     "adam_beta2": 0.98,
-    "adam_epsilon": 0.000001,
+    "adam_epsilon": 1e-06,
     "max_grad_norm": 1.0,
     "optim": "adamw_torch_fused",
     "lr_scheduler_type": "polynomial",
-    "lr_scheduler_kwargs": {"lr_end": 0.000016, "power": 1.0},
+    "lr_scheduler_kwargs": {
+      "lr_end": 1.6e-05,
+      "power": 1.0
+    },
     "warmup_ratio": 0.06,
     "bf16": true,
     "bf16_full_eval": false,

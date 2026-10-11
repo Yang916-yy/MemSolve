@@ -1,7 +1,7 @@
 """Public MemSolve API."""
 
-from .ball import MemSolve, MemSolveConfig
+from .ball import CoreMode, MemSolve, MemSolveConfig
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
-__all__ = ["MemSolve", "MemSolveConfig", "__version__"]
+__all__ = ["CoreMode", "MemSolve", "MemSolveConfig", "__version__"]

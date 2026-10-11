@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memsolve-operator"
-version = "0.14.0"
+version = "0.15.0"
 description = "Full-context associative memory via compact equilibrium solves, with linear sequence scaling and PyTorch/Triton acceleration."
 keywords = [
     "memsolve", "associative-memory", "global-equilibrium", "bidirectional", "ridge-regression",

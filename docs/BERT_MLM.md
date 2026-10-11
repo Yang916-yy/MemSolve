@@ -1,3 +1,9 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # MemSolve-BERT integration
 
 **MemSolve** names the operator, **MemSolve-ViT** the visual family, and
@@ -19,20 +25,12 @@ h=\mathrm{LayerNorm}(x+\mathrm{Dropout}(\mathrm{MemSolve}(x))),\qquad
 y=\mathrm{LayerNorm}(h+\mathrm{Dropout}(\mathrm{FFN}(h))).
 \]
 
-MemSolve includes its packed QKV projection, per-head output RMSNorm with shared
-channel gain, a low-rank sigmoid channel gate, and output projection. BERT's attention output dense layer becomes
-an identity, avoiding a duplicate output projection. The attention residual
-dropout and LayerNorm remain. Projected Q/K pass through centered width-3
-depthwise convolutions, with no bias or activation and identity initialization.
-V remains tokenwise. Padding is masked before and after convolution. No additional
-mixer LayerNorm, RoPE, CPE or LayerScale is added.
-
-`memsolve_qk_conv_kernel_size` controls the odd centered 1D kernel width (default 3).
-`memsolve_output_gate_rank` controls the gate bottleneck (default 32), independently
-of `memsolve_rank`. Both are serialized in the HF configuration and checked against
-the core checkpoint contract. The gate receives the same input as QKV and acts
-after output RMSNorm, before Wo; its two factors use HF's normal initialization
-and its output bias starts at zero.
+MemSolve owns its packed relation/content projection, sample-conditioned compact
+generator, bounded scalar complement and output projection. BERT's attention
+output dense layer becomes an identity, avoiding a duplicate Wo; its residual,
+dropout and LayerNorm remain. `memsolve_core_mode` selects equilibrium (default)
+or complement and is persisted in the HF configuration. There is no Q/K short
+convolution, output RMSNorm or output gate. BERT supplies absolute positions.
 
 The FFN uses `silu(gate) * up`, with gate and up packed into one linear
 projection. BERT's FFN output module retains the down projection, dropout,
@@ -55,13 +53,11 @@ prediction transform (GELU); the encoder FFN is always SwiGLU.
 | Embedding and residual dropout | 0.1 |
 | Attention probability dropout | 0; this operator does not materialize probabilities |
 | BERT LayerNorm epsilon | 1e-12 |
-| MemSolve head RMSNorm epsilon | 1e-6, owned by the core |
-| MLM parameters, tied weights counted once | r32: 103,214,394; r48: 106,956,090 |
 
 HF's normal initialization (std 0.02, zero linear biases) applies to the BERT
 scaffold and MemSolve Q/V/output projections. After child linear initialization,
-the core restores its K fan-in and identity Q/K filter initialization. Delta
-starts at zero, so T starts at identity; RMSNorm gain starts at one. The MLM decoder shares the word
+the restored core resets its learned shared core coordinates to zero and
+its per-head complement to approximately0.9. The MLM decoder shares the word
 embedding weight. There is no trained CLS pooler in the MLM model or the default
 base encoder.
 
@@ -151,8 +147,7 @@ The scaffold follows the operator replacement boundary in
 The public LION YAML `hf_bert` route and its `linear_attention` / `nova` names
 do not match the custom `bert` factory and `lion-lit` / `lion-d` / `lion-s`
 branches in that checkout. We register the MemSolve model explicitly instead of
-copying those configuration switches. LION-Lit's optional output LayerNorm is
-not added on top of MemSolve's output RMSNorm. These are architecture differences,
+copying those configuration switches. No extra mixer output normalization is added. These are architecture differences,
 not an exact reproduction of LION training.
 
 The implementation imports the Apache-2.0

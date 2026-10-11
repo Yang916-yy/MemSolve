@@ -350,8 +350,7 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
 
     defaults = dict(_as_mapping(raw.get("defaults"), "[defaults]"))
     operator = dict(_as_mapping(raw.get("operator"), "[operator]"))
-    operator.setdefault("qk_conv_kernel_size", 3)
-    operator.setdefault("output_gate_rank", 32)
+    operator.setdefault("core_mode", "equilibrium")
     tiers = _as_mapping(raw.get("tiers"), "[tiers]")
     tier_values = dict(_as_mapping(tiers.get(args.tier), f"[tiers.{args.tier}]"))
     phases = {
@@ -377,7 +376,7 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         "num_classes": defaults["num_classes"],
         "mlp_ratio": defaults["mlp_ratio"],
         "norm_eps": defaults["norm_eps"],
-        "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
+        "architecture": "vit3_cpe_accretive_mean_gelu_v7", "ffn": "gelu",
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
@@ -511,24 +510,16 @@ def _validate_run(
     _probability(model["drop_path_rate"], "drop_path_rate")
 
     for key, expected in {
-        "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu", "layer_scale": False, "class_token": False,
-        "pooling": "token_ln_mean", "position_encoding": "learned_2d",
+        "architecture": "vit3_cpe_accretive_mean_gelu_v7", "ffn": "gelu", "layer_scale": False, "class_token": False,
+        "pooling": "token_ln_mean", "position_encoding": "cpe",
     }.items():
         if model.get(key) != expected:
             raise ValueError(f"the vision scaffold requires {key}={expected!r}")
-    if "layer_scale_init_value" in model or "layer_scale_init_value" in train:
-        raise ValueError("LayerScale is not part of the current vision scaffold")
-
-    if "core_mode" in operator:
-        raise ValueError("core_mode is not part of the QKV equilibrium contract")
     from memsolve import MemSolveConfig
-    MemSolveConfig(
-        dim=embed_dim, num_heads=heads, rank=model["rank"], qk_conv_dim=2,
-        qk_conv_kernel_size=operator["qk_conv_kernel_size"],
-        output_gate_rank=operator["output_gate_rank"],
-    )
+    MemSolveConfig(dim=embed_dim, num_heads=heads, rank=model["rank"],
+                   core_mode=operator["core_mode"])
     if operator["bias"] is not True:
-        raise ValueError("the ViT³ scaffold requires qkv/projection bias")
+        raise ValueError("the restored scaffold requires qkv/projection bias")
     if operator["implementation"] not in {"cuda", "reference"}:
         raise ValueError("operator.implementation must be 'cuda' or 'reference'")
 
@@ -1835,14 +1826,14 @@ def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
 
 
 def build_model(run: ImageNetRun) -> nn.Module:
-    """Call the shared ViT³-style MemSolve backbone factory owned by integrations."""
+    """Call the shared restored MemSolve backbone factory owned by integrations."""
 
     try:
         from integrations.timm import create_memsolve_vit
     except ImportError as error:
         raise RuntimeError(
             "ImageNet training requires integrations.timm.create_memsolve_vit; "
-            "the shared ViT³-style backbone adapter is not available."
+            "the shared restored backbone adapter is not available."
         ) from error
 
     model = run.model
@@ -1854,8 +1845,8 @@ def build_model(run: ImageNetRun) -> nn.Module:
         depth=int(model["depth"]),
         num_heads=int(model["num_heads"]),
         rank=int(model["rank"]),
-        qk_conv_kernel_size=run.operator["qk_conv_kernel_size"],
-        output_gate_rank=run.operator["output_gate_rank"],
+        core_mode=run.operator["core_mode"],
+        position_encoding=str(model["position_encoding"]),
         mlp_ratio=float(model["mlp_ratio"]),
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
@@ -2151,7 +2142,7 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
         for module in model.modules():
             if isinstance(module, MemSolve):
                 module.forward = torch.compiler.disable(module.forward)
-                # The CUDA mixer already fuses normalization and its gate.
+                # Preserve the restored native equilibrium forward/backward boundary.
         # One outer graph captures all compiled segments and CUDA MemSolve calls.
         # Disable Inductor's own graphs so graph pools and RNG have one owner.
         # Preserve eager BF16 rounding between fused pointwise operations.

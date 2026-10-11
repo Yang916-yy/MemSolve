@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
-import json
-from pathlib import Path
 import statistics
 import time
 
 import torch
 import torch.nn as nn
 
-from memsolve import MemSolve, MemSolveConfig
+from memsolve import CoreMode, MemSolve, MemSolveConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,14 +19,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim", type=int, default=192)
     parser.add_argument("--heads", type=int, default=3)
     parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--spatial-shape", type=int, nargs=2, metavar=("H", "W"))
+    parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="equilibrium")
     parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--graph", action="store_true", help="Capture a complete gradient-accumulation cycle.")
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--autotune", action="store_true",
-                        help="Tune MemSolve token launches during eager warmup, before Graph capture.")
-    parser.add_argument("--launch-report", type=Path,
-                        help="Write selected launch configs, resource usage and tuning times as JSON.")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
@@ -71,13 +64,11 @@ class _BenchmarkMixer(nn.Module):
         *,
         operator: str,
         implementation: str,
-        spatial_shape: tuple[int, int] | None,
     ) -> None:
         super().__init__()
         self.mixer = mixer
         self.operator = operator
         self.implementation = implementation
-        self.spatial_shape = spatial_shape
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.operator == "memsolve":
@@ -85,7 +76,6 @@ class _BenchmarkMixer(nn.Module):
             return self.mixer(
                 x,
                 implementation=self.implementation,
-                spatial_shape=self.spatial_shape,
             )
         assert isinstance(self.mixer, nn.MultiheadAttention)
         output, _ = self.mixer(x, x, x, need_weights=False)
@@ -100,15 +90,8 @@ def main() -> None:
         raise ValueError("warmup must be nonnegative; steps and repeats must be positive")
     if args.grad_accum <= 0:
         raise ValueError("grad_accum must be positive")
-    if (args.autotune or args.launch_report) and (args.operator != "memsolve" or args.implementation != "cuda"):
-        raise ValueError("launch tuning/reporting requires MemSolve implementation=cuda")
-    if args.autotune and args.warmup < 1:
-        raise ValueError("autotune requires at least one eager warmup step")
     if args.steps % args.grad_accum:
         raise ValueError("steps must be divisible by grad_accum")
-    spatial_shape = None if args.spatial_shape is None else tuple(args.spatial_shape)
-    if spatial_shape is not None and (min(spatial_shape) <= 0 or spatial_shape[0] * spatial_shape[1] != args.length):
-        raise ValueError("spatial shape must be positive with H*W=length")
     if args.graph and args.operator == "memsolve" and args.implementation != "cuda":
         raise ValueError("MemSolve graph benchmarking requires implementation=cuda")
 
@@ -122,8 +105,8 @@ def main() -> None:
                 dim=args.dim,
                 num_heads=args.heads,
                 rank=args.rank,
+                core_mode=args.core_mode,
                 bias=args.bias,
-                qk_conv_dim=1 if spatial_shape is None else 2,
             )
         ).to(device)
     else:
@@ -138,7 +121,6 @@ def main() -> None:
         mixer,
         operator=args.operator,
         implementation=args.implementation,
-        spatial_shape=spatial_shape,
     )
     if args.mode == "forward":
         layer.eval()
@@ -183,16 +165,19 @@ def main() -> None:
             x.grad = None
 
     clear_parameter_gradients()
-    with cuda.autotune() if args.autotune else nullcontext():
-        for step_index in range(args.warmup):
-            clear_input_gradient()
-            step()
-            if (step_index + 1) % args.grad_accum == 0:
-                clear_parameter_gradients()
+    for step_index in range(args.warmup):
+        clear_input_gradient()
+        step()
+        if (step_index + 1) % args.grad_accum == 0:
+            clear_parameter_gradients()
     clear_parameter_gradients()
     clear_input_gradient()
     torch.cuda.synchronize()
 
+    # Graph replay reuses its private pool without allocator calls. Reset before
+    # capture so the reported peak includes training intermediates allocated
+    # during capture, rather than only tensors still live after capture.
+    torch.cuda.reset_peak_memory_stats()
     graph = None
     if args.graph:
         def cycle() -> None:
@@ -214,7 +199,6 @@ def main() -> None:
             graph.replay()
         torch.cuda.synchronize()
 
-    torch.cuda.reset_peak_memory_stats()
     samples: list[float] = []
     gpu_samples: list[float] = []
     for _ in range(args.repeats):
@@ -241,19 +225,14 @@ def main() -> None:
         gpu_samples.append(start_event.elapsed_time(end_event) / args.steps)
 
     properties = torch.cuda.get_device_properties(device)
-    if args.launch_report:
-        args.launch_report.parent.mkdir(parents=True, exist_ok=True)
-        args.launch_report.write_text(json.dumps({
-            "torch": torch.__version__, "cuda": torch.version.cuda,
-            "launches": cuda.launch_report(),
-        }, indent=2) + "\n")
     implementation = args.implementation if args.operator == "memsolve" else "torch_mha"
     rank = str(args.rank) if args.operator == "memsolve" else "na"
-    position = "rope_2d" if args.operator == "memsolve" and spatial_shape is not None else "external"
+    position = "external"
+    core_mode = args.core_mode if args.operator == "memsolve" else "na"
     print(
         f"device={properties.name} sm={properties.major}.{properties.minor} "
         f"torch={torch.__version__} cuda={torch.version.cuda} "
-        f"operator={args.operator} implementation={implementation} mode={args.mode} "
+        f"operator={args.operator} implementation={implementation} mode={args.mode} core_mode={core_mode} "
         f"dtype={args.dtype} tf32={args.tf32} graph={args.graph} bias={args.bias} "
         f"batch={args.batch} grad_accum={args.grad_accum} length={args.length} "
         f"dim={args.dim} heads={args.heads} rank={rank} position={position} "

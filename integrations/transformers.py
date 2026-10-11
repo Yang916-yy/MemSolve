@@ -1,7 +1,7 @@
 """MemSolve-BERT: Hugging Face BERT with MemSolve in the attention sublayer.
 
 BERT owns embeddings, Post-LN residuals and the tied MLM head; FFNs use SwiGLU.
-MemSolve owns all mixer mathematics, QKV, head RMSNorm and output projection.
+MemSolve owns all mixer mathematics, relation/content projections, compact generator and output projection.
 Import this module before using the HF Auto classes with MemSolve checkpoints.
 """
 
@@ -23,7 +23,7 @@ from transformers.models.bert.modeling_bert import (
     BertSelfOutput,
 )
 
-from memsolve import MemSolve, MemSolveConfig
+from memsolve import CoreMode, MemSolve, MemSolveConfig
 
 
 class MemSolveBertConfig(BertConfig):
@@ -34,8 +34,7 @@ class MemSolveBertConfig(BertConfig):
     def __init__(
         self,
         memsolve_rank: int = 32,
-        memsolve_qk_conv_kernel_size: int = 3,
-        memsolve_output_gate_rank: int = 32,
+        memsolve_core_mode: str = "equilibrium",
         memsolve_implementation: str = "reference",
         memsolve_contract: dict | None = None,
         ffn_type: str = "swiglu",
@@ -54,8 +53,7 @@ class MemSolveBertConfig(BertConfig):
         MemSolveConfig(
             dim=self.hidden_size, num_heads=self.num_attention_heads,
             rank=memsolve_rank, bias=True,
-            qk_conv_kernel_size=memsolve_qk_conv_kernel_size,
-            output_gate_rank=memsolve_output_gate_rank,
+            core_mode=memsolve_core_mode,
         )
         if memsolve_implementation not in ("reference", "cuda"):
             raise ValueError("memsolve_implementation must be 'reference' or 'cuda'")
@@ -68,8 +66,7 @@ class MemSolveBertConfig(BertConfig):
         if self.attention_probs_dropout_prob != 0:
             raise ValueError("Use hidden_dropout_prob; MemSolve has no attention-probability dropout")
         self.memsolve_rank = memsolve_rank
-        self.memsolve_qk_conv_kernel_size = memsolve_qk_conv_kernel_size
-        self.memsolve_output_gate_rank = memsolve_output_gate_rank
+        self.memsolve_core_mode = CoreMode(memsolve_core_mode).value
         self.memsolve_implementation = memsolve_implementation
         self.memsolve_contract = copy.deepcopy(memsolve_contract)
         self.ffn_type = ffn_type
@@ -107,8 +104,7 @@ class _MemSolveBertAttention(nn.Module):
             num_heads=config.num_attention_heads,
             rank=config.memsolve_rank,
             bias=True,
-            qk_conv_kernel_size=config.memsolve_qk_conv_kernel_size,
-            output_gate_rank=config.memsolve_output_gate_rank,
+            core_mode=config.memsolve_core_mode,
         ))
         if config.memsolve_contract is None:
             config.memsolve_contract = self.mixer.get_extra_state()
@@ -137,6 +133,12 @@ class _MemSolveBertAttention(nn.Module):
                 raise ValueError("MemSolve-BERT accepts a 2D padding mask, not pairwise masks")
             valid_mask = attention_mask[:, 0, 0, :] == 0
         x = hidden_states
+        if self.implementation == "cuda":
+            # HF AutoModel/Trainer does not call the standalone operator loader.
+            # Load the matching native artifact before the first CUDA forward;
+            # load() verifies the device and caches the registered extension.
+            from memsolve.ball import cuda
+            cuda.load(device=x.device)
         if x.is_cuda and torch.is_autocast_enabled("cuda"):
             x = x.to(torch.get_autocast_dtype("cuda"))
         elif self.implementation == "cuda":
@@ -158,10 +160,10 @@ class _MemSolveBertMixin:
         super()._init_weights(module)
         if isinstance(module, MemSolve):
             with torch.no_grad():
-                module.core_delta.zero_()
-                module.head_norm_weight.fill_(1.0)
-                # HF initializes child linears first. Restore the core's K rule.
-                module.init_weights()
+                if module.core_base_raw is not None:
+                    module.core_base_raw.zero_()
+                import math
+                module.eta_raw.fill_(math.atanh(0.9))
 
     @classmethod
     def _load_pretrained_model(cls, *args, **kwargs):

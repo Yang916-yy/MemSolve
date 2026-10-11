@@ -1,3 +1,9 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # MemSolve-ViT with LAMB and 3-Augment
 
 ## Default: RoPE-ViT-derived 400-epoch training
@@ -108,8 +114,7 @@ under the new 400-epoch schedule.
 
 `experiments/configs/imagenet_deit3_400.toml` adapts the ImageNet-1K recipe in
 [DeiT III](https://arxiv.org/abs/2204.07118), tables 1, 6 and 13. The backbone
-retains MemSolve-ViT-B/r48, packed SwiGLU, Q/K convolution and learned 2D absolute patch positions, token-LN mean
-pooling, no CLS and no LayerScale. BF16 AMP, no EMA, local indexed WebDataset and
+uses restored MemSolve-ViT-B/r48, GELU, per-block CPE and token-LN mean pooling without LayerScale. BF16 AMP, no EMA, local indexed WebDataset and
 physical-batch gradient accumulation are local adaptations. This is a
 **DeiT III-derived training protocol**, not the original ViT architecture or
 an identical ImageFolder sampling protocol.

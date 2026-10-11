@@ -1,6 +1,12 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # Sequence Experiments
 
-> Current source uses model contract 24 and CUDA contract 19. External position
+> Current source uses model contract 26 and native CUDA ABI 12. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -10,16 +16,11 @@ for the current GenomicBenchmarks and Long Range Arena (LRA) experiments. It
 owns data preparation, the shared encoder shell, validation-based checkpoint
 selection, and the one-time held-out test evaluation.
 
-The current operator uses independent Q/K/V, a learned sample-independent
-core and direct normalized readout. Q/K additionally use centered width-3
-depthwise convolution with identity initialization; V remains tokenwise.
-It has no core-mode or complement switches.
-The shared encoder retains learned absolute position embeddings initialized
-from `Normal(0, 0.02)`. CUDA contract 19 accepts FP16 and BF16 inputs; sequence
-recipes still default to FP16. Current model checkpoints use contract 24.
-The output uses a low-rank sigmoid channel gate after head RMSNorm.
-`--qk-conv-kernel-size` selects an odd centered 1D kernel width (default 3);
-`--output-gate-rank` sets the independent output gate bottleneck (default 32).
+The restored operator uses shared relation/content projections and the accretive
+compact equilibrium. `--core-mode` selects equilibrium (default) or complement. No RankRotary,
+short convolution or readout gate is present. The surrounding encoder retains
+learned absolute positions initialized from Normal(0,0.02). Native ABI12 accepts
+FP16/BF16 activations; parameters stay FP32. Model checkpoints use contract26.
 
 Historical results below used earlier operator and numerical contracts,
 including internal relation-feature preprocessing absent from current source.
@@ -322,8 +323,8 @@ batch caps to a formal reproduction; the runner rejects these combinations.
 
 ## Historical certificate stress test
 
-The recorded contraction certificates belong to the previous reflected
-operator. They do not certify the current independent-QKV normalized readout.
+The recorded contraction certificates belong to the historical reflected
+operator. Restoration does not regenerate those empirical stress measurements.
 Regenerating them requires their recorded source revision and checkpoints.
 The remaining `experiments/certificate_diagnostics.py` utility only summarizes
 existing raw CSV records:

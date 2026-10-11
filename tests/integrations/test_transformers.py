@@ -42,21 +42,15 @@ def test_scaffold_initialization_and_weight_tying():
     assert model.bert.pooler is None
     assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
     assert len([m for m in model.modules() if isinstance(m, MemSolve)]) == 2
-    assert sum(isinstance(m, nn.Conv1d) for m in model.modules()) == 2
+    assert sum(isinstance(m, nn.Conv1d) for m in model.modules()) == 0
     for block in model.bert.encoder.layer:
         assert isinstance(block.attention.output.dense, nn.Identity)
         core = block.attention.mixer
-        assert core.config.qk_conv_dim == 1
-        expected = torch.zeros_like(core.qk_conv.weight)
-        expected[:, 0, 1] = 1
-        torch.testing.assert_close(core.qk_conv.weight, expected, rtol=0, atol=0)
-        offset = core.config.num_heads * core.config.rank
-        q, k, v = core.w_qkv.weight.split((offset, offset, 192))
-        assert abs(k.std().item() * 192**0.5 - 1) < 0.05
-        for w in (q, v, core.w_o.weight):
+        for w in (core.w_bc.weight, core.w_o.weight):
             assert abs(w.std().item() / 0.02 - 1) < 0.05
-        assert torch.count_nonzero(core.core_delta) == 0
-        assert torch.equal(core.head_norm_weight, torch.ones_like(core.head_norm_weight))
+        assert torch.count_nonzero(core.core_base_raw) == 0
+        assert not hasattr(core, "core_drive_weight")
+        torch.testing.assert_close(core.complement(), torch.full((6,), .9))
 
 
 def test_swiglu_width_and_packed_projection_gradients():
@@ -111,7 +105,7 @@ def test_padding_is_excluded_but_mlm_tokens_are_valid():
     with torch.no_grad():
         for module in model.modules():
             if isinstance(module, MemSolve):
-                module.qk_conv.weight.add_(torch.randn_like(module.qk_conv.weight) * .1)
+                module.core_base_raw.normal_(std=0.1)
     data = batch()
     original = model(**data)
     changed = dict(data, input_ids=data["input_ids"].clone())
@@ -140,26 +134,24 @@ def test_mlm_backward_and_gradient_checkpointing(checkpointing):
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         assert torch.isfinite(p.grad).all(), name
-    before = model.bert.encoder.layer[0].attention.mixer.core_delta.detach().clone()
+    before = model.bert.encoder.layer[0].attention.mixer.core_base_raw.detach().clone()
     torch.optim.AdamW(model.parameters(), lr=1e-3).step()
-    assert not torch.equal(before, model.bert.encoder.layer[0].attention.mixer.core_delta)
+    assert not torch.equal(before, model.bert.encoder.layer[0].attention.mixer.core_base_raw)
 
 
 @pytest.mark.parametrize("max_shard_size", ["5GB", "20KB"])
 def test_hf_checkpoint_roundtrip_and_encoder_extraction(tmp_path, max_shard_size):
     torch.manual_seed(31)
-    model = MemSolveBertForMaskedLM(config(memsolve_qk_conv_kernel_size=5,
-                                        memsolve_output_gate_rank=8)).eval()
+    model = MemSolveBertForMaskedLM(config(memsolve_core_mode="equilibrium")).eval()
     with torch.no_grad():
-        model.bert.encoder.layer[0].attention.mixer.core_delta.normal_(std=0.1)
+        model.bert.encoder.layer[0].attention.mixer.core_base_raw.normal_(std=0.1)
     model.save_pretrained(tmp_path, max_shard_size=max_shard_size)
     saved_config = json.loads((tmp_path / "config.json").read_text())
     assert saved_config["model_type"] == "memsolve_bert"
     assert saved_config["architectures"] == ["MemSolveBertForMaskedLM"]
     assert isinstance(AutoConfig.from_pretrained(tmp_path), MemSolveBertConfig)
     loaded, info = AutoModelForMaskedLM.from_pretrained(tmp_path, output_loading_info=True)
-    assert loaded.config.memsolve_qk_conv_kernel_size == 5
-    assert loaded.config.memsolve_output_gate_rank == 8
+    assert loaded.config.memsolve_core_mode == "equilibrium"
     assert info == dict(missing_keys=[], unexpected_keys=[], mismatched_keys=[], error_msgs=[])
     assert loaded.get_input_embeddings().weight is loaded.get_output_embeddings().weight
     torch.testing.assert_close(loaded(**batch()).logits, model(**batch()).logits, rtol=0, atol=0)

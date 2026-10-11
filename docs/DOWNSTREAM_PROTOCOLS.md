@@ -1,20 +1,25 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # Optional dense downstream adapters
 
 Detection and segmentation are outside the current experimental scope. The
 adapters below are retained for development; no current MemSolve downstream
 accuracy or complete detector/segmenter validation is claimed.
 
-> Current source uses model contract 24 and CUDA contract 19. External position
+> Current source uses model contract 26 and native CUDA ABI 12. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
 
-The optional dense adapters share the current MemSolveViT encoder used by ImageNet:
-Q/K convolution, learned 2D absolute patch positions, Pre-LN, no CLS and no LayerScale.
-Local convolution and timm position interpolation use the actual patch grid,
-including rectangular padded images; the mixer consumes patch features and the
-validity mask. Updating this shared adapter does not constitute a new detection
-or segmentation experiment.
+The optional dense adapter uses the same restored operator with a historical
+GELU/mean-pooling encoder without LayerScale and learned patch positions for dynamic padded grids.
+It deliberately retains that adapter's learned-position path; the ImageNet
+CPE default is not a compatible pretrained backbone without an explicit study.
+These adapters are outside the current experimental scope.
 
 | Scale | Width | Depth | Heads | MemSolve rank | Feature taps |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -107,10 +112,10 @@ backbone; the launch examples below use Base.
 
 ## Pretrained checkpoint compatibility
 
-Current loading validates ImageNet envelope **12**, MemSolve model contract **24**
-and CUDA contract **19**. The independent-QKV architecture cannot load earlier
-shared-A checkpoints. A new matching ImageNet checkpoint is required; changing
-metadata or using `strict=False` is not a conversion.
+Loading validates the current ImageNet envelope and exact operator/vision
+contracts. A Q/K/V checkpoint cannot be loaded into the restored operator.
+The CPE ImageNet default is also distinct from this learned-position adapter;
+no new downstream results or checkpoint compatibility are claimed.
 
 The current compatibility check still expects the ViT³-style linear DropPath
 schedule. It rejects the constant-DropPath DeiT III checkpoints even when their
@@ -130,15 +135,11 @@ end-to-end throughput or evidence of COCO AP/ADE20K mIoU.
 
 ## Launch
 
-The launcher validates the CUDA/Triton runtime before MMEngine constructs
-the model. Delta uses the ordinary optimizer decay group, without a
-model-specific constraint or optimizer hook. New downstream runs require an explicit
-ImageNet checkpoint; they never silently train a paper result from scratch.
-The backbone verifies the checkpoint's current ImageNet contract and canonical
-digest, then checks its tier, MemSolve operator, and shared vision geometry before
-accepting any pretrained tensor. Q/K convolution weights transfer across patch
-grid sizes; RoPE tables are regenerated without position-table interpolation. Config filenames
-containing `deit3` are historical paths; their registered backbone is MemSolveViTBackbone.
+The launcher loads the matching native CUDA extension before model construction.
+The backbone verifies the checkpoint digest, tier, operator and vision geometry.
+Learned position tables are interpolated for its dynamic grids. Config filenames
+containing `deit3` retain their historical paths; the registered class remains
+MemSolveViTBackbone.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 experiments/train_openmmlab.py \

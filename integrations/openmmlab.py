@@ -1,7 +1,7 @@
-"""Thin OpenMMLab adapters for the ViT³-style MemSolve vision backbone.
+"""Thin OpenMMLab adapters for the DeiT III MemSolve vision backbone.
 
 This module owns framework registration and padded-image plumbing only. The
-operator remains entirely in :mod:`memsolve.ball`, while the ViT³-style encoder is
+operator remains entirely in :mod:`memsolve.ball`, while the DeiT III encoder is
 owned by :mod:`integrations.timm`.
 """
 
@@ -24,6 +24,7 @@ from integrations.timm import (
     vision_default_rank,
     vision_spec,
 )
+from memsolve import CoreMode
 
 
 def _validate_out_indices(
@@ -66,7 +67,7 @@ def _checkpoint_state(payload: dict[str, Any]) -> dict[str, torch.Tensor | objec
 
 
 class MemSolveViTBackbone(MemSolveViT):
-    """ViT³-style MemSolve features for Mask R-CNN/FPN and UperNet.
+    """DeiT III MemSolve features for Mask R-CNN/FPN and UperNet.
 
     Four intermediate plain-ViT maps are converted to strides 4, 8, 16, and
     32 with the same simple feature pyramid used by the XCiT downstream code.
@@ -79,9 +80,8 @@ class MemSolveViTBackbone(MemSolveViT):
         variant: str,
         image_size: int = 224,
         rank: int | None = None,
-        qk_conv_kernel_size: int = 3,
-        output_gate_rank: int = 32,
         out_indices: Sequence[int] | None = None,
+        core_mode: CoreMode | str = CoreMode.EQUILIBRIUM,
         bias: bool = True,
         implementation: str = "cuda",
         checkpoint: str | Path | None = None,
@@ -93,7 +93,7 @@ class MemSolveViTBackbone(MemSolveViT):
                 f"got {implementation!r}"
             )
         resolved_rank = vision_default_rank(variant) if rank is None else rank
-
+        resolved_mode = CoreMode(core_mode)
         self.variant = variant
         self.out_indices = _validate_out_indices(
             _variant_out_indices(variant) if out_indices is None else out_indices,
@@ -104,12 +104,6 @@ class MemSolveViTBackbone(MemSolveViT):
             "patch_size": 16,
             "num_classes": 1000,
             "mlp_ratio": 4.0,
-            "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
-            "layer_scale": False,
-            "class_token": False,
-            "pooling": "token_ln_mean",
-            "position_encoding": "learned_2d",
-            "drop_path_schedule": "linear",
             "norm_eps": 1e-6,
             "embed_dim": spec.embed_dim,
             "depth": spec.depth,
@@ -118,10 +112,9 @@ class MemSolveViTBackbone(MemSolveViT):
             "drop_path_rate": spec.drop_path_rate,
         }
         self._pretrained_operator_contract = {
+            "core_mode": resolved_mode.value,
             "bias": bias,
             "implementation": implementation,
-            "qk_conv_kernel_size": qk_conv_kernel_size,
-            "output_gate_rank": output_gate_rank,
         }
         super().__init__(
             image_size=image_size,
@@ -131,12 +124,12 @@ class MemSolveViTBackbone(MemSolveViT):
             depth=spec.depth,
             num_heads=spec.num_heads,
             rank=resolved_rank,
-            qk_conv_kernel_size=qk_conv_kernel_size,
-            output_gate_rank=output_gate_rank,
             mlp_ratio=4.0,
+            core_mode=resolved_mode,
             bias=bias,
             implementation=implementation,
             drop_path_rate=spec.drop_path_rate,
+            position_encoding="learned",
             dynamic_img_size=True,
             dynamic_img_pad=True,
         )
@@ -249,7 +242,7 @@ class MemSolveViTBackbone(MemSolveViT):
         ).squeeze(1).to(dtype=torch.bool)
         if pooled.shape[-2:] != (grid_height, grid_width):
             raise RuntimeError(
-                "patch validity grid does not match the ViT³-style patch embedding"
+                "patch validity grid does not match the DeiT III patch embedding"
             )
         return pooled
 

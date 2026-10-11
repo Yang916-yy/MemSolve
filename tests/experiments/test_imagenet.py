@@ -253,8 +253,8 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "image_size": 224,
         "patch_size": 16,
         "num_classes": 1000,
-        "mlp_ratio": 4.0,
-        "architecture": "vit3_qkconv_lpe2d_mean_swiglu_v5", "ffn": "swiglu",
+        "mlp_ratio": 4.125,
+        "architecture": "vit3_cpe_accretive_mean_gelu_v7", "ffn": "gelu",
         "layer_scale": False,
         "class_token": False,
         "pooling": "token_ln_mean",
@@ -265,7 +265,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
         "rank": 32,
         "drop_path_rate": 0.1,
         "drop_path_schedule": "linear",
-        "position_encoding": "learned_2d",
+        "position_encoding": "cpe",
     }
     assert (run.train["epochs"], run.train["optimizer"], run.train["augmentation"]) == (
         300,
@@ -280,8 +280,7 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
     ) == (512, 1024)
     assert (run.train["train_workers"], run.train["val_workers"]) == (12, 4)
     assert run.operator == {
-        "qk_conv_kernel_size": 3,
-        "output_gate_rank": 32,
+        "core_mode": "equilibrium",
         "bias": True,
         "implementation": "cuda",
     }
@@ -961,7 +960,7 @@ def test_checkpoint_model_state_preserves_memsolve_contract_entries() -> None:
 
     target = MemSolve(MemSolveConfig(16, 2, rank=4))
     target.load_state_dict(restored, strict=True)
-    torch.testing.assert_close(target.core_delta, source.core_delta)
+    torch.testing.assert_close(target.core_base_raw, source.core_base_raw)
 
     with pytest.raises(ValueError, match="MemSolve _extra_state"):
         _checkpoint_model_state({"model": {"unexpected": {}}})
@@ -1218,19 +1217,19 @@ def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
     assert source['source_weights'] == 'model_ema'
     for loaded, shadow in zip(fresh.parameters(), ema.module.parameters()):
         torch.testing.assert_close(loaded, shadow, rtol=0, atol=0)
-    # The formal Base transition must resize ordinary or EMA patch positions.
+    # The resolution transition reuses CPE weights for both ordinary and EMA models.
     larger = create_memsolve_vit(image_size=224, num_classes=2, embed_dim=32,
         depth=1, num_heads=2, rank=16, mlp_ratio=4., bias=True)
     for selection, owner in [('model', model), ('model_ema', ema.module)]:
         payload['selected_weights'] = selection
         torch.save(payload, path)
         imagenet._load_finetune(path, model=larger, run=ft)
-        expected = imagenet.interpolate_position_embedding(
-            owner.encoder.pos_embed, larger.encoder.pos_embed)
-        torch.testing.assert_close(larger.encoder.pos_embed, expected)
+        assert owner.encoder.pos_embed is None and larger.encoder.pos_embed is None
+        torch.testing.assert_close(larger.blocks[0].cpe.weight, owner.blocks[0].cpe.weight)
         torch.testing.assert_close(larger.encoder.patch_embed.proj.weight,
                                    owner.encoder.patch_embed.proj.weight)
-    assert 'encoder.pos_embed' in imagenet._no_weight_decay(larger)
+    assert 'encoder.cls_token' not in imagenet._no_weight_decay(larger)
+    assert 'encoder.pos_embed' not in imagenet._no_weight_decay(larger)
     # Resume always restores raw optimizer-owned weights, even from EMA best.
     assert _load_resume(path, **kwargs) == (5, 73.5, 72.0)
     for loaded, raw in zip(target.parameters(), model.parameters()):
@@ -1399,10 +1398,10 @@ def test_imagenet_optimizer_uses_plain_fused_adamw_with_delta_weight_decay(tmp_p
     assert not optimizer._optimizer_step_pre_hooks
     assert not optimizer._optimizer_step_post_hooks
     delta_groups = [group for group in optimizer.param_groups
-                    if any(p is model.core_delta for p in group["params"])]
+                    if any(p is model.core_base_raw for p in group["params"])]
     assert len(delta_groups) == 1
     assert delta_groups[0]["weight_decay"] == .05
-    assert torch.count_nonzero(model.core_delta) == 0
+    assert torch.count_nonzero(model.core_base_raw) == 0
 
 
 
@@ -1617,7 +1616,7 @@ def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path, ti
     from timm.optim.lamb import Lamb
     torch.manual_seed(17)
     actual = torch.nn.Module()
-    actual.core_delta = torch.nn.Parameter(torch.zeros(2, 4, 4, device='cuda'))
+    actual.core_base_raw = torch.nn.Parameter(torch.zeros(2, 4, 4, device='cuda'))
     actual.linear = torch.nn.Linear(8, 16, device='cuda')
     reference = copy.deepcopy(actual)
     run = load_run(parse_args(['--config', str(config), '--tier', tier,
@@ -1634,7 +1633,7 @@ def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path, ti
         expected.step()
         for a, b in zip(actual.parameters(), reference.parameters()):
             torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-7)
-    assert actual.core_delta.abs().sum() > 0
+    assert actual.core_base_raw.abs().sum() > 0
 
 
 @pytest.mark.cuda

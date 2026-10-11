@@ -1,4 +1,4 @@
-from .config import MemSolveConfig
+from .config import CoreMode, MemSolveConfig
 from .model import MemSolve
 
-__all__ = ["MemSolve", "MemSolveConfig"]
+__all__ = ["CoreMode", "MemSolve", "MemSolveConfig"]

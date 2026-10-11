@@ -7,7 +7,7 @@ num_classes = 1000
 patch_size = 16
 mlp_ratio = 4.0
 norm_eps = 1.0e-6
-position_encoding = "learned_2d"
+position_encoding = "cpe"
 epochs = 300
 warmup_epochs = 20
 warmup_lr = 1.0e-6
@@ -40,8 +40,7 @@ bce_loss = false
 label_smoothing = 0.1
 
 [operator]
-qk_conv_kernel_size = 3
-output_gate_rank = 32
+core_mode = "equilibrium"
 bias = true
 implementation = "cuda"
 
@@ -55,8 +54,7 @@ drop_path_rate = 0.0
 input_size = 224
 
 [tiers.small]
-# SwiGLU gate width 1024 (packed input projection 2048): 20,697,448 parameters with head.
-# Inherits mlp_ratio=4.0: gate width = (8/3) * embed_dim.
+mlp_ratio = 4.125
 embed_dim = 384
 depth = 12
 num_heads = 6

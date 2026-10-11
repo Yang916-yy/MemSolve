@@ -1,170 +1,82 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
-from dataclasses import asdict, dataclass
-import importlib.util
+import importlib
+import os
+from pathlib import Path
+from threading import Lock
 
 import torch
 
+_LOAD_LOCK = Lock()
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
-_CUDA_CONTRACT_VERSION = 19
+_NATIVE_CONTRACT_VERSION = 12
+_RUNTIME_PACKAGE = "memsolve_cuda_runtime"
+_LOADED_ARCHITECTURE: int | None = None
 
 
-@dataclass(frozen=True)
-class _LaunchConfig:
-    tokens: int
-    warps: int
-    stages: int = 1
-
-
-_TUNE_LAUNCHES = ContextVar("memsolve_tune_launches", default=False)
-# Only scalar metadata is retained: never keep a training tensor or graph alive.
-_LAUNCH_PLANS: dict[tuple, dict] = {}
-
-
-@contextmanager
-def autotune():
-    """Measure token-kernel configurations during eager forward/backward warmup.
-
-    Use before CUDA Graph capture and preferably on an otherwise idle GPU.
-    Results are cached per device and workload for this process. Normal calls
-    only validate resources and keep the existing schedule when it fits.
-    """
-    token = _TUNE_LAUNCHES.set(True)
-    try:
-        yield
-    finally:
-        _TUNE_LAUNCHES.reset(token)
-
-
-def launch_report() -> list[dict]:
-    """Return JSON-compatible resource/timing records, without GPU synchronization."""
-    from copy import deepcopy
-
-    return deepcopy(list(_LAUNCH_PLANS.values()))
-
-
-@lru_cache(maxsize=None)
-def _device_resources(index: int) -> tuple:
-    prop = torch.cuda.get_device_properties(index)
+def _native_operator_abi_is_registered() -> bool:
+    namespace = getattr(torch.ops, "memsolve_equilibrium", None)
     return (
-        index, str(prop.uuid), prop.major, prop.minor,
-        prop.shared_memory_per_block_optin,
-        prop.shared_memory_per_multiprocessor, prop.regs_per_multiprocessor,
+        namespace is not None
+        and hasattr(namespace, "compact_lu")
+        and hasattr(namespace, "compact_getrs")
     )
 
 
-def _launch_candidates(default: _LaunchConfig) -> tuple[_LaunchConfig, ...]:
-    # Bounded search, inspired by Mamba-2's Triton launch configurations.
-    # Keep arithmetic/dtypes fixed. Smaller tiles provide lower-resource options;
-    # two stages are an optional latency-hiding alternative, never mandatory.
-    return tuple(dict.fromkeys((
-        default,
-        _LaunchConfig(default.tokens, 2 if default.warps == 4 else 4),
-        _LaunchConfig(max(16, default.tokens // 2), default.warps),
-        _LaunchConfig(16, 4),
-        _LaunchConfig(default.tokens, default.warps, 2),
-    )))
+def _native_contract_version() -> int | None:
+    """Return the registered native contract version, if the query exists."""
+
+    namespace = getattr(torch.ops, "memsolve_equilibrium", None)
+    if namespace is None or not hasattr(namespace, "contract_version"):
+        return None
+    try:
+        version = namespace.contract_version()
+    except RuntimeError:
+        return None
+    return version if isinstance(version, int) else None
 
 
-def _launch_token(kind, kernel, device, signature, default, prepare):
-    # A tensor on cuda:1 must never reuse cuda:0's resource plan or compile for
-    # cuda:0 merely because that device happens to be current in the caller.
-    with torch.cuda.device(device):
-        return _launch_token_on_device(kind, kernel, device, signature, default, prepare)
-
-
-def _launch_token_on_device(kind, kernel, device, signature, default, prepare):
-    """Select a schedule, then allocate exactly its partial buffers and launch.
-
-    prepare(config) returns (arguments, grid, finish, workspace_bytes). finish
-    includes partial reduction, so tuning measures the whole token operation,
-    not a kernel that wins by exporting more work to a later reduction.
-    Every candidate overwrites its outputs; none updates model parameters.
-    """
-    from triton.runtime.errors import OutOfResources
-
-    resources = _device_resources(device.index)
-    key = (resources, kind, signature)
-    plan = _LAUNCH_PLANS.get(key)
-    tuning = _TUNE_LAUNCHES.get()
-    if plan is not None and (not tuning or plan["tuned"]):
-        config = _LaunchConfig(**plan["selected"])
-        args, grid, finish, _ = prepare(config)
-        kernel[grid](*args, num_warps=config.warps, num_stages=config.stages)
-        return finish()
-
-    with torch.cuda.device(device):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "MemSolve launch configuration is cold: run eager forward/backward "
-                "warmup for this shape before CUDA Graph capture"
-            )
-        records = []
-        winner = None
-        best_ms = float("inf")
-        for config in _launch_candidates(default):
-            options = dict(num_warps=config.warps, num_stages=config.stages)
-            record = {"config": asdict(config)}
-            args = finish = None
-            try:
-                # Smaller token tiles use less on-chip storage but may need
-                # MORE global partial-buffer memory. An oversized tuning
-                # candidate must not discard another viable schedule.
-                args, grid, finish, workspace = prepare(config)
-                record["workspace_bytes"] = workspace
-                compiled = kernel.warmup(*args, grid=grid, **options)
-                shared = compiled.metadata.shared
-                record["shared_bytes"] = shared
-                if shared > resources[4]:
-                    raise OutOfResources(shared, resources[4], "shared memory")
-                # Load through Triton's public launch path, which also validates
-                # thread/tensor-memory limits and populates register metadata.
-                kernel[grid](*args, **options)
-                record.update(registers=compiled.n_regs, spills=compiled.n_spills)
-                if tuning:
-                    from triton.testing import do_bench_cudagraph
-
-                    def run():
-                        kernel[grid](*args, **options)
-                        return finish()
-
-                    record["milliseconds"] = do_bench_cudagraph(run, rep=10)
-                    if record["milliseconds"] < best_ms:
-                        winner, best_ms = config, record["milliseconds"]
-                else:
-                    winner = config
-                records.append(record)
-            except (OutOfResources, torch.cuda.OutOfMemoryError) as error:
-                record["rejected"] = str(error)
-                records.append(record)
-            # Do not retain the last candidate's workspace during the next one.
-            del args, finish
-            if winner is not None and not tuning:
-                break
-        if winner is None:
-            raise RuntimeError(
-                f"No resource-compatible MemSolve {kind} configuration on {device}: {records}"
-            )
-        _LAUNCH_PLANS[key] = {
-            "device": list(resources), "kernel": kind, "signature": list(signature),
-            "selected": asdict(winner), "tuned": tuning, "candidates": records,
-        }
-    args, grid, finish, _ = prepare(winner)
-    kernel[grid](*args, num_warps=winner.warps, num_stages=winner.stages)
-    return finish()
+def _check_native_contract() -> None:
+    version = _native_contract_version()
+    if version is None:
+        raise RuntimeError(
+            "the loaded MemSolve CUDA extension does not expose the required native "
+            f"contract version {_NATIVE_CONTRACT_VERSION}; rebuild it with "
+            "tools/build_cuda.sh and restart the process"
+        )
+    if version != _NATIVE_CONTRACT_VERSION:
+        raise RuntimeError(
+            "the loaded MemSolve CUDA extension has native contract version "
+            f"{version}, but this package requires {_NATIVE_CONTRACT_VERSION}; "
+            "rebuild it with tools/build_cuda.sh and restart the process"
+        )
 
 
 def is_available() -> bool:
-    """The fast path uses PyTorch CUDA and Triton; no native MemSolve library."""
-    return torch.cuda.is_available() and importlib.util.find_spec("triton") is not None
+    """Return whether the compact-solve runtime is registered."""
+
+    return (
+        _native_operator_abi_is_registered()
+        and _native_contract_version() == _NATIVE_CONTRACT_VERSION
+    )
 
 
 def require_available() -> None:
-    if not is_available():
-        raise RuntimeError("the MemSolve CUDA fast path requires CUDA PyTorch and Triton")
+    """Reject an explicit CUDA request until its extension is loaded."""
+
+    with _LOAD_LOCK:
+        if _LOADED_ARCHITECTURE is not None:
+            return
+        if not is_available():
+            if _native_operator_abi_is_registered():
+                _check_native_contract()
+            raise RuntimeError(
+                "the MemSolve accretive-equilibrium CUDA extension is not loaded; "
+                "install the matching precompiled runtime wheel or build it with "
+                "tools/build_cuda.sh, then call memsolve.ball.cuda.load(); "
+                f"native contract version {_NATIVE_CONTRACT_VERSION} is required"
+            )
 
 
 def _device_architecture(device: torch.device | int | None = None) -> int:
@@ -179,7 +91,7 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
         resolved_device = torch.device(device)
     if resolved_device.type != "cuda":
         raise ValueError(
-            f"the MemSolve CUDA fast path requires a CUDA device, got {resolved_device}"
+            "the MemSolve CUDA fast path requires a CUDA device, " f"got {resolved_device}"
         )
     if resolved_device.index is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
@@ -196,233 +108,136 @@ def _device_architecture(device: torch.device | int | None = None) -> int:
     return architecture
 
 
-def load(*, device: torch.device | int | None = None) -> None:
-    """Validate the requested CUDA runtime before kernel compilation/capture."""
-    require_available()
-    _device_architecture(device)
+def _packaged_library_path(architecture: int) -> Path | None:
+    """Return the matching release runtime library when its wheel is installed."""
+
+    try:
+        runtime = importlib.import_module(_RUNTIME_PACKAGE)
+    except ModuleNotFoundError as error:
+        if error.name == _RUNTIME_PACKAGE:
+            return None
+        raise RuntimeError(
+            "the installed MemSolve CUDA runtime wheel could not be imported"
+        ) from error
+
+    from memsolve import __version__ as package_version
+
+    expected = {
+        "MEMSOLVE_VERSION": package_version,
+        "NATIVE_CONTRACT_VERSION": _NATIVE_CONTRACT_VERSION,
+        "TORCH_VERSION": torch.__version__,
+        "CUDA_VERSION": torch.version.cuda or "",
+        "CXX11_ABI": int(torch.compiled_with_cxx11_abi()),
+    }
+    for name, value in expected.items():
+        if getattr(runtime, name, None) != value:
+            raise RuntimeError(
+                "the installed MemSolve CUDA runtime wheel is incompatible: "
+                f"{name} is {getattr(runtime, name, None)!r}, expected {value!r}"
+            )
+    architectures = getattr(runtime, "ARCHITECTURES", ())
+    if architecture not in architectures:
+        raise RuntimeError(
+            "the installed MemSolve CUDA runtime wheel does not contain "
+            f"memsolve_equilibrium_sm{architecture}.so"
+        )
+    library_path = getattr(runtime, "library_path", None)
+    if not callable(library_path):
+        raise RuntimeError(
+            "the installed MemSolve CUDA runtime wheel does not expose library_path()"
+        )
+    return Path(library_path(architecture))
 
 
-@lru_cache(maxsize=1)
-def _rotary_kernel():
-    # Interleaved-pair loading and conjugate backward follow FLA rotary.py
-    # (MIT; see NOTICE). Specialize to packed [Q,K,V], copying V in the same
-    # launch, with no full-size FP32 intermediate or saved input activations.
-    from triton import jit
-    import triton.language as tl
-
-    @jit
-    def rotate(X, COS, SIN, Y, SIZE: tl.constexpr, N: tl.constexpr,
-               C: tl.constexpr, H: tl.constexpr, R: tl.constexpr,
-               CONJUGATE: tl.constexpr, BLOCK: tl.constexpr):
-        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        channel = offset % C
-        token = (offset // C) % N
-        valid = offset < SIZE
-        is_qk = channel < 2 * H * R
-        pair = (channel % R) // 2
-        cosine = tl.load(COS + token * (R // 2) + pair, valid & is_qk, other=1).to(tl.float32)
-        sine = tl.load(SIN + token * (R // 2) + pair, valid & is_qk, other=0).to(tl.float32)
-        x = tl.load(X + offset, valid, other=0).to(tl.float32)
-        mate = tl.load(X + offset + 1 - 2 * (channel % 2), valid & is_qk, other=0).to(tl.float32)
-        if CONJUGATE:
-            sine = -sine
-        base, cross = x * cosine, mate * sine
-        rotated = tl.where(channel % 2 == 0, base - cross, base + cross)
-        tl.store(Y + offset, tl.where(is_qk, rotated, x), valid)
-
-    return rotate
-
-
-def _rotate_packed(projected, num_heads, cos, sin, *, conjugate):
-    projected = projected.contiguous()
-    output = torch.empty_like(projected)
-    batch, length, width = projected.shape
-    size = batch * length * width
-    _rotary_kernel()[((size + 511) // 512,)](
-        projected, cos, sin, output, size, length, width, num_heads, 2 * cos.shape[1],
-        conjugate, 512, num_warps=4, enable_fp_fusion=False,
+def _development_library_path(architecture: int) -> Path:
+    repository_root = Path(__file__).resolve().parents[2]
+    return (
+        repository_root
+        / "build"
+        / "cuda"
+        / "lib"
+        / f"memsolve_equilibrium_sm{architecture}.so"
     )
-    return output
 
 
-class _RotaryQK(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, projected, num_heads, cos, sin):
-        ctx.num_heads = num_heads
-        ctx.save_for_backward(cos, sin)
-        return _rotate_packed(projected, num_heads, cos, sin, conjugate=False)
+def _default_library_path(device: torch.device | int | None = None) -> Path:
+    override = os.environ.get("MEMSOLVE_CUDA_LIBRARY")
+    if override:
+        return Path(override).expanduser()
 
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, gradient):
-        cos, sin = ctx.saved_tensors
-        return _rotate_packed(gradient, ctx.num_heads, cos, sin, conjugate=True), None, None, None
+    architecture = _device_architecture(device)
+    development = _development_library_path(architecture)
+    if development.is_file():
+        return development
+    packaged = _packaged_library_path(architecture)
+    return packaged if packaged is not None else development
 
 
-def rotary_qk(projected, num_heads, cos, sin):
-    """Packed Q/K rotation; tables obey reference.axial_rotary_tables."""
-    if projected.device.type != "cuda" or projected.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("CUDA RoPE requires CUDA float16/bfloat16/float32 projections")
-    if projected.ndim != 3 or min(projected.shape) <= 0:
-        raise ValueError("CUDA RoPE requires nonempty [B,N,C] projections")
-    if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
-        raise ValueError("CUDA RoPE requires positive num_heads")
-    if cos.ndim != 2 or cos.shape != sin.shape or cos.shape[0] != projected.shape[1] or cos.shape[1] <= 0:
-        raise ValueError("CUDA RoPE tables must have shape [N,rank/2]")
-    if projected.shape[-1] <= 4 * num_heads * cos.shape[1]:
-        raise ValueError("CUDA RoPE requires packed Q/K and nonempty V")
-    for table in (cos, sin):
-        if table.device != projected.device or table.dtype != torch.float32 or not table.is_contiguous():
-            raise TypeError("CUDA RoPE requires contiguous FP32 tables on the projection device")
-        if table.requires_grad:
-            raise ValueError("CUDA RoPE uses fixed positional frequencies")
-    load(device=projected.device)
-    return _RotaryQK.apply(projected, num_heads, cos, sin)
+def load(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    device: torch.device | int | None = None,
+) -> None:
+    """Load one explicitly built strict CUDA extension."""
+
+    global _LOADED_ARCHITECTURE
+    requested_architecture = _device_architecture(device)
+    with _LOAD_LOCK:
+        if is_available():
+            if (
+                _LOADED_ARCHITECTURE is not None
+                and _LOADED_ARCHITECTURE != requested_architecture
+            ):
+                raise RuntimeError(
+                    "the loaded MemSolve CUDA extension targets "
+                    f"SM{_LOADED_ARCHITECTURE}, not requested SM{requested_architecture}"
+                )
+            return
+        if _native_operator_abi_is_registered():
+            _check_native_contract()
+
+        library = Path(path) if path is not None else _default_library_path(device)
+        library = library.expanduser().resolve()
+        expected_name = f"memsolve_equilibrium_sm{requested_architecture}.so"
+        if library.name != expected_name:
+            raise RuntimeError(
+                "the strict MemSolve CUDA fast path requires "
+                f"{expected_name} for SM{requested_architecture}, got {library.name}"
+            )
+        if not library.is_file():
+            raise RuntimeError(
+                "the MemSolve CUDA extension was not found at "
+                f"{library}; build it with tools/build_cuda.sh or pass its path to load()"
+            )
+
+        torch.ops.load_library(str(library))
+        _check_native_contract()
+        _LOADED_ARCHITECTURE = requested_architecture
 
 
 @lru_cache(maxsize=1)
-def _local_pack_kernel():
-    # FLA-style adjacent-pair RoPE, fused with packing / unpacking and masking.
-    # The depthwise convolution itself stays in cuDNN.
+def _no_frame_kernels():
+    # Lazily import the Triton supplied by CUDA PyTorch, as for projections.
     from triton import jit
     import triton.language as tl
 
     @jit
-    def pack(QK, V, COS, SIN, MASK, PACKED,
-             SIZE: tl.constexpr, N: tl.constexpr, C: tl.constexpr,
-             Q: tl.constexpr, R: tl.constexpr, V0: tl.constexpr, V1: tl.constexpr,
-             ROPE: tl.constexpr, MASKED: tl.constexpr, BACKWARD: tl.constexpr,
-             BLOCK: tl.constexpr):
-        o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        c, row = o % C, o // C
-        b, n = row // N, row % N
-        valid = o < SIZE
-        active = valid
-        if MASKED:
-            active = active & tl.load(MASK + row, valid, 0)
-        is_qk = c < Q
-        if BACKWARD:
-            x = tl.load(PACKED + o, active, 0).to(tl.float32)
-        else:
-            qk = tl.load(QK + row * Q + c, active & is_qk, 0).to(tl.float32)
-            v = tl.load(V + b * V0 + n * V1 + c - Q, active & ~is_qk, 0).to(tl.float32)
-            x = tl.where(is_qk, qk, v)
-        if ROPE:
-            phase = n * (R // 2) + (c % R) // 2
-            co = tl.load(COS + phase, active & is_qk, 1)
-            si = tl.load(SIN + phase, active & is_qk, 0)
-            if BACKWARD:
-                mate = tl.load(PACKED + o + 1 - 2 * (c % 2), active & is_qk, 0).to(tl.float32)
-                si = -si
-            else:
-                mate = tl.load(QK + row * Q + (c ^ 1), active & is_qk, 0).to(tl.float32)
-            base, cross = x * co, mate * si
-            x = tl.where(c % 2 == 0, base - cross, base + cross)
-        if BACKWARD:
-            tl.store(QK + row * Q + c, x, valid & is_qk)
-            tl.store(V + row * (C - Q) + c - Q, x, valid & ~is_qk)
-        else:
-            tl.store(PACKED + o, x, valid)
-    return pack
-
-
-class _PackLocalQK(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, qk, value, cos, sin, mask):
-        batch, length, channels = qk.shape
-        width = channels + value.shape[-1]
-        output = torch.empty((batch, length, width), device=qk.device, dtype=qk.dtype)
-        args = (batch * length * width, length, width, channels,
-                0 if cos is None else 2 * cos.shape[1], value.stride(0), value.stride(1),
-                cos is not None, mask is not None)
-        _local_pack_kernel()[((output.numel() + 511) // 512,)](
-            qk, value, cos, sin, mask, output, *args, False, 512,
-            num_warps=4, enable_fp_fusion=False,
-        )
-        ctx.save_for_backward(cos, sin, mask)
-        ctx.args = args
-        return output
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, gradient):
-        cos, sin, mask = ctx.saved_tensors
-        batch, length, width = gradient.shape
-        channels = ctx.args[3]
-        qk = torch.empty((batch, length, channels), device=gradient.device, dtype=gradient.dtype)
-        value = torch.empty((batch, length, width - channels), device=gradient.device, dtype=gradient.dtype)
-        _local_pack_kernel()[((gradient.numel() + 511) // 512,)](
-            qk, value, cos, sin, mask, gradient.contiguous(), *ctx.args, True, 512,
-            num_warps=4, enable_fp_fusion=False,
-        )
-        return qk, value, None, None, None
-
-
-def local_qk(projected, weight, *, cos=None, sin=None, valid_mask=None, spatial_shape=None):
-    """Native channels-last convolution plus fused QKV packing/RoPE/masking.
-
-    A sequence is a 1 x N grid and its width-k filter is a 1 x k kernel. This
-    equals centered Conv1d exactly, while letting cuDNN retain channels-last
-    activations in both modalities. Invalid input rows are zeroed by the model.
-    """
-    import torch.nn.functional as functional
-
-    batch, length, width = projected.shape
-    channels = weight.shape[0]
-    shape = (1, length) if spatial_shape is None else spatial_shape
-    qk, value = projected.split((channels, width - channels), -1)
-    with torch.autocast('cuda', enabled=False):
-        x = qk.reshape(batch, *shape, channels).permute(0, 3, 1, 2)
-        x = x.contiguous(memory_format=torch.channels_last)
-        w = weight.to(torch.bfloat16)
-        if spatial_shape is None:
-            w = w.unsqueeze(2)
-        qk = functional.conv2d(x, w, padding=(w.shape[-2] // 2, w.shape[-1] // 2), groups=channels)
-        qk = qk.flatten(2).transpose(1, 2).contiguous()
-        return _PackLocalQK.apply(qk, value, cos, sin, valid_mask)
-
-
-@lru_cache(maxsize=1)
-def _token_kernels():
-    """Parallel token tiles, compact reduction, then a separate readout.
-
-    The decomposition follows FLA's selective-fusion pattern. BF16x3 is
-    Triton's upstream FP32-input Tensor Core decomposition, also implemented
-    by OpenXLA following Henry et al. (2019). FP32 storage and accumulation
-    are retained; no direct FP16 cast of unbounded coefficients or adjoints.
-    BF16 Q/K/V statistics use ordinary BF16 dots. The normalized readout and
-    its coefficient VJP use three residual products for the FP32 operand,
-    retaining the low component omitted by ordinary BF16x3.
-    The grid traverses (head, token tile, batch), keeping heads/tokens local
-    before advancing to another sample, following FLA chunk-kernel scheduling.
-    """
-    from triton import jit
-    import triton.language as tl
-
-    @jit
-    def wide_dot(a, b):
-        return tl.dot(a.to(tl.float32), b.to(tl.float32), input_precision="bf16x3")
-
-    @jit
-    def mixed_dot(a, b):
-        # A is exactly BF16. Three residual components of the FP32 operand
-        # retain its mantissa; ordinary BF16x3 omits the third component.
-        # Accumulate small products first so the large term rounds only once.
+    def _mixed_dot(a, b):
+        # The token operand is already BF16. Preserve the compact FP32
+        # coefficient with two BF16 words (Henry et al., arXiv:1904.06376).
+        # One BF16 rounding fails the scale-64 forward/gradient envelope.
         hi = b.to(tl.bfloat16)
-        residual = b - hi.to(tl.float32)
-        mid = residual.to(tl.bfloat16)
-        lo = (residual - mid.to(tl.float32)).to(tl.bfloat16)
-        result = tl.dot(a, lo)
-        result = tl.dot(a, mid, result)
-        return tl.dot(a, hi, result)
+        lo = (b - hi.to(tl.float32)).to(tl.bfloat16)
+        return tl.dot(a, hi) + tl.dot(a, lo)
 
     @jit
-    def statistics(
+    def _statistics(
         X,
         E,
         COUNT,
         G,
-        S,
+        Q,
+        DE,
         N: tl.constexpr,
         H: tl.constexpr,
         R: tl.constexpr,
@@ -434,57 +249,53 @@ def _token_kernels():
         BD: tl.constexpr,
         BT: tl.constexpr,
     ):
-        pid = tl.program_id(0)
-        tiles = tl.cdiv(N, BT)
-        h, tile, b = pid % H, (pid // H) % tiles, pid // (H * tiles)
-        s = b * H + h
+        s = tl.program_id(0)
+        tile = tl.program_id(1)
+        b = s // H
+        h = s % H
         count = tl.load(COUNT + b) if HAS_COUNT else float(N)
         n = tile * BT + tl.arange(0, BT)
         r = tl.arange(0, BR)
-        # Forward uses keys; the readout adjoint uses independent queries.
-        offset = 0 if GRAD else H * R
+        d = tl.arange(0, BD)
         a = tl.load(
-            X + (b * N + n[:, None]) * (H * (2 * R + D)) + offset + h * R + r[None, :],
+            X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
             (n[:, None] < N) & (r[None, :] < R),
             0,
         )
         if not GRAD:
-            g = tl.dot(tl.trans(a), a) / count
+            g = tl.dot(tl.trans(a), a).to(tl.float32) / count
             tl.store(
                 G + ((s * T + tile) * R + r[:, None]) * R + r[None, :],
-                g,
-                (r[:, None] < R) & (r[None, :] < R),
+                g, (r[:, None] < R) & (r[None, :] < R),
             )
-        for c in range(tl.cdiv(D, BD)):
-            d = c * BD + tl.arange(0, BD)
+        de = tl.full((), 0.0, tl.float32)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            c = tl.load(
+                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D), 0,
+            )
             if GRAD:
-                v = tl.load(
+                e = tl.load(
                     E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
-                    (n[:, None] < N) & (d[None, :] < D),
-                    0,
+                    (n[:, None] < N) & (d[None, :] < D), 0,
                 )
-                result = wide_dot(tl.trans(a), v) / tl.sqrt(count)
+                q = tl.dot(tl.trans(a), e).to(tl.float32) / tl.sqrt(count)
+                de += tl.sum(tl.sum(e.to(tl.float32) * c.to(tl.float32), 0), 0)
             else:
-                v = tl.load(
-                    X
-                    + (b * N + n[:, None]) * (H * (2 * R + D))
-                    + 2 * H * R
-                    + h * D
-                    + d[None, :],
-                    (n[:, None] < N) & (d[None, :] < D),
-                    0,
-                )
-                result = tl.dot(tl.trans(a), v) / tl.sqrt(count)
+                q = tl.dot(tl.trans(a), c).to(tl.float32) / tl.sqrt(count)
             tl.store(
-                S + ((s * T + tile) * R + r[:, None]) * D + d[None, :],
-                result,
-                (r[:, None] < R) & (d[None, :] < D),
+                Q + ((s * T + tile) * R + r[:, None]) * D + d[None, :],
+                q, (r[:, None] < R) & (d[None, :] < D),
             )
+        if GRAD:
+            tl.store(DE + s * T + tile, de)
 
     @jit
-    def readout(
+    def _readout(
         X,
-        COEF,
+        V,
+        ETA,
         COUNT,
         Y,
         N: tl.constexpr,
@@ -496,25 +307,33 @@ def _token_kernels():
         BD: tl.constexpr,
         BT: tl.constexpr,
     ):
-        pid = tl.program_id(0)
-        tiles = tl.cdiv(N, BT)
-        h, tile, b = pid % H, (pid // H) % tiles, pid // (H * tiles)
-        s = b * H + h
+        s = tl.program_id(0)
+        tile = tl.program_id(1)
+        b = s // H
+        h = s % H
         count = tl.load(COUNT + b) if HAS_COUNT else float(N)
-        n, r = tile * BT + tl.arange(0, BT), tl.arange(0, BR)
-        q = tl.load(
-            X + (b * N + n[:, None]) * (H * (2 * R + D)) + h * R + r[None, :],
+        n = tile * BT + tl.arange(0, BT)
+        r = tl.arange(0, BR)
+        d = tl.arange(0, BD)
+        a = tl.load(
+            X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
             (n[:, None] < N) & (r[None, :] < R),
             0,
         )
-        for c in range(tl.cdiv(D, BD)):
-            d = c * BD + tl.arange(0, BD)
-            coef = tl.load(
-                COEF + (s * R + r[:, None]) * D + d[None, :],
+        eta = tl.load(ETA + h)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            c = tl.load(
+                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D),
+                0,
+            ).to(tl.float32)
+            v = tl.load(
+                V + (s * R + r[:, None]) * D + d[None, :],
                 (r[:, None] < R) & (d[None, :] < D),
                 0,
-            )
-            y = wide_dot(q, coef) / tl.sqrt(count)
+            ).to(tl.float32)
+            y = eta * c + _mixed_dot(a, v) / tl.sqrt(count)
             tl.store(
                 Y + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
                 y,
@@ -522,12 +341,13 @@ def _token_kernels():
             )
 
     @jit
-    def backward(
+    def _token_backward(
         X,
         E,
-        COEF,
+        V,
         DG,
-        DS,
+        DQ,
+        ETA,
         COUNT,
         DX,
         N: tl.constexpr,
@@ -535,729 +355,576 @@ def _token_kernels():
         R: tl.constexpr,
         D: tl.constexpr,
         HAS_COUNT: tl.constexpr,
-        QUERY_GRAD: tl.constexpr,
         BR: tl.constexpr,
         BD: tl.constexpr,
         BT: tl.constexpr,
     ):
-        pid = tl.program_id(0)
-        tiles = tl.cdiv(N, BT)
-        h, tile, b = pid % H, (pid // H) % tiles, pid // (H * tiles)
-        s = b * H + h
+        s = tl.program_id(0)
+        tile = tl.program_id(1)
+        b = s // H
+        h = s % H
         count = tl.load(COUNT + b) if HAS_COUNT else float(N)
-        inv = 1.0 / tl.sqrt(count)
-        n, r = tile * BT + tl.arange(0, BT), tl.arange(0, BR)
-        k = tl.load(
-            X + (b * N + n[:, None]) * (H * (2 * R + D)) + H * R + h * R + r[None, :],
+        n = tile * BT + tl.arange(0, BT)
+        r = tl.arange(0, BR)
+        d = tl.arange(0, BD)
+        a = tl.load(
+            X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
             (n[:, None] < N) & (r[None, :] < R),
             0,
         )
-        dg = tl.load(
+        g = tl.load(
             DG + (s * R + r[:, None]) * R + r[None, :],
             (r[:, None] < R) & (r[None, :] < R),
             0,
         )
-        dk = wide_dot(k, dg + tl.trans(dg)) * (inv * inv)
-        dq = tl.full((BT, BR), 0.0, tl.float32)
-        for c in range(tl.cdiv(D, BD)):
-            d = c * BD + tl.arange(0, BD)
-            v = tl.load(
-                X
-                + (b * N + n[:, None]) * (H * (2 * R + D))
-                + 2 * H * R
-                + h * D
-                + d[None, :],
+        g = (g + tl.trans(g)).to(tl.float32)
+        inv = 1.0 / tl.sqrt(count)
+        eta = tl.load(ETA + h)
+        da = _mixed_dot(a, g) * (inv * inv)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            c = tl.load(
+                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
                 (n[:, None] < N) & (d[None, :] < D),
                 0,
             )
-            if QUERY_GRAD:
-                e = tl.load(
-                    E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
-                    (n[:, None] < N) & (d[None, :] < D),
-                    0,
-                )
-                coef = tl.load(
-                    COEF + (s * R + r[:, None]) * D + d[None, :],
-                    (r[:, None] < R) & (d[None, :] < D),
-                    0,
-                )
-            ds = tl.load(
-                DS + (s * R + r[:, None]) * D + d[None, :],
+            e = tl.load(
+                E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
+                (n[:, None] < N) & (d[None, :] < D),
+                0,
+            )
+            v = tl.load(
+                V + (s * R + r[:, None]) * D + d[None, :],
                 (r[:, None] < R) & (d[None, :] < D),
                 0,
-            )
-            if QUERY_GRAD:
-                dq += wide_dot(e, tl.trans(coef)) * inv
-            dk += wide_dot(v, tl.trans(ds)) * inv
-            dv = wide_dot(k, ds) * inv
+            ).to(tl.float32)
+            dq = tl.load(
+                DQ + (s * R + r[:, None]) * D + d[None, :],
+                (r[:, None] < R) & (d[None, :] < D),
+                0,
+            ).to(tl.float32)
+            da += (_mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
+            dc = eta * e.to(tl.float32) + _mixed_dot(a, dq) * inv
             tl.store(
-                DX
-                + (b * N + n[:, None]) * (H * (2 * R + D))
-                + 2 * H * R
-                + h * D
-                + d[None, :],
-                dv,
-                (n[:, None] < N) & (d[None, :] < D),
-            )
-        if QUERY_GRAD:
-            tl.store(
-                DX + (b * N + n[:, None]) * (H * (2 * R + D)) + h * R + r[None, :],
-                dq,
-                (n[:, None] < N) & (r[None, :] < R),
+                DX + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                dc, (n[:, None] < N) & (d[None, :] < D),
             )
         tl.store(
-            DX + (b * N + n[:, None]) * (H * (2 * R + D)) + H * R + h * R + r[None, :],
-            dk,
-            (n[:, None] < N) & (r[None, :] < R),
+            DX + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
+            da, (n[:, None] < N) & (r[None, :] < R),
         )
 
-    @jit
-    def normalized_readout(
-        X, COEF, COUNT, W, E, Y, DW, DM, GATE, DGATE,
-        N: tl.constexpr, H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
-        HAS_COUNT: tl.constexpr, BACKWARD: tl.constexpr, HAS_GATE: tl.constexpr,
-        BR: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr,
-    ):
-        # Recompute the compact query readout in backward instead of saving a
-        # token-sized FP32 activation, following FlashAttention's rematerialization
-        # principle (arxiv:2205.14135). The per-head RMS equations match FLA.
-        pid = tl.program_id(0)
-        tiles = tl.cdiv(N, BT)
-        h, tile, b = pid % H, (pid // H) % tiles, pid // (H * tiles)
-        s = b * H + h
-        count = tl.load(COUNT + b) if HAS_COUNT else float(N)
-        n = tile * BT + tl.arange(0, BT)
-        r, d = tl.arange(0, BR), tl.arange(0, BD)
-        q = tl.load(
-            X + (b * N + n[:, None]) * (H * (2 * R + D)) + h * R + r[None, :],
-            (n[:, None] < N) & (r[None, :] < R), 0,
-        )
-        coef = tl.load(
-            COEF + (s * R + r[:, None]) * D + d[None, :],
-            (r[:, None] < R) & (d[None, :] < D), 0,
-        )
-        value = mixed_dot(q, coef) / tl.sqrt(count)
-        rstd = tl.rsqrt(tl.sum(value * value, 1) / D + 1e-6)
-        xhat = value * rstd[:, None]
-        weight = tl.load(W + d, d < D, 0)
-        offset = (b * N + n[:, None]) * (H * D) + h * D + d[None, :]
-        if HAS_GATE:
-            logits = tl.load(GATE + offset, (n[:, None] < N) & (d[None, :] < D), 0).to(tl.float32)
-            gate = tl.sigmoid(logits)
-            # RMS, gain and gating share FP32 registers; round only on store.
-            normalized = xhat * weight[None, :]
-        if BACKWARD:
-            e = tl.load(
-                E + offset, (n[:, None] < N) & (d[None, :] < D), 0,
-            ).to(tl.float32)
-            if HAS_GATE:
-                dg = ((e * normalized) * gate) * (1.0 - gate)
-                tl.store(DGATE + offset, dg, (n[:, None] < N) & (d[None, :] < D))
-                e = e * gate
-            we = e * weight[None, :]
-            result = (we - xhat * (tl.sum(we * xhat, 1) / D)[:, None]) * rstd[:, None]
-            dw = tl.sum(e * xhat, 0)
-            tl.store(DW + (s * tl.cdiv(N, BT) + tile) * D + d, dw, d < D)
-            inv = 1.0 / tl.sqrt(count)
-            # Both readout VJPs consume the same RMS adjoint. Compute them here
-            # so that no token-sized FP32 adjoint crosses the compact-solve barrier.
-            dm = mixed_dot(tl.trans(q), result) * inv
-            tl.store(
-                DM + ((s * tl.cdiv(N, BT) + tile) * R + r[:, None]) * D + d[None, :],
-                dm, (r[:, None] < R) & (d[None, :] < D),
-            )
-            # Reload the small coefficient after dM so it need not remain
-            # live across normalization and another Tensor Core product.
-            coef = tl.load(
-                COEF + (s * R + r[:, None]) * D + d[None, :],
-                (r[:, None] < R) & (d[None, :] < D), 0, volatile=True,
-            )
-            dq = wide_dot(result, tl.trans(coef)) * inv
-            tl.store(
-                Y + (b * N + n[:, None]) * (H * (2 * R + D)) + h * R + r[None, :],
-                dq, (n[:, None] < N) & (r[None, :] < R),
-            )
-        else:
-            result = normalized * gate if HAS_GATE else xhat * weight[None, :]
-            tl.store(Y + offset, result, (n[:, None] < N) & (d[None, :] < D))
-
-    return statistics, readout, backward, normalized_readout
+    return _statistics, _readout, _token_backward
 
 
-def _block_size(size):
+def _no_frame_block_size(size: int) -> int:
     return max(16, 1 << (size - 1).bit_length())
 
 
-def _statistics(projected, heads, rank, counts, gradient=None):
+def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None):
     batch, length, width = projected.shape
-    dim = (width - 2 * heads * rank) // heads
-    # BF16 forward statistics fit 256 tokens per tile; short sequences then
-    # need no partial-sum kernels. FP32 adjoints retain smaller live tiles.
-    bt = (32 if rank > 32 else 128) if gradient is not None else 256
-    def prepare(config):
-        tiles = (length + config.tokens - 1) // config.tokens
-        options = dict(device=projected.device, dtype=torch.float32)
-        cross = torch.empty((batch * heads, tiles, rank, dim), **options)
-        gram = torch.empty((batch * heads, tiles, rank, rank), **options) if gradient is None else cross
-        args = (projected, gradient, counts, gram, cross, length, heads, rank, dim,
-                tiles, gradient is not None, counts is not None,
-                _block_size(rank), min(128, _block_size(dim)), config.tokens)
-
-        def finish():
-            reduced = (cross[:, 0] if tiles == 1 else cross.sum(1)).view(batch, heads, rank, dim)
-            if gradient is not None:
-                return reduced
-            return (gram[:, 0] if tiles == 1 else gram.sum(1)).view(batch, heads, rank, rank), reduced
-
-        workspace = (cross.numel() + (gram.numel() if gradient is None else 0)) * 4
-        return args, (batch * heads * tiles,), finish, workspace
-
-    return _launch_token(
-        "statistics_grad" if gradient is not None else "statistics", _token_kernels()[0],
-        projected.device, (batch, length, heads, rank, dim, counts is not None,
-                           str(gradient.dtype) if gradient is not None else "none"),
-        _LaunchConfig(bt, 4), prepare,
+    head_dim = (width - heads * rank) // heads
+    tiles = (length + 127) // 128
+    options = dict(device=projected.device, dtype=torch.float32)
+    cross = torch.empty((batch * heads, tiles, rank, head_dim), **options)
+    if gradient is None:
+        gram = torch.empty((batch * heads, tiles, rank, rank), **options)
+        eta_gradient = cross
+    else:
+        gram = cross
+        eta_gradient = torch.empty((batch * heads, tiles), **options)
+    _no_frame_kernels()[0][(batch * heads, tiles)](
+        projected,
+        gradient,
+        counts,
+        gram,
+        cross,
+        eta_gradient,
+        length,
+        heads,
+        rank,
+        head_dim,
+        tiles,
+        gradient is not None,
+        counts is not None,
+        _no_frame_block_size(rank),
+        min(128, _no_frame_block_size(head_dim)),
+        128,
+        num_warps=4,
+        num_stages=1,
     )
+    cross = cross.sum(1).view(batch, heads, rank, head_dim)
+    if gradient is None:
+        return gram.sum(1).view(batch, heads, rank, rank), cross
+    return cross, eta_gradient.sum(1).view(batch, heads).sum(0)
 
 
 @lru_cache(maxsize=1)
-def _ridge_kernel():
+def _compact_kernels():
     from triton import jit
     import triton.language as tl
 
     @jit
-    def prepare(
-        X, Y, R: tl.constexpr, XS0: tl.constexpr, XS1: tl.constexpr,
-        XS2: tl.constexpr, XS3: tl.constexpr, H: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        s = tl.program_id(0)
-        a = tl.arange(0, BLOCK)
-        i, j = a // R, a % R
-        base = (s // H) * XS0 + (s % H) * XS1
-        x = tl.load(X + base + i * XS2 + j * XS3, a < R * R, 0)
-        result = x + (i == j).to(tl.float32)
-        # Produce the column-major layout consumed by the vendor factorization.
-        tl.store(Y + s * R * R + j * R + i, result, a < R * R)
-    return prepare
-
-
-def _ridge_system(value):
-    batch, heads, rank, _ = value.shape
-    result = torch.empty_like(value, memory_format=torch.contiguous_format).mT
-    _ridge_kernel()[(batch * heads,)](
-        value, result, rank, *value.stride(), heads,
-        _block_size(rank * rank), num_warps=4,
-    )
-    return result
-
-
-@lru_cache(maxsize=1)
-def _compact_product_kernel():
-    from triton import jit
-    import triton.language as tl
-    @jit
-    def kernel(
-        T, DT, DZ, Z, OUT, H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
-        Z0: tl.constexpr, Z1: tl.constexpr, Z2: tl.constexpr, Z3: tl.constexpr,
-        BR: tl.constexpr,
-    ):
-        s = tl.program_id(2)
-        i = tl.program_id(0) * BR + tl.arange(0, BR)
-        j = tl.program_id(1) * BR + tl.arange(0, BR)
-        # Only lower blocks are needed; mirror them into the upper triangle.
-        # A 32x32 output tile avoids the register spills of full-rank IEEE dots.
-        if tl.program_id(0) >= tl.program_id(1):
-            inner = tl.arange(0, 32)
-            product = tl.full((BR, BR), 0., tl.float32)
-            for start in range(tl.cdiv(R, 32)):
-                k = start * 32 + inner
-                t = tl.load(T + (s % H) * R * R + i[:, None] * R + k[None, :],
-                            (i[:, None] < R) & (k[None, :] < R), 0)
-                dt = tl.load(DT + s * R * R + j[:, None] * R + k[None, :],
-                             (j[:, None] < R) & (k[None, :] < R), 0)
-                product -= tl.dot(t, tl.trans(dt), input_precision="ieee")
-            for start in range(tl.cdiv(D, 32)):
-                d = start * 32 + inner
-                dz = tl.load(DZ + (s * R + i[:, None]) * D + d[None, :],
-                             (i[:, None] < R) & (d[None, :] < D), 0)
-                z = tl.load(Z + (s // H) * Z0 + (s % H) * Z1
-                            + j[:, None] * Z2 + d[None, :] * Z3,
-                            (j[:, None] < R) & (d[None, :] < D), 0)
-                product -= tl.dot(dz, tl.trans(z), input_precision="ieee")
-            if tl.program_id(0) == tl.program_id(1):
-                product = tl.where(i[:, None] >= j[None, :], product, tl.trans(product))
-            value = product * 0.5
-            mask = (i[:, None] < R) & (j[None, :] < R)
-            tl.store(OUT + s * R * R + i[:, None] + j[None, :] * R, value, mask)
-            if tl.program_id(0) != tl.program_id(1):
-                tl.store(OUT + s * R * R + j[None, :] + i[:, None] * R, value, mask)
-    return kernel
-
-
-def _compact_product(mapping, core_samples, state_gradient, state):
-    batch, heads, rank, dim = state.shape
-    result = torch.empty_like(core_samples, memory_format=torch.contiguous_format).mT
-    tile = min(32, _block_size(rank))
-    _compact_product_kernel()[((rank + tile - 1) // tile, (rank + tile - 1) // tile, batch * heads)](
-        mapping, core_samples, state_gradient, state, result,
-        heads, rank, dim, *state.stride(), tile, num_warps=4,
-    )
-    return result
-
-
-@lru_cache(maxsize=1)
-def _shared_core_kernel():
-    # Standard tiled GEMM (Triton tutorial), addressing the shared head map
-    # directly rather than expanding it across the batch before a cuBLAS BMM.
-    from triton import jit
-    import triton.language as tl
+    def prepare(BASE, COORD, FACTOR, SIZE: tl.constexpr,
+                R: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        local = i % (R * R)
+        row, col = local // R, local % R
+        h = (i // (R * R)) % H
+        value = tl.load(BASE + h * R * R + local, i < SIZE, 0)
+        shifted = value + 0.5413248546129181
+        diagonal = tl.where(shifted > 20.0, shifted, tl.log(1.0 + tl.exp(shifted)))
+        f = tl.where(row > col, value, tl.where(row == col, diagonal, 0.0))
+        tl.store(COORD + i, value, i < SIZE)
+        tl.store(FACTOR + i, f, i < SIZE)
 
     @jit
-    def multiply(T, X, Y, H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
-                 TRANSPOSE: tl.constexpr):
-        s = tl.program_id(2)
-        i = tl.program_id(0) * 32 + tl.arange(0, 32)
-        j = tl.program_id(1) * 32 + tl.arange(0, 32)
-        inner = tl.arange(0, 32)
-        value = tl.full((32, 32), 0., tl.float32)
-        for start in range(tl.cdiv(R, 32)):
-            k = start * 32 + inner
-            index = k[None, :] * R + i[:, None] if TRANSPOSE else i[:, None] * R + k[None, :]
-            t = tl.load(T + (s % H) * R * R + index,
-                        (i[:, None] < R) & (k[None, :] < R), 0)
-            x = tl.load(X + (s * R + k[:, None]) * D + j[None, :],
-                        (k[:, None] < R) & (j[None, :] < D), 0)
-            value = tl.dot(t, x, value, input_precision="ieee")
-        tl.store(Y + (s * R + i[:, None]) * D + j[None, :], value,
-                 (i[:, None] < R) & (j[None, :] < D))
-    return multiply
+    def matrix(A, B, COORD, OUT, AUX, SIZE: tl.constexpr,
+               R: tl.constexpr, OP: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        local = i % (R * R)
+        row, col = local // R, local % R
+        offset = i - local
+        transposed = offset + col * R + row
+        a = tl.load(A + i, i < SIZE, 0)
+        if OP == 0:  # K=F F^T+Omega and both I +/- K in one pass.
+            t = tl.load(COORD + i, i < SIZE, 0)
+            tt = tl.load(COORD + transposed, i < SIZE, 0)
+            k = a + tl.where(row < col, t, tl.where(row > col, -tt, 0.0))
+            tl.store(OUT + i, (row == col).to(tl.float32) + k, i < SIZE)
+            tl.store(AUX + i, (row == col).to(tl.float32) - k, i < SIZE)
+        elif OP == 1:  # Cholesky VJP: half the symmetric copy of the lower triangle.
+            at = tl.load(A + transposed, i < SIZE, 0)
+            tl.store(OUT + i, 0.5 * tl.where(row >= col, a, at), i < SIZE)
+        else:  # Generator parameterization VJP.
+            g = tl.load(B + i, i < SIZE, 0)
+            gt = tl.load(B + transposed, i < SIZE, 0)
+            coordinate = tl.load(COORD + i, i < SIZE, 0)
+            shifted = coordinate + 0.5413248546129181
+            sigmoid = 1.0 / (1.0 + tl.exp(-shifted))
+            d = tl.where(row > col, a, tl.where(row == col, a * sigmoid, g - gt))
+            tl.store(OUT + i, d, i < SIZE)
+
+    @jit
+    def complement(RAW, ETA, DERIVATIVE, H: tl.constexpr, BLOCK: tl.constexpr):
+        h = tl.arange(0, BLOCK)
+        raw = tl.load(RAW + h, h < H, 0)
+        exponent = tl.exp(-2.0 * tl.abs(raw))
+        scale: tl.constexpr = 1.0 - 1.1920928955078125e-7
+        value = scale * tl.where(raw >= 0.0, 1.0 - exponent, exponent - 1.0) / (1.0 + exponent)
+        derivative = scale * 4.0 * exponent / ((1.0 + exponent) * (1.0 + exponent))
+        tl.store(ETA + h, value, h < H)
+        tl.store(DERIVATIVE + h, derivative, h < H)
+
+    @jit
+    def combine(DELTA, STATE, ETA, OUT, SIZE: tl.constexpr, H: tl.constexpr,
+                RD: tl.constexpr, COMPLEMENT_ONLY: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        z = tl.load(STATE + i, i < SIZE, 0)
+        eta = tl.load(ETA + (i // RD) % H, i < SIZE, 0)
+        delta = 0.0 if COMPLEMENT_ONLY else tl.load(DELTA + i, i < SIZE, 0)
+        tl.store(OUT + i, delta - eta * z, i < SIZE)
+
+    return prepare, matrix, complement, combine
 
 
-def _shared_core_product(mapping, state, *, transpose=False):
-    batch, heads, rank, dim = state.shape
-    result = torch.empty_like(state)
-    _shared_core_kernel()[((rank + 31) // 32, (dim + 31) // 32, batch * heads)](
-        mapping, state, result, heads, rank, dim, transpose, num_warps=4,
+def _compact_prepare(base):
+    coordinates = torch.empty_like(base)
+    core_factor = torch.empty_like(coordinates)
+    size = coordinates.numel()
+    _compact_kernels()[0][((size + 255) // 256,)](
+        base, coordinates, core_factor, size, base.shape[-1],
+        base.shape[0], 256, num_warps=4,
     )
-    return result
+    return coordinates, core_factor
 
 
-def _compact_forward(gram, cross, core_map):
-    factor, _ = torch.linalg.cholesky_ex(_ridge_system(gram), check_errors=False)
-    # Reuse the compact triangular inverse across forward and backward.
-    # FP32 is retained; no token-sized inverse or P is formed.
-    inverse = torch.linalg.solve_triangular(
-        factor, torch.eye(factor.shape[-1], device=factor.device, dtype=factor.dtype).expand_as(factor),
-        upper=False,
+def _compact_matrix(a, coordinates=None, b=None, *, op=0):
+    output = torch.empty_like(a, memory_format=torch.contiguous_format)
+    auxiliary = torch.empty_like(output) if op == 0 else output
+    # GEMM outputs are contiguous; the Cholesky product is normalized here too.
+    a = a.contiguous()
+    _compact_kernels()[1][((a.numel() + 255) // 256,)](
+        a, b, coordinates, output, auxiliary, a.numel(), a.shape[-1],
+        op, 256, num_warps=4,
     )
-    state = inverse @ cross
-    mapping = core_map
-    coefficient = inverse.mT @ _shared_core_product(mapping, state)
-    return coefficient, (inverse, state, mapping)
+    return output, auxiliary
 
 
-def _compact_backward(tape, gradient):
-    """Analytic VJP; sum sample contributions to the shared direct T."""
-    inverse, state, mapping = tape
-    memory_gradient = inverse @ gradient
-    core_samples = memory_gradient @ state.mT
-    core_gradient = core_samples.sum(0)
-    state_gradient = _shared_core_product(mapping, memory_gradient, transpose=True)
-    cross_gradient = inverse.mT @ state_gradient
-    # L^T dL = -(T Z) U^T - (T^T U) Z^T
-    #         = -T (U Z^T)^T - state_gradient Z^T.
-    # Reuse per-sample dT=U Z^T; neither dL nor L^T dL needs materializing via dL.
-    symmetric = _compact_product(mapping, core_samples, state_gradient, state)
-    gram_gradient = inverse.mT @ symmetric @ inverse
-    return gram_gradient, cross_gradient, core_gradient
+def _compact_complement(raw):
+    eta, derivative = torch.empty_like(raw), torch.empty_like(raw)
+    _compact_kernels()[2][(1,)](raw, eta, derivative, raw.numel(), _no_frame_block_size(raw.numel()), num_warps=4)
+    return eta, derivative
 
 
-def _forward(projected, core_map, counts, norm_weight=None, gate_logits=None, *, storage_dtype=torch.bfloat16):
-    from .reference import _ieee_fp32_matmul
-
-    heads, rank = core_map.shape[:2]
-    batch, length, width = projected.shape
-    dim = (width - 2 * heads * rank) // heads
-    gram, cross = _statistics(projected, heads, rank, counts)
-    with (
-        torch.no_grad(),
-        torch.autocast("cuda", enabled=False),
-        _ieee_fp32_matmul(projected.device),
-    ):
-        coefficient, tape = _compact_forward(gram, cross, core_map)
-    if norm_weight is not None:
-        output = torch.empty(
-            (batch, length, heads * dim), device=projected.device, dtype=storage_dtype,
-        )
-        def prepare(config):
-            args = (projected, coefficient, counts, norm_weight, None, output, None, None, gate_logits, None,
-                    length, heads, rank, dim, counts is not None, False, gate_logits is not None,
-                    _block_size(rank), _block_size(dim), config.tokens)
-            return args, (batch * heads * ((length + config.tokens - 1) // config.tokens),), lambda: output, 0
-
-        _launch_token(
-            "normalized_readout", _token_kernels()[3], projected.device,
-            (batch, length, heads, rank, dim, counts is not None, gate_logits is not None, str(storage_dtype)),
-            _LaunchConfig(32, 4), prepare,
-        )
-        return output, (coefficient, *tape)
-    output = torch.empty(
-        (batch, length, heads * dim), device=projected.device, dtype=torch.float32
+def _compact_combine(correction, state, eta, mode):
+    output = torch.empty_like(state, memory_format=torch.contiguous_format)
+    state = state.contiguous()
+    if correction is not None:
+        correction = correction.contiguous()
+    _compact_kernels()[3][((state.numel() + 255) // 256,)](
+        correction, state, eta, output, state.numel(), state.shape[1],
+        state.shape[-2] * state.shape[-1], mode == 2, 256, num_warps=4,
     )
-    def prepare(config):
-        args = (projected, coefficient, counts, output, length, heads, rank, dim,
-                counts is not None, _block_size(rank), min(128, _block_size(dim)), config.tokens)
-        return args, (batch * heads * ((length + config.tokens - 1) // config.tokens),), lambda: output, 0
-
-    _launch_token(
-        "readout", _token_kernels()[1], projected.device,
-        (batch, length, heads, rank, dim, counts is not None), _LaunchConfig(128, 4), prepare,
-    )
-    return output, (coefficient, *tape)
-
-
-class _QKVMix(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, projected, core_map, counts, norm_weight, gate_logits,
-                output_weight, output_bias, output_dtype):
-        # Autograd may execute backward on a worker thread; Python ContextVars
-        # do not propagate there. Carry the warmup request on this graph only.
-        ctx.tune_launches = _TUNE_LAUNCHES.get()
-        output, saved = _forward(projected, core_map, counts, norm_weight, gate_logits,
-            storage_dtype=torch.float16 if output_weight is not None else torch.bfloat16)
-        value16 = weight16 = None
-        if output_weight is not None:
-            from .reference import _readout_linear_forward
-            output, value16, weight16 = _readout_linear_forward(output, output_weight, output_bias, output_dtype)
-        ctx.save_for_backward(projected, counts, norm_weight, gate_logits, value16, weight16, *saved)
-        ctx.has_output_bias = output_bias is not None
-        ctx.heads, ctx.rank = core_map.shape[:2]
-        return output
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, gradient):
-        with autotune() if ctx.tune_launches else nullcontext():
-            return _QKVMix._backward(ctx, gradient)
-
-    @staticmethod
-    def _backward(ctx, gradient):
-        from .reference import _ieee_fp32_matmul
-
-        projected, counts, norm_weight, gate_logits, value16, weight16, coefficient, *tape = ctx.saved_tensors
-        output_weight_gradient = output_bias_gradient = None
-        if value16 is not None:
-            from .reference import _readout_linear_backward
-            gradient, output_weight_gradient, output_bias_gradient = _readout_linear_backward(
-                gradient, value16, weight16, ctx.has_output_bias)
-        heads, rank = ctx.heads, ctx.rank
-        batch, length, width = projected.shape
-        dim = (width - 2 * heads * rank) // heads
-        gradient = gradient.contiguous()
-        norm_gradient = None
-        gate_gradient = None if gate_logits is None else torch.empty_like(gate_logits)
-        projected_gradient = torch.empty_like(projected)
-        if norm_weight is not None:
-            # FLA-style small tiles. Store the gain VJP early and reload the
-            # compact coefficient inside the kernel to keep live ranges short.
-            def prepare(config):
-                tiles = (length + config.tokens - 1) // config.tokens
-                partial = torch.empty(
-                    (batch, heads, tiles, dim), device=projected.device, dtype=torch.float32,
-                )
-                coefficient_partial = torch.empty(
-                    (batch, heads, tiles, rank, dim), device=projected.device, dtype=torch.float32,
-                )
-                args = (projected, coefficient, counts, norm_weight, gradient,
-                        projected_gradient, partial, coefficient_partial, gate_logits, gate_gradient,
-                        length, heads, rank, dim, counts is not None, True, gate_logits is not None,
-                        _block_size(rank), _block_size(dim), config.tokens)
-
-                def finish():
-                    return partial.sum((0, 1, 2)), coefficient_partial.sum(2)
-
-                return args, (batch * heads * tiles,), finish, (partial.numel() + coefficient_partial.numel()) * 4
-
-            norm_gradient, coefficient_gradient = _launch_token(
-                "normalized_readout_grad", _token_kernels()[3], projected.device,
-                (batch, length, heads, rank, dim, counts is not None, gate_logits is not None, str(gradient.dtype)),
-                _LaunchConfig(32, 2), prepare,
-            )
-            gradient = None
-        else:
-            coefficient_gradient = _statistics(projected, heads, rank, counts, gradient)
-        with (
-            torch.no_grad(),
-            torch.autocast("cuda", enabled=False),
-            _ieee_fp32_matmul(projected.device),
-        ):
-            gram_gradient, cross_gradient, core_gradient = _compact_backward(
-                tape, coefficient_gradient
-            )
-        gram_gradient, cross_gradient = gram_gradient.contiguous(), cross_gradient.contiguous()
-
-        def prepare(config):
-            args = (projected, gradient, coefficient, gram_gradient, cross_gradient, counts,
-                    projected_gradient, length, heads, rank, dim, counts is not None,
-                    norm_weight is None, _block_size(rank), min(128, _block_size(dim)), config.tokens)
-            return args, (batch * heads * ((length + config.tokens - 1) // config.tokens),), lambda: None, 0
-
-        _launch_token(
-            "token_grad", _token_kernels()[2], projected.device,
-            (batch, length, heads, rank, dim, counts is not None, norm_weight is None,
-             str(gradient.dtype) if gradient is not None else "none"),
-            _LaunchConfig(32, 2 if rank <= 32 else 4), prepare,
-        )
-        return (projected_gradient, core_gradient, None, norm_gradient, gate_gradient,
-                output_weight_gradient, output_bias_gradient, None)
-
-
-def fast_mix(projected, core_map, valid_counts=None, *, norm_weight=None, gate_logits=None,
-             output_weight=None, output_bias=None, output_dtype=None):
-    """Direct Q/K/V readout without materializing P, for every N and rank.
-
-    Packed input rows excluded by a mask must already be zero. Counts are
-    clamped to one for empty samples by the model; they are not differentiable.
-    A norm weight fuses the canonical head RMSNorm and returns BF16. Optional
-    gate logits fuse post-norm sigmoid selection, without intermediate rounding.
-    An output weight includes Wo in the autograd boundary: the internal readout
-    and forward Wo operands use FP16, while its incoming readout VJP uses BF16 storage and FP32 arithmetic.
-    Backward
-    recomputes the FP32 readout from the saved compact coefficient. Without
-    it, this primitive returns the unnormalized FP32 readout for operator use.
-    """
-    load(device=projected.device)
-    if not projected.is_cuda or projected.ndim != 3 or not projected.is_contiguous():
-        raise ValueError("projected must be contiguous CUDA [B,N,2*H*R+H*D]")
-    if projected.dtype != torch.bfloat16:
-        raise TypeError("projected must use bfloat16")
-    if core_map.ndim != 3 or core_map.shape[-1] != core_map.shape[-2]:
-        raise ValueError("core_map must have shape [H,R,R]")
-    heads, rank, _ = core_map.shape
-    if rank not in (16, 32, 48, 64):
-        raise ValueError("CUDA rank must be in {16,32,48,64}")
-    if (
-        core_map.device != projected.device
-        or core_map.dtype != torch.float32
-        or not core_map.is_contiguous()
-    ):
-        raise TypeError("core_map must be contiguous FP32 on the projected device")
-    batch, length, width = projected.shape
-    if (
-        min(batch, length, heads) <= 0
-        or width <= 2 * heads * rank
-        or (width - 2 * heads * rank) % heads
-    ):
-        raise ValueError("invalid packed QKV shape")
-    if valid_counts is not None:
-        if valid_counts.requires_grad:
-            raise ValueError("valid_counts are not differentiable")
-        if (
-            valid_counts.shape != (batch,)
-            or valid_counts.device != projected.device
-            or valid_counts.dtype != torch.float32
-            or not valid_counts.is_contiguous()
-        ):
-            raise ValueError(
-                "valid_counts must be contiguous FP32 [B] on the projected device"
-            )
-    if norm_weight is not None and (
-        norm_weight.shape != ((width - 2 * heads * rank) // heads,)
-        or norm_weight.dtype != torch.float32
-        or norm_weight.device != projected.device
-        or not norm_weight.is_contiguous()
-    ):
-        raise ValueError("norm_weight must be contiguous FP32 [D], shared across heads, on the projected device")
-    if gate_logits is not None and (
-        norm_weight is None
-        or gate_logits.shape != (batch, length, width - 2 * heads * rank)
-        or gate_logits.dtype != torch.bfloat16
-        or gate_logits.device != projected.device
-        or not gate_logits.is_contiguous()
-    ):
-        raise ValueError("gate_logits require norm_weight and contiguous BF16 [B,N,H*D] on the projected device")
-    if output_weight is not None:
-        dim = width - 2 * heads * rank
-        if (norm_weight is None or output_weight.shape != (dim, dim)
-                or output_weight.device != projected.device or output_weight.dtype != torch.float32
-                or not output_weight.is_contiguous()):
-            raise ValueError("output_weight requires norm_weight and contiguous FP32 [H*D,H*D] on the projected device")
-        if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError("output_dtype must be float16, bfloat16 or float32")
-        if output_bias is not None and (output_bias.shape != (dim,)
-                or output_bias.device != projected.device or output_bias.dtype != torch.float32
-                or not output_bias.is_contiguous()):
-            raise ValueError("output_bias must be contiguous FP32 [H*D] on the projected device")
-    elif output_bias is not None or output_dtype is not None:
-        raise ValueError("output_bias/output_dtype require output_weight")
-    if torch.is_grad_enabled() and (
-        projected.requires_grad or core_map.requires_grad
-        or (norm_weight is not None and norm_weight.requires_grad)
-        or (gate_logits is not None and gate_logits.requires_grad)
-        or (output_weight is not None and output_weight.requires_grad)
-        or (output_bias is not None and output_bias.requires_grad)
-    ):
-        return _QKVMix.apply(projected, core_map, valid_counts, norm_weight, gate_logits,
-                             output_weight, output_bias, output_dtype)
-    output = _forward(projected, core_map, valid_counts, norm_weight, gate_logits,
-        storage_dtype=torch.float16 if output_weight is not None else torch.bfloat16)[0]
-    if output_weight is not None:
-        from .reference import _readout_linear_forward
-        output = _readout_linear_forward(output, output_weight, output_bias, output_dtype)[0]
     return output
 
 
-@lru_cache(maxsize=1)
-def _rms_kernels():
-    # Adapted from FLA grouped RMSNorm, commit
-    # 954438d1fcb5e1bb05c22f9908de9c5c2df74ae5, fla/modules/layernorm.py.
-    # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li.
-    # Copyright (c) 2023 Tri Dao. MIT license reproduced in NOTICE.
-    # Specialization: no bias/residual, FP32 input/VJP, BF16 output, per-head
-    # statistics with shared affine weights. Parallel partial weight gradients
-    # sum over heads and token tiles without atomic updates.
-    from triton import jit
-    import triton.language as tl
-
-    @jit
-    def forward(
-        X,
-        W,
-        Y,
-        RSTD,
-        T: tl.constexpr,
-        H: tl.constexpr,
-        D: tl.constexpr,
-        BD: tl.constexpr,
-        BT: tl.constexpr,
-    ):
-        rows = tl.program_id(0) * BT + tl.arange(0, BT)
-        d = tl.arange(0, BD)
-        x = tl.load(
-            X + rows[:, None] * D + d[None, :],
-            (rows[:, None] < T * H) & (d[None, :] < D),
-            0,
-        ).to(tl.float32)
-        w = tl.load(W + d[None, :], d[None, :] < D, 0).to(
-            tl.float32
-        )
-        rstd = tl.rsqrt(tl.sum(x * x, 1) / D + 1e-6)
-        y = x * rstd[:, None] * w
-        tl.store(
-            Y + rows[:, None] * D + d[None, :],
-            y,
-            (rows[:, None] < T * H) & (d[None, :] < D),
-        )
-        tl.store(RSTD + rows, rstd, rows < T * H)
-
-    @jit
-    def backward(
-        X,
-        W,
-        E,
-        RSTD,
-        DX,
-        DW,
-        T: tl.constexpr,
-        H: tl.constexpr,
-        D: tl.constexpr,
-        SPLITS: tl.constexpr,
-        SPAN: tl.constexpr,
-        BD: tl.constexpr,
-        BT: tl.constexpr,
-    ):
-        h, s = tl.program_id(0), tl.program_id(1)
-        d = tl.arange(0, BD)
-        w = tl.load(W + d, d < D, 0).to(tl.float32)
-        dw = tl.full((BT, BD), 0.0, tl.float32)
-        for start in range(s * SPAN, (s + 1) * SPAN, BT):
-            t = start + tl.arange(0, BT)
-            active = (t < T) & (t < (s + 1) * SPAN)
-            offset = (t[:, None] * H + h) * D + d[None, :]
-            x = tl.load(X + offset, active[:, None] & (d[None, :] < D), 0).to(
-                tl.float32
-            )
-            e = tl.load(E + offset, active[:, None] & (d[None, :] < D), 0).to(
-                tl.float32
-            )
-            rstd = tl.load(RSTD + t * H + h, active, 0)
-            xhat = x * rstd[:, None]
-            we = e * w[None, :]
-            dx = (we - xhat * (tl.sum(we * xhat, 1) / D)[:, None]) * rstd[:, None]
-            tl.store(DX + offset, dx, active[:, None] & (d[None, :] < D))
-            dw += e * xhat
-        tl.store(DW + (h * SPLITS + s) * D + d, tl.sum(dw, 0), d < D)
-
-    return forward, backward
+def _compact_lu(system):
+    return torch.ops.memsolve_equilibrium.compact_lu(system.contiguous())[:2]
 
 
-class _HeadRMSNorm(torch.autograd.Function):
+def _compact_getrs(lu, pivots, rhs, *, transpose=False):
+    return torch.ops.memsolve_equilibrium.compact_getrs(
+        lu, pivots, rhs.contiguous(), transpose
+    )
+
+
+class _NoFrameSolve(torch.autograd.Function):
+    """MathDx partial-pivot LU, reused by the implicit first-order VJP."""
+
     @staticmethod
-    def forward(ctx, value, weight):
-        batch, length, heads, dim = value.shape
-        value = value.contiguous()
-        rows = batch * length
-        output = torch.empty_like(value, dtype=torch.bfloat16)
-        rstd = torch.empty((rows * heads,), device=value.device, dtype=torch.float32)
-        _rms_kernels()[0][((rows * heads + 31) // 32,)](
-            value,
-            weight,
-            output,
-            rstd,
-            rows,
-            heads,
-            dim,
-            _block_size(dim),
-            32,
-            num_warps=4,
+    def forward(ctx, system, rhs):
+        lu, pivots = _compact_lu(system)
+        result = _compact_getrs(lu, pivots, rhs)
+        ctx.save_for_backward(lu, pivots, result)
+        return result
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        lu, pivots, result = ctx.saved_tensors
+        adjoint = _compact_getrs(lu, pivots, gradient, transpose=True)
+        return -(adjoint @ result.mT), adjoint
+
+
+def _no_frame_compact(gram, cross, base, raw, mode):
+    # reference.py owns these equations. This boundary records values, not an
+    # autograd graph: R^T R=I+A^T A, Z=R^-T A^T C, V=R^-1(Delta-eta Z).
+    rank = gram.shape[-1]
+    identity = torch.eye(rank, device=gram.device, dtype=gram.dtype)
+    factor, _info = torch.linalg.cholesky_ex(gram + identity, check_errors=False)
+    state = torch.linalg.solve_triangular(factor, cross, upper=False)
+    eta, eta_derivative = _compact_complement(raw)
+    coordinates = core_factor = lu = pivots = mapping = None
+    if mode == 2:
+        correction = None
+    else:
+        coordinates, core_factor = _compact_prepare(base)
+        system, difference = _compact_matrix(core_factor @ core_factor.mT, coordinates)
+        lu, pivots = _compact_lu(system)
+        mapping = _compact_getrs(lu, pivots, difference)
+        correction = mapping @ state
+    coefficient = torch.linalg.solve_triangular(
+        factor.mT, _compact_combine(correction, state, eta, mode), upper=True,
+    ).contiguous()
+    tape = (factor, state, coordinates, lu, pivots, mapping, eta_derivative, core_factor)
+    return coefficient, eta, tape
+
+
+def _no_frame_compact_backward(coefficient, eta, tape, gradient, eta_gradient, mode):
+    factor, state, coordinates, lu, pivots, correction, eta_derivative, core_factor = tape
+    # V=L^-T(Delta-eta Z): E_delta=L^-1 E_v, E_L=-V E_delta^T.
+    delta_gradient = torch.linalg.solve_triangular(factor, gradient, upper=False)
+    factor_gradient = -(coefficient @ delta_gradient.mT)
+    state_gradient = -eta[None, :, None, None] * delta_gradient
+    eta_gradient = eta_gradient - (delta_gradient * state).sum((0, 2, 3))
+    base_gradient = None
+    if mode != 2:
+        # Accumulate one per-head map adjoint before solving.
+        map_gradient = (delta_gradient @ state.mT).sum(0)
+        adjoint = _compact_getrs(lu, pivots, map_gradient, transpose=True)
+        identity = torch.eye(state.shape[-2], device=state.device, dtype=state.dtype)
+        generator_gradient = -(adjoint @ (correction + identity).mT)
+        del map_gradient, identity
+        state_gradient = state_gradient + correction.mT @ delta_gradient
+        core_gradient = (generator_gradient + generator_gradient.mT) @ core_factor
+        base_gradient, _ = _compact_matrix(
+            core_gradient, coordinates, generator_gradient, op=2,
         )
-        ctx.save_for_backward(value, weight, rstd)
+        del core_gradient, generator_gradient, adjoint
+    # Z=L^-1 Q, followed by the Cholesky adjoint for G+I=L L^T.
+    cross_gradient = torch.linalg.solve_triangular(factor.mT, state_gradient, upper=True)
+    factor_gradient.sub_(cross_gradient @ state.mT)
+    product = factor.mT @ factor_gradient
+    del factor_gradient, state_gradient, delta_gradient
+    symmetric, _ = _compact_matrix(product, op=1)
+    del product
+    intermediate = torch.linalg.solve_triangular(factor.mT, symmetric, upper=True)
+    gram_gradient = torch.linalg.solve_triangular(factor.mT, intermediate.mT, upper=True).mT
+    raw_gradient = eta_gradient * eta_derivative
+    return gram_gradient, cross_gradient, base_gradient, raw_gradient
+
+
+def _no_frame_forward(projected, base, raw, counts, *, record):
+    from .reference import _ieee_fp32_matmul
+
+    heads, rank = base.shape[:2]
+    batch, length, width = projected.shape
+    head_dim = (width - heads * rank) // heads
+    mode = 2 if base.numel() == 0 else 1
+    gram, cross = _no_frame_statistics(projected, heads, rank, counts=counts)
+    # All compact operations remain FP32 regardless of the caller's AMP/TF32
+    # policy. No process-wide precision setting is left changed.
+    with (
+        torch.no_grad(),
+        torch.autocast(device_type="cuda", enabled=False),
+        _ieee_fp32_matmul(projected.device),
+    ):
+        coefficient, eta, tape = _no_frame_compact(
+            gram, cross, base, raw, mode
+        )
+    output = torch.empty(
+        (batch, length, heads * head_dim),
+        device=projected.device,
+        dtype=projected.dtype,
+    )
+    _no_frame_kernels()[1][(batch * heads, (length + 127) // 128)](
+        projected,
+        coefficient,
+        eta,
+        counts,
+        output,
+        length,
+        heads,
+        rank,
+        head_dim,
+        counts is not None,
+        _no_frame_block_size(rank),
+        min(128, _no_frame_block_size(head_dim)),
+        128,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output, (coefficient, eta, *tape)
+
+
+class _NoFrameMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, projected, base, raw, counts):
+        output, saved = _no_frame_forward(
+            projected, base, raw, counts, record=True
+        )
+        ctx.save_for_backward(projected, counts, *saved)
+        ctx.heads, ctx.rank = base.shape[:2]
         return output
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, gradient):
-        value, weight, rstd = ctx.saved_tensors
-        batch, length, heads, dim = value.shape
-        rows = batch * length
-        splits = min(
-            (rows + 31) // 32,
-            max(
-                1,
-                torch.cuda.get_device_properties(value.device).multi_processor_count
-                * 4
-                // heads,
-            ),
-        )
-        span = ((rows + splits - 1) // splits + 31) // 32 * 32
-        partial = torch.empty(
-            (heads, splits, dim), device=value.device, dtype=torch.float32
-        )
-        dx = torch.empty_like(value)
-        _rms_kernels()[1][(heads, splits)](
-            value,
-            weight,
-            gradient.contiguous(),
-            rstd,
-            dx,
-            partial,
-            rows,
+        from .reference import _ieee_fp32_matmul
+
+        projected, counts, coefficient, eta, *tape = ctx.saved_tensors
+        heads, rank = ctx.heads, ctx.rank
+        batch, length, width = projected.shape
+        head_dim = (width - heads * rank) // heads
+        gradient = gradient.contiguous()
+        coefficient_gradient, eta_gradient = _no_frame_statistics(
+            projected,
             heads,
-            dim,
-            splits,
-            span,
-            _block_size(dim),
+            rank,
+            gradient,
+            counts,
+        )
+        mode = 2 if tape[2] is None else 1
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type="cuda", enabled=False),
+            _ieee_fp32_matmul(projected.device),
+        ):
+            gram_gradient, cross_gradient, base_gradient, raw_gradient = _no_frame_compact_backward(
+                coefficient, eta, tape, coefficient_gradient, eta_gradient, mode
+            )
+        projected_gradient = torch.empty_like(projected)
+        # Bound live token adjoints independently of the statistics tile.
+        # Larger fused tiles can spill registers at rank 48/64 and head_dim 64.
+        _no_frame_kernels()[2][(batch * heads, (length + 31) // 32)](
+            projected,
+            gradient,
+            coefficient,
+            gram_gradient.contiguous(),
+            cross_gradient.contiguous(),
+            eta,
+            counts,
+            projected_gradient,
+            length,
+            heads,
+            rank,
+            head_dim,
+            counts is not None,
+            _no_frame_block_size(rank),
+            min(128, _no_frame_block_size(head_dim)),
             32,
             num_warps=4,
+            num_stages=1,
         )
-        return dx, partial.sum((0, 1))
+        return projected_gradient, base_gradient, raw_gradient, None
 
 
-def head_rms_norm(value, weight):
-    """FLA-derived per-head RMSNorm with a shared [D] gain and epsilon 1e-6."""
-    if weight.shape != (value.shape[-1],):
-        raise ValueError("RMSNorm weight must have shape [D], shared across heads")
-    if weight.dtype != torch.float32 or weight.device != value.device or not weight.is_contiguous():
-        raise ValueError("RMSNorm weight must be contiguous FP32 on the value device")
-    return _HeadRMSNorm.apply(value, weight)
+def _short_no_frame_forward(projected, base, raw, counts):
+    """Use the smaller token system for the cancellation-sensitive base term.
+
+    When N <= r, C-A(I+A^T A)^-1 A^T C = (I+A A^T)^-1 C.
+    The latter avoids subtracting nearly equal values for a strong relation.
+    Only at most r-by-r systems are formed; no explicit soft frame is needed.
+    """
+    from .reference import accretive_generator, bounded_complement, _ieee_fp32_matmul
+
+    batch, length, width = projected.shape
+    heads, rank = base.shape[:2]
+    head_dim = (width - heads * rank) // heads
+    with (
+        torch.autocast(device_type="cuda", enabled=False),
+        _ieee_fp32_matmul(projected.device),
+    ):
+        normalization = (
+            counts
+            if counts is not None
+            else torch.full(
+                (batch,),
+                float(length),
+                device=projected.device,
+                dtype=torch.float32,
+            )
+        )
+        relation, content = projected.float().split(
+            (heads * rank, heads * head_dim), dim=-1
+        )
+        relation = relation.reshape(batch, length, heads, rank).transpose(1, 2)
+        relation = relation / normalization.sqrt().view(batch, 1, 1, 1)
+        content = content.reshape(batch, length, heads, head_dim).transpose(1, 2)
+        identity_token = torch.eye(length, device=projected.device, dtype=torch.float32)
+        factor_token, _info = torch.linalg.cholesky_ex(
+            identity_token + relation @ relation.mT, check_errors=False
+        )
+        residual = torch.linalg.solve_triangular(factor_token, content, upper=False)
+        residual = torch.linalg.solve_triangular(factor_token.mT, residual, upper=True)
+        eta = bounded_complement(raw)
+        result = eta[None, :, None, None] * residual
+        if base.numel():
+            identity = torch.eye(rank, device=projected.device, dtype=torch.float32)
+            factor, _info = torch.linalg.cholesky_ex(
+                identity + relation.mT @ relation, check_errors=False
+            )
+            state = torch.linalg.solve_triangular(
+                factor, relation.mT @ content, upper=False
+            )
+            generator = accretive_generator(base)
+            correction = (
+                _NoFrameSolve.apply(identity + generator, identity - generator)
+                @ state
+            )
+            coefficient = torch.linalg.solve_triangular(
+                factor.mT, correction, upper=True
+            )
+            result = result + relation @ coefficient
+        return (
+            result.transpose(1, 2)
+            .reshape(batch, length, heads * head_dim)
+            .to(torch.bfloat16)
+        )
+
+
+class _ShortNoFrameMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, projected, base, raw, counts):
+        with torch.enable_grad():
+            leaves = [
+                value.detach().requires_grad_(True)
+                for value in (projected, base, raw)
+            ]
+            result = _short_no_frame_forward(*leaves, counts)
+        ctx.save_for_backward(result, *leaves)
+        return result.detach()
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        from .reference import _ieee_fp32_matmul
+
+        result, *leaves = ctx.saved_tensors
+        with (
+            torch.enable_grad(),
+            torch.autocast(device_type="cuda", enabled=False),
+            _ieee_fp32_matmul(result.device),
+        ):
+            gradients = torch.autograd.grad(
+                result, leaves, gradient, allow_unused=True, retain_graph=True
+            )
+        return (*gradients, None)
+
+
+def _validate_no_frame_inputs(projected, base, raw, counts):
+    def require(condition, message):
+        if not condition:
+            raise RuntimeError(message)
+
+    require(projected.is_cuda, "projected must be a CUDA tensor")
+    require(
+        projected.ndim == 3 and projected.is_contiguous(),
+        "projected must be contiguous [B, N, H*R + D]",
+    )
+    require(
+        projected.dtype == torch.bfloat16,
+        "projected must use bfloat16 under the mixed precision CUDA contract",
+    )
+    for name, value in (
+        ("core_base_raw", base),
+        ("eta_raw", raw),
+    ):
+        require(
+            value.device == projected.device and value.is_contiguous(),
+            f"{name} must be contiguous on the same CUDA device",
+        )
+        require(value.dtype == torch.float32, f"{name} must use float32")
+    require(base.ndim == 3, "core_base_raw must have shape [H,R,R] or [H,R,0]")
+    batch, length, width = projected.shape
+    heads, rank, columns = base.shape
+    require(batch > 0 and length > 0 and heads > 0, "B, N, and H must be positive")
+    require(
+        rank in (16, 32, 48, 64), "the CUDA fast path supports rank in {16,32,48,64}"
+    )
+    require(columns in (0, rank), "core_base_raw must have shape [H,R,R] or [H,R,0]")
+    content_dim = width - heads * rank
+    require(
+        content_dim > 0 and content_dim % heads == 0,
+        "projected content width must be positive and divisible by H",
+    )
+    require(tuple(raw.shape) == (heads,), "eta_raw must have shape [H]")
+    if counts is not None:
+        require(
+            counts.device == projected.device
+            and counts.dtype == torch.float32
+            and counts.is_contiguous(),
+            "valid_counts must be contiguous float32 on the same CUDA device",
+        )
+        require(tuple(counts.shape) == (batch,), "valid_counts must have shape [B]")
+
+
+def fast_mix(
+    projected: torch.Tensor,
+    core_base_raw: torch.Tensor,
+    eta_raw: torch.Tensor,
+    valid_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply the common no-frame operator; never dispatch to a materialized P.
+
+    The only dimension choice is the primal/dual identity for the base term:
+    solve an N-by-N token system when N <= r, otherwise an r-by-r system.
+    Rank, core mode and batch size do not select a different CUDA algorithm.
+    """
+    if valid_counts is not None and valid_counts.requires_grad:
+        raise ValueError("the MemSolve CUDA fast path does not support gradients for valid_counts")
+    require_available()
+    _validate_no_frame_inputs(
+        projected, core_base_raw, eta_raw, valid_counts
+    )
+    record = torch.is_grad_enabled() and any(
+        value.requires_grad
+        for value in (projected, core_base_raw, eta_raw)
+    )
+    arguments = (projected, core_base_raw, eta_raw, valid_counts)
+    if projected.shape[1] <= core_base_raw.shape[1]:
+        return _ShortNoFrameMix.apply(*arguments) if record else _short_no_frame_forward(*arguments)
+    if record:
+        return _NoFrameMix.apply(*arguments)
+    return _no_frame_forward(*arguments, record=False)[0]

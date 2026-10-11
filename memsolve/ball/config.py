@@ -1,41 +1,65 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+
+
+class CoreMode(str, Enum):
+    """Compact-core modes supported by the one MemSolve operator."""
+
+    EQUILIBRIUM = "equilibrium"
+    COMPLEMENT = "complement"
 
 
 @dataclass(frozen=True, slots=True)
 class MemSolveConfig:
-    """Q/K/V ridge readout with centered Q/K filters and a sigmoid output gate."""
+    """Configuration for the one MemSolve operator and its explicit ablations."""
 
     dim: int
     num_heads: int
     rank: int = 16
+    core_mode: CoreMode = CoreMode.EQUILIBRIUM
     bias: bool = False
-    qk_conv_dim: int = 1
-    qk_conv_kernel_size: int = 3
-    output_gate_rank: int = 32
+    skew_coupling: bool = True
+    scalar_complement: bool = True
 
     def __post_init__(self) -> None:
-        for name in ("dim", "num_heads", "rank", "qk_conv_kernel_size", "output_gate_rank"):
-            value = getattr(self, name)
+        for name, value in (
+            ("dim", self.dim),
+            ("num_heads", self.num_heads),
+            ("rank", self.rank),
+        ):
             if not isinstance(value, int) or isinstance(value, bool):
-                raise TypeError(f"{name} must be an integer")
-            if value <= 0:
-                raise ValueError(f"{name} must be positive")
-        if self.dim % self.num_heads:
-            raise ValueError("dim must be divisible by num_heads")
+                raise TypeError(
+                    f"{name} must be an integer, got {type(value).__name__}"
+                )
+
+        try:
+            core_mode = CoreMode(self.core_mode)
+        except (TypeError, ValueError) as error:
+            choices = ", ".join(mode.value for mode in CoreMode)
+            raise ValueError(
+                f"core_mode must be one of {{{choices}}}, got {self.core_mode!r}"
+            ) from error
+        object.__setattr__(self, "core_mode", core_mode)
+
         if not isinstance(self.bias, bool):
-            raise TypeError("bias must be a bool")
-        if not isinstance(self.qk_conv_dim, int) or isinstance(self.qk_conv_dim, bool):
-            raise TypeError("qk_conv_dim must be an integer")
-        if self.qk_conv_dim not in (1, 2):
-            raise ValueError("qk_conv_dim must be 1 (sequence) or 2 (patch grid)")
-        if self.qk_conv_kernel_size % 2 != 1:
-            raise ValueError("qk_conv_kernel_size must be odd for centered convolution")
+            raise TypeError(f"bias must be a bool, got {type(self.bias).__name__}")
+
+        for name in ("skew_coupling", "scalar_complement"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+
+        if self.dim <= 0 or self.num_heads <= 0 or self.rank <= 0:
+            raise ValueError("dim, num_heads, and rank must be positive")
+        if self.dim % self.num_heads:
+            raise ValueError(
+                f"dim={self.dim} must be divisible by num_heads={self.num_heads}"
+            )
 
     @property
     def head_dim(self) -> int:
         return self.dim // self.num_heads
 
 
-__all__ = ["MemSolveConfig"]
+__all__ = ["CoreMode", "MemSolveConfig"]

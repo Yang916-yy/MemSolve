@@ -30,11 +30,11 @@ from integrations.timm import MemSolveViT
 
 def build_model(*, seed: int = 0, implementation: str = "reference") -> nn.Module:
     torch.manual_seed(seed)
-    # Same Q/K convolution + learned 2D positions scaffold as ImageNet, no CLS or LayerScale.
+    # Same restored CPE/GELU/mean-pooling scaffold as ImageNet.
     return MemSolveViT(
         image_size=224, patch_size=16, num_classes=101,
         embed_dim=384, depth=12, num_heads=6, rank=32,
-        implementation=implementation, drop_path_rate=0.1, mlp_ratio=4.0,
+        implementation=implementation, drop_path_rate=0.1, mlp_ratio=4.125,
     )
 
 

@@ -61,8 +61,8 @@ informed.
 
 ## CUDA Boundary
 
-- CUDA supports the independent Q/K/V ridge readout with an identity-plus-delta
-  shared query map at ranks 16, 32, 48 and 64; see `docs/CUDA_CONTRACT.md`.
+- CUDA supports the restored no-RankRotary accretive-equilibrium operator
+  (`equilibrium` and `complement`) at ranks 16, 32, 48 and 64; see `docs/CUDA_CONTRACT.md`.
 - Unsupported variants, layouts, dtypes, or devices must fail explicitly.
 - CUDA must not silently fall back or load a native library from an old contract.
 - Every CUDA forward result and gradient must be checked against `reference.py`.

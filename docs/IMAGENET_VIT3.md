@@ -1,3 +1,9 @@
+> Structure update: MemSolve now uses the restored no-RankRotary accretive
+> operator. Vision uses CPE/GELU and token-LN mean pooling without LayerScale,
+> following ordinary ViT3; BERT retains its own SwiGLU shell. Historical results and recipe
+> discussions below are not measurements of a new run of this restoration.
+> See [the current architecture](ARCHITECTURE.md) and [core contract](CORE_CONTRACT.md).
+
 # ImageNet with plain ViT³ training
 
 The visual model family is **MemSolve-ViT-T/S/B**; ViT³ names the source of this
@@ -8,7 +14,9 @@ training recipe. From the source checkout, `import integrations.timm` registers
 ```python
 import timm
 import integrations.timm
+from memsolve.ball import cuda
 
+cuda.load()
 model = timm.create_model("memsolve_vit_small", img_size=224,
                           implementation="cuda", pretrained=False).cuda()
 ```
@@ -58,54 +66,21 @@ the global batch of the upstream README launch. Upstream scales its base LR
 | small | 384 | 12 | 6 | 32 | 0.1 |
 | base | 768 | 12 | 12 | 48 | 0.4 |
 
-The small model uses **SwiGLU with gate width 1024**, a packed input
-projection of width 2048, and 20,697,448 parameters including the 1000-class
-head. `mlp_ratio=4.0` denotes the equivalent two-projection MLP weight budget:
-the gate width is `ceil_to_16(floor(2 * int(width * mlp_ratio) / 3))`.
-All three tiers use budget ratio 4.0, so the gate width is exactly `(8/3) * width`:
-512 / 1024 / 2048 for T / S / B. Their parameter counts including the
-1000-class head and 224px position table are 5,464,744 / 20,697,448 / 84,090,856.
-This replaces the original ViT³ GELU FFN; it is a local architecture choice,
-not part of the upstream recipe. Historical results and speed measurements
-belong to their recorded model versions.
+The restored S model uses a GELU MLP with width1584 (`mlp_ratio=4.125`),
+matching the archived Small experiment. T/B use ratio4.0 (width768/3072).
+T/S/B parameter counts including the 1,000-class head are
+5,053,936 / 19,876,336 / 77,980,792 in equilibrium mode.
 
-The packed forward reuses [timm GluMlp](https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/mlp.py)
-with SiLU on the first half and multiplication by the second half. The
-parameter-budget adjustment follows the same two-thirds principle used by
-[DINOv2 SwiGLU](https://github.com/facebookresearch/dinov2/blob/main/dinov2/layers/swiglu_ffn.py).
-Both input branches and the output projection use timm's linear initialization
-(truncated normal, std 0.02; zero biases). We bypass GluMlp's near-constant
-second-half initialization, which targets the value branch with this packing.
+The shared visual adapter uses residual depthwise 3x3 CPE before each block,
+Pre-LayerNorm, GELU MLP and no LayerScale or CLS token.
+DropPath increases linearly to the tier's maximum. At224/16 there are196 patch tokens. CPE operates only on patches; no learned absolute patch table is used.
+The final readout is per-token LayerNorm, valid-patch mean and the classifier.
+The operator remains the historical no-RankRotary core; the readout and
+LayerScale choices now follow ordinary ViT3. The whole model is not upstream ViT3.
 
-
-DropPath increases linearly from zero to the listed maximum across blocks,
-as in plain ViT³. MemSolve ranks are our model choices. The canonical
-`integrations.timm.create_memsolve_vit` encoder uses 3×3 depthwise Q/K convolution
-inside each Pre-LN mixer, with no residual CPE, CLS, or LayerScale. A learned
-2D absolute position table is added after patch embedding, before the first block.
-It reuses timm's initialization and bicubic grid interpolation. Convolution uses
-PyTorch/cuDNN and keeps masked patches out of neighboring valid updates. At 224/16, all 196 tokens are image patches. The final readout is
-per-token LayerNorm (ε=1e-6), then patch mean, then the classifier. timm's
-post-pooling `fc_norm` is explicitly disabled; moving LN after the mean would
-change the architecture. Masked pooling averages only valid patches.
-
-The mixer retains independent Q/K/V, a shared learned core, direct readout and
-per-head RMSNorm with a shared channel gain initialized to one and epsilon
-`1e-6`, following the FLA Gated DeltaNet model configuration (see [core contract](CORE_CONTRACT.md));
-projected Q/K additionally use independent centered 3×3 depthwise filters on
-the patch grid, initialized to identity without bias or activation. V remains
-tokenwise. Q/K enter Gram and KV statistics without rotation. This is
-**MemSolve in a plain ViT³-style visual scaffold with its derived training recipe**.
-It does not use the upstream TTT mixer, adaptive convolution, or MESA variant.
-
-The readout additionally uses a low-rank sigmoid channel gate after head RMSNorm
-and before Wo. `[operator].output_gate_rank=32` controls its bottleneck, and
-`[operator].qk_conv_kernel_size=3` controls the odd centered 2D filter width.
-Both are recorded in checkpoint metadata. Gate weights retain timm's std 0.02
-initialization, with zero output bias and initial gates near 0.5. Parameter
-counts above include this gate; its rank is independent of the MemSolve rank.
-The CUDA readout includes the fused sigmoid gate in eager and Graph execution.
-`compile-graph` compiles the surrounding encoder while preserving this CUDA boundary.
+The operator defaults to equilibrium; complement omits the learned core.
+There is no RankRotary, independent Q/K projection, Q/K convolution, output
+RMSNorm or channel gate. See [the mathematical contract](CORE_CONTRACT.md).
 
 ## Batching and data
 
@@ -194,22 +169,20 @@ epoch. Workers use `spawn` and prefetch one physical batch each. Defaults are
 12 train / 4 validation workers per rank. This follows the lifecycle and replica
 semantics in the [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.14/data.html).
 
-The ImageNet checkpoint envelope is now **12**, vision scaffold contract **4**,
-MemSolve model contract **24**, and CUDA contract **19**. The model metadata records
-`vit3_qkconv_lpe2d_mean_swiglu_v5`, SwiGLU, no CLS/LayerScale and token-LN mean pooling.
-Previous GELU or CLS/LayerScale ImageNet states cannot resume as this model.
-Historical classification results retain their original training protocol and
-source version, including the previous shared-A ViT³-derived run. This refactor
-produces no new accuracy results and does not relabel those measurements.
+The ImageNet checkpoint envelope remains12. The restored vision scaffold
+contract is7 and the operator contract26; native ABI is12. Metadata records
+`vit3_cpe_accretive_mean_gelu_v7`, GELU, token-LN mean pooling, no LayerScale and CPE. Previous Q/K/V
+checkpoints cannot resume as this model. Historical Small weights were checked
+against the archived source after explicitly translating contract metadata;
+this does not add an automatic checkpoint migration API.
 
-The BF16 autocast setting is a local precision adaptation from the upstream FP16 AMP entrypoint. MemSolve uses BF16 QKV/gate projections, FP16 readout/Wo forward operands and FP32 solver/accumulation; model parameters and AdamW states remain FP32. No GradScaler is created or checkpointed.
+BF16 autocast remains a local precision choice. The restored native backend uses
+BF16 packed projections and FP32 compact solves; parameters remain FP32.
+The current training utilities retain persistent workers and later fixes;
+structural restoration is not a claim to reproduce all historical sampling or
+augmentation settings. No new training run is started by this change.
 
-The optimizer uses ordinary fused AdamW for all parameters. The
-[identity-centered core](CORE_CONTRACT.md#identity-centered-parameterization-and-training)
-stores Delta with zero initialization and forms T = I + Delta. Delta receives
-the regular 0.05 weight decay, pulling T toward I; there are no optimizer hooks.
-
-K projections use the MemSolve-owned fan-in normal initializer (variance `1/embed_dim`,
-zero bias), applied after timm initializes the child projections. Q/V keep timm
-std=0.02. This source-0.8.1 initialization change is a local MemSolve choice, not a
-claim about the upstream ViT³ initializer; loaded checkpoint weights are restored.
+The optimizer uses ordinary fused AdamW. The learned shared core coordinates
+start at zero (J=I) and receive the configured weight decay; there are no
+constraint-optimizer hooks. Projection initialization follows the restored
+relation/content model. See [the core contract](CORE_CONTRACT.md).

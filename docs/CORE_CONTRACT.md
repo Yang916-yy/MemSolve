@@ -2,7 +2,7 @@
 
 MemSolve uses the no-RankRotary relation/content operator restored from
 `e769a9a`, with two modes: `equilibrium` (default) and `complement`.
-Model checkpoint contract **26** and native CUDA ABI **12** require matching
+Model checkpoint contract **26** and native CUDA ABI **16** require matching
 source and artifacts. Old mode names are not aliases. Historical checkpoints
 and their source snapshots retain their original contracts.
 

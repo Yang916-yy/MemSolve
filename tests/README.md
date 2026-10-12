@@ -37,16 +37,27 @@ python tools/check_repository.py
 git diff --check
 ```
 
-Read skip reasons with `-rs`. Missing timm/OpenMMLab packages  must not be reported as successful full-model validation. Test other
-SM targets on their own hardware. Benchmarks and exploratory probes belong
+Read skip reasons with `-rs`. Missing timm/OpenMMLab packages must not be reported
+as successful full-model validation. Test other SM targets on their own hardware.
+Benchmarks and exploratory probes belong
 outside the tracked test tree.
 
 Before the 2026-09-12 main publication, the full suite passed 342 tests with
 6 skips; only SM120 was executed. This is a dated verification record, not a
 promise that all optional stacks or architectures were exercised.
 
-Model contract26 / native ABI12 restores the historical accretive-equilibrium
+Model contract 26 / native ABI 16 covers the accretive-equilibrium
 oracle checks: equilibrium/complement, masks, compact solves, complement tails,
 forward/parameter/input gradients and CUDA Graph replay. The native extension
 must be built before GPU tests; skipped native tests are not successful oracle
 validation. See the [CUDA contract](../docs/CUDA_CONTRACT.md).
+
+The fused Cholesky adjoint and compact-product epilogues have independent
+FP64 oracle checks. Eta-adjoint reductions cover small/large scales and both
+row-major and transposed dense inputs; they must respect incoming strides.
+
+On 2026-10-12, SM80/A800 validation passed 363 checks across `tests/core`,
+`tests/cuda` and `tests/integrations/test_timm.py`, plus 15 checks in
+`tests/integrations/test_transformers.py` using the NLP environment. These checks
+cover operator and adapter correctness, not a new training run or validation
+of other GPU architectures. Performance probes and their logs remain outside Git.

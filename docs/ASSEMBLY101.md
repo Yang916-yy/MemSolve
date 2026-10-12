@@ -6,7 +6,7 @@
 
 # Assembly101 data and evaluation protocol
 
-> Current source uses model contract 26 and native CUDA ABI 12. External position
+> Current source uses model contract 26 and native CUDA ABI 16. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 

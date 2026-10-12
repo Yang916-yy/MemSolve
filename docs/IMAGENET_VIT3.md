@@ -169,9 +169,10 @@ epoch. Workers use `spawn` and prefetch one physical batch each. Defaults are
 12 train / 4 validation workers per rank. This follows the lifecycle and replica
 semantics in the [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.14/data.html).
 
-The ImageNet checkpoint envelope remains12. The restored vision scaffold
-contract is7 and the operator contract26; native ABI is12. Metadata records
-`vit3_cpe_accretive_mean_gelu_v7`, GELU, token-LN mean pooling, no LayerScale and CPE. Previous Q/K/V
+The ImageNet checkpoint envelope remains 12. The restored vision scaffold
+contract is 7 and the operator contract is 26; native ABI is 16. Metadata records
+`vit3_cpe_accretive_mean_gelu_v7`, GELU, token-LN mean pooling, no LayerScale
+and CPE. Previous Q/K/V
 checkpoints cannot resume as this model. Historical Small weights were checked
 against the archived source after explicitly translating contract metadata;
 this does not add an automatic checkpoint migration API.

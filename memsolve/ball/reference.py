@@ -66,10 +66,14 @@ def _biased_gemm(
     output = torch.empty((rows, columns), device=left.device, dtype=output_dtype)
     if rows == 0 or columns == 0:
         return output
-    _biased_gemm_kernel()[((rows + 63) // 64, (columns + 63) // 64)](
+    # Wider tiles reuse operands across output columns (Triton matmul tutorial).
+    # Keep small projections compact; this changes only scheduling, not precision.
+    large = rows >= 128 and columns >= 128
+    bm, bn, bk, warps = (128, 128, 32, 8) if large else (64, 64, 32, 4)
+    _biased_gemm_kernel()[((rows + bm - 1) // bm, (columns + bn - 1) // bn)](
         left, right, bias, output, rows, columns, inner,
         *left.stride(), *right.stride(), bias.stride(0),
-        64, 64, 32, num_warps=4,
+        bm, bn, bk, num_warps=warps,
     )
     return output
 
@@ -176,6 +180,7 @@ class _TensorCoreLinear(torch.autograd.Function):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
         output_dtype: torch.dtype | None,
+        fuse_weight_bias_grad: bool,
     ) -> torch.Tensor:
         value_bf16 = value.to(dtype=torch.bfloat16)
         weight_bf16 = weight.to(dtype=torch.bfloat16)
@@ -186,6 +191,7 @@ class _TensorCoreLinear(torch.autograd.Function):
         ctx.bias_dtype = None if bias is None else bias.dtype
         ctx.bias_device = None if bias is None else bias.device
         ctx.has_bias = bias is not None
+        ctx.fuse_weight_bias_grad = fuse_weight_bias_grad
 
         flat_value = value_bf16.reshape(-1, value.shape[-1])
         output = _wide_gemm(
@@ -206,7 +212,7 @@ class _TensorCoreLinear(torch.autograd.Function):
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None]:
         value, weight = ctx.saved_tensors
         flat_value = value.reshape(-1, value.shape[-1])
         flat_gradient = grad_output.to(dtype=torch.bfloat16).reshape(
@@ -225,15 +231,26 @@ class _TensorCoreLinear(torch.autograd.Function):
             ).reshape(ctx.value_shape)
             grad_value = grad_value.to(dtype=ctx.value_dtype)
 
-        grad_weight = None
-        if ctx.needs_input_grad[1]:
+        grad_weight = grad_bias = None
+        # Bias uses the original upstream gradient, not a BF16-rounded FP16/
+        # FP32 tensor. Fuse only when both VJPs consume the same BF16 values.
+        fused = (
+            ctx.fuse_weight_bias_grad and grad_output.dtype == torch.bfloat16
+            and ctx.needs_input_grad[1] and ctx.has_bias and ctx.needs_input_grad[2]
+        )
+        if fused:
+            grad_weight, grad_bias = torch.ops.memsolve_equilibrium.linear_weight_bias(
+                flat_value.contiguous(), flat_gradient.contiguous(),
+            )
+            grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+            grad_bias = grad_bias.to(device=ctx.bias_device, dtype=ctx.bias_dtype)
+        elif ctx.needs_input_grad[1]:
             grad_weight = _wide_gemm(
                 flat_gradient.mT,
                 flat_value,
             ).to(dtype=ctx.weight_dtype)
 
-        grad_bias = None
-        if ctx.has_bias and ctx.needs_input_grad[2]:
+        if not fused and ctx.has_bias and ctx.needs_input_grad[2]:
             # Preserve the original FP32 bias-reduction boundary without
             # materializing a full FP32 copy of a half-precision upstream VJP.
             dimensions = tuple(range(grad_output.ndim - 1))
@@ -243,7 +260,7 @@ class _TensorCoreLinear(torch.autograd.Function):
                 else grad_output.to(dtype=torch.float32)
             ).to(device=ctx.bias_device, dtype=ctx.bias_dtype)
 
-        return grad_value, grad_weight, grad_bias, None
+        return grad_value, grad_weight, grad_bias, None, None
 
 
 @contextmanager
@@ -423,6 +440,7 @@ def tensor_core_linear(
     bias: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype | None = None,
+    fuse_weight_bias_grad: bool = False,
 ) -> torch.Tensor:
     """Apply a BF16/FP32 projection, with FP32 accumulation/bias and an optional final cast.
 
@@ -463,7 +481,7 @@ def tensor_core_linear(
             or (bias is not None and bias.requires_grad)
         )
         if needs_backward:
-            return _TensorCoreLinear.apply(value, weight, bias, output_dtype)
+            return _TensorCoreLinear.apply(value, weight, bias, output_dtype, fuse_weight_bias_grad)
         # Low-precision biased outputs fuse the FP32 bias and final cast;
         # other outputs retain the established GEMM conversion boundary.
         direct_dtype = (
@@ -472,7 +490,7 @@ def tensor_core_linear(
             and (bias is not None or output_dtype == torch.bfloat16)
             else None
         )
-        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype)
+        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype, fuse_weight_bias_grad)
         bias = None
     else:
         output = tensor_core_matmul(value, weight.mT)
@@ -591,6 +609,11 @@ def accretive_equilibrium_mix(
     products are fused as P (correction - eta Z). Shared K is solved
     once per head, with gradients retained and no cross-forward cache.
     Z = P^T C; generator=None means zero correction, equivalent to K=I.
+
+    For P=A R^-1 and R^T R=I+A^T A, the complement can be evaluated
+    as eta*(C-A H), H=solve(I+A^T A, A^T C). Its derivative follows
+    the SPD solve directly: dH=M^-1(dQ-dM H). Cholesky coordinates
+    are an implementation detail and need not be differentiated separately.
     """
 
     if frame.ndim != 4:

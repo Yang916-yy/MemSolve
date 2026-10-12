@@ -83,6 +83,7 @@ target_link_libraries(
     memsolve_equilibrium
     PRIVATE
     ${TORCH_LIBRARIES}
+    CUDA::cublasLt
     CUDA::cudart
     mathdx::cusolverdx_fatbin
 )

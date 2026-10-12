@@ -41,12 +41,18 @@ python -m pip install -e '.[vision]'
 
 Use `.[nlp]` for the BERT workflows or `.[sequence]` for genomic/LRA training.
 Framework integrations and experiment entrypoints run from the source checkout.
-The restored native backend requires the matching extension: Torch
-`2.14.0+cu132`, CUDA 13.2, MathDx 26.06.1 and CMake >=3.25. For this machine:
+The native backend requires the matching extension: Torch
+`2.14.0+cu132`, CUDA 13.2, MathDx 26.06.1 and CMake >=3.25. For an A800/SM80,
+activate the intended Python environment and build from the checkout:
 
 ```bash
-PYTHON=/cywang/vision-venv/bin/python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
+PYTHON=python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
 ```
+
+Set `CUDA_HOME` and `MATHDX_ROOT` if the toolkit locations differ from the
+defaults in `tools/build_cuda.sh`. Select the target architecture listed in the
+[CUDA guide](docs/CUDA_CONTRACT.md#build-and-runtime-artifacts). Native ABI 16
+requires rebuilding older extensions; the model checkpoint contract remains 26.
 
 The reference also runs on CUDA and needs no extension. LAMB training recipes
 separately require NVIDIA Apex.
@@ -173,7 +179,7 @@ evaluation. Both modalities call the same MemSolve operator and CUDA path.
 
 ## Research status and provenance
 
-Current model checkpoint contract: **26**; native CUDA contract: **12**;
+Current model checkpoint contract: **26**; native CUDA contract: **16**;
 source version: **0.15.0**. The current API is `MemSolve` / `MemSolveConfig`.
 Older model checkpoints and the former `lsso` namespace are not supported.
 

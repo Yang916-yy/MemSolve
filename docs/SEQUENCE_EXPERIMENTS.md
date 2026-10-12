@@ -6,7 +6,7 @@
 
 # Sequence Experiments
 
-> Current source uses model contract 26 and native CUDA ABI 12. External position
+> Current source uses model contract 26 and native CUDA ABI 16. External position
 > embeddings belong to the surrounding model. Historical measurements retain
 > their recorded source versions and are not new-source results.
 
@@ -19,8 +19,9 @@ selection, and the one-time held-out test evaluation.
 The restored operator uses shared relation/content projections and the accretive
 compact equilibrium. `--core-mode` selects equilibrium (default) or complement. No RankRotary,
 short convolution or readout gate is present. The surrounding encoder retains
-learned absolute positions initialized from Normal(0,0.02). Native ABI12 accepts
-FP16/BF16 activations; parameters stay FP32. Model checkpoints use contract26.
+learned absolute positions initialized from Normal(0,0.02). The public CUDA
+module accepts FP16/BF16 activations and uses BF16 packed projections internally;
+parameters stay FP32. Model checkpoints use contract 26 and the native ABI is 16.
 
 Historical results below used earlier operator and numerical contracts,
 including internal relation-feature preprocessing absent from current source.

@@ -131,3 +131,39 @@ JHU-CLSP/ettin-encoder-vs-decoder, retrieval_eval/train_st.py (Apache-2.0,
 Copyright 2024 onwards Answer.AI, LightOn, and contributors). These framework
 implementations are imported, not vendored; adaptations are documented in
 docs/BERT_MLM.md.
+
+The compact triangular solves use NVIDIA cuSOLVERDx's TRSM device
+operation and follow the cooperative load/solve/store structure in MathDx
+26.06.1 example/cusolverdx/07_BLAS/trsm_batched_block.cu (Apache-2.0).
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+https://docs.nvidia.com/cuda/cusolverdx/get_started/functions/trsm.html
+
+The compact FP32 Tensor Core products and bounded statistics scheduling draw
+on FLA's tile organization and explicit product-precision choices (MIT):
+https://github.com/fla-org/flash-linear-attention/blob/78a39922d56562336e22e5a429b039f34ef2bf7f/fla/ops/utils/solve_tril.py
+https://github.com/fla-org/flash-linear-attention/blob/78a39922d56562336e22e5a429b039f34ef2bf7f/fla/ops/common/chunk_o.py
+The projected GEMM tiles follow Triton's matrix-multiplication tutorial:
+https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
+These references inform algorithm/scheduling choices; MemSolve's equations
+and analytic derivatives remain independently defined in reference.py.
+
+The complement solve calls NVIDIA cuSOLVERDx POTRS; the projection
+weight/bias gradient calls the cuBLASLt BGRADB epilogue with FP32 accumulation.
+These are library API integrations, not vendored solver or GEMM implementations.
+https://docs.nvidia.com/cuda/cusolverdx/get_started/potrs.html
+https://docs.nvidia.com/cuda/cublas/index.html#cublasltepilogue-t
+
+Compact factor/solve composition uses the NVIDIA cuSOLVERDx POTRF, TRSM and
+POTRS APIs, factoring each system once before processing its RHS panels.
+The shared-map gradient follows the split-reduction organization described by
+CUTLASS, implemented for MemSolve's FP32 compact products in Triton.
+cuBLASLt host-plan reuse follows NVIDIA's heuristics-cache guidance.
+https://docs.nvidia.com/cuda/cusolverdx/get_started/posv.html
+https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html#parallelized-reductions
+https://docs.nvidia.com/cuda/cublas/index.html#heuristics-cache
+
+Cholesky-adjoint fusion composes the cuSOLVERDx left/transposed and
+right/nontransposed TRSM operations cited above in shared memory. No solver
+source is vendored. Compact-product epilogues follow the cited Triton
+post-accumulation fusion pattern; the analytic VJP remains the repository's
+reference contract.

@@ -235,7 +235,8 @@ class MemSolve(nn.Module):
             assert mask is not None
             safe_x = torch.where(mask[:, :, None], x, torch.zeros_like(x))
         projected = tensor_core_linear(
-            safe_x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16
+            safe_x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16,
+            fuse_weight_bias_grad=True,
         )
         if not all_valid:
             assert mask is not None
@@ -256,7 +257,8 @@ class MemSolve(nn.Module):
             valid_counts,
         )
         output = tensor_core_linear(
-            mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype
+            mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype,
+            fuse_weight_bias_grad=True,
         )
         if not all_valid:
             assert mask is not None

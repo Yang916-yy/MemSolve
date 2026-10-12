@@ -106,6 +106,11 @@ def test_cuda_probe_uses_equilibrium_namespace(monkeypatch: pytest.MonkeyPatch) 
         contract_version=lambda: cuda._NATIVE_CONTRACT_VERSION,
         compact_lu=object(),
         compact_getrs=object(),
+        compact_trsm=object(),
+        compact_potrs=object(),
+        compact_factor_solve=object(),
+        compact_cholesky_backward=object(),
+        linear_weight_bias=object(),
     )
     monkeypatch.setattr(
         cuda,
@@ -134,6 +139,11 @@ def test_cuda_probe_rejects_a_stale_native_contract(
         contract_version=lambda: cuda._NATIVE_CONTRACT_VERSION - 1,
         compact_lu=object(),
         compact_getrs=object(),
+        compact_trsm=object(),
+        compact_potrs=object(),
+        compact_factor_solve=object(),
+        compact_cholesky_backward=object(),
+        linear_weight_bias=object(),
     )
     monkeypatch.setattr(
         cuda,
@@ -159,6 +169,11 @@ def test_cuda_loader_rejects_a_stale_same_name_artifact(
         namespace.contract_version = lambda: cuda._NATIVE_CONTRACT_VERSION - 1
         namespace.compact_lu = object()
         namespace.compact_getrs = object()
+        namespace.compact_trsm = object()
+        namespace.compact_potrs = object()
+        namespace.compact_factor_solve = object()
+        namespace.compact_cholesky_backward = object()
+        namespace.linear_weight_bias = object()
 
     monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
     monkeypatch.setattr(cuda, "_LOADED_ARCHITECTURE", None)
@@ -1424,9 +1439,276 @@ def test_compact_analytic_vjp_matches_independent_fp64_autograd(mode, rank):
     with torch.no_grad(), _ieee_fp32_matmul(gram.device):
         got, got_eta, tape = cuda._no_frame_compact(gram, cross, base, raw, mode)
         actual = cuda._no_frame_compact_backward(got, got_eta, tape, upstream, eta_upstream, mode)
-    _assert_mixed_close(got, coefficient, limit=2e-5)
+    represented = -got_eta[None, :, None, None] * got if mode == 2 else got
+    _assert_mixed_close(represented, coefficient, limit=2e-5)
     for value, oracle in zip(actual, expected):
         if oracle is None:
             assert value is None
         else:
             _assert_mixed_close(value, oracle, limit=1e-4)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("column_major_rhs", [False, True])
+def test_compact_trsm_preserves_layouts_and_matches_fp64(rank, transpose, column_major_rhs):
+    _require_native_cuda()
+    torch.manual_seed(413 + rank)
+    a = torch.randn(2, 3, rank, rank, device="cuda") / rank**0.5
+    factor = torch.linalg.cholesky(torch.eye(rank, device="cuda") + a @ a.mT)
+    rhs = torch.randn(2, 3, rank, 65, device="cuda")
+    if column_major_rhs:
+        rhs = rhs.mT.contiguous().mT
+    factor_before, rhs_before = factor.clone(), rhs.clone()
+    with torch.no_grad():
+        actual = torch.ops.memsolve_equilibrium.compact_trsm(factor, rhs, transpose)
+        expected = torch.linalg.solve_triangular(
+            factor.double().mT if transpose else factor.double(), rhs.double(), upper=transpose,
+        )
+    _assert_mixed_close(actual, expected, limit=2e-6)
+    torch.testing.assert_close(factor, factor_before, rtol=0, atol=0)
+    torch.testing.assert_close(rhs, rhs_before, rtol=0, atol=0)
+
+
+def test_compact_trsm_rejects_invalid_inputs_and_unowned_autograd():
+    _require_native_cuda()
+    factor = torch.eye(16, device="cuda").requires_grad_()
+    rhs = torch.ones(16, 7, device="cuda")
+    with pytest.raises(RuntimeError, match="explicit autograd owner"):
+        torch.ops.memsolve_equilibrium.compact_trsm(factor, rhs)
+    with torch.no_grad():
+        with pytest.raises(RuntimeError, match="CUDA FP32"):
+            torch.ops.memsolve_equilibrium.compact_trsm(factor, rhs.bfloat16())
+        with pytest.raises(RuntimeError, match="batch/rank mismatch"):
+            torch.ops.memsolve_equilibrium.compact_trsm(factor, rhs[:15])
+        with pytest.raises(RuntimeError, match="dense CUDA FP32"):
+            torch.ops.memsolve_equilibrium.compact_trsm(factor, rhs[:, ::2])
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("loss_scale", [2.0**-24, 1.0, 2.0**12])
+def test_no_frame_small_gradients_preserve_bf16_range(mode, loss_scale):
+    """A small loss must not introduce an FP16 gradient underflow boundary."""
+    _require_native_cuda()
+    torch.manual_seed(493)
+    layer = MemSolve(MemSolveConfig(32, 2, rank=16, core_mode=mode, bias=True)).cuda()
+    with torch.no_grad():
+        if layer.core_base_raw is not None:
+            layer.core_base_raw.normal_(std=0.1)
+    oracle = copy.deepcopy(layer).double()
+    x = torch.randn(2, 129, 32, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    xr = x.detach().double().requires_grad_()
+    upstream = (torch.randn_like(x) * loss_scale).bfloat16()
+    y = layer(x, implementation="cuda")
+    yr = oracle(xr, implementation="reference")
+    got = torch.autograd.grad(y, (x, *layer.parameters()), upstream)
+    want = torch.autograd.grad(yr, (xr, *oracle.parameters()), upstream.double())
+    _assert_mixed_close(y, yr, limit=5e-3)
+    for actual, expected in zip(got, want):
+        _assert_mixed_close(actual, expected, limit=3e-2)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("column_major_factor", [False, True])
+@pytest.mark.parametrize("column_major_rhs", [False, True])
+def test_compact_potrs_matches_fp64_without_modifying_inputs(rank, column_major_factor, column_major_rhs):
+    _require_native_cuda()
+    torch.manual_seed(620 + rank)
+    a = torch.randn(2, 3, rank, rank, device="cuda") / rank**0.5
+    factor = torch.linalg.cholesky(torch.eye(rank, device="cuda") + a @ a.mT)
+    if not column_major_factor:
+        factor = factor.contiguous()
+    rhs = torch.randn(2, 3, rank, 65, device="cuda")
+    if column_major_rhs:
+        rhs = rhs.mT.contiguous().mT
+    before = (factor.clone(), rhs.clone())
+    with torch.no_grad():
+        actual = torch.ops.memsolve_equilibrium.compact_potrs(factor, rhs)
+        expected = torch.cholesky_solve(rhs.double(), factor.double())
+    _assert_mixed_close(actual, expected, limit=2e-6)
+    for got, original in zip((factor, rhs), before):
+        torch.testing.assert_close(got, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(257, 32, 48), (129, 17, 19), (4096, 64, 96)])
+@pytest.mark.parametrize("scale", [2.0**-24, 1.0, 2.0**12])
+def test_fused_linear_weight_bias_preserves_fp32_gradients(shape, scale):
+    _require_native_cuda()
+    torch.manual_seed(731)
+    tokens, inputs, outputs = shape
+    x = torch.randn(tokens, inputs, device="cuda", dtype=torch.bfloat16)
+    e = (torch.randn(tokens, outputs, device="cuda") * scale).bfloat16()
+    with torch.no_grad():
+        weight, bias = torch.ops.memsolve_equilibrium.linear_weight_bias(x, e)
+    assert weight.dtype == bias.dtype == torch.float32
+    _assert_mixed_close(weight, e.double().mT @ x.double(), limit=1e-4)
+    _assert_mixed_close(bias, e.double().sum(0), limit=2e-6)
+
+
+def test_fused_linear_rejects_invalid_inputs_and_unowned_autograd():
+    _require_native_cuda()
+    x = torch.randn(31, 16, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    e = torch.randn(31, 32, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="explicit autograd owner"):
+        torch.ops.memsolve_equilibrium.linear_weight_bias(x, e)
+    with torch.no_grad():
+        with pytest.raises(RuntimeError, match="CUDA BF16"):
+            torch.ops.memsolve_equilibrium.linear_weight_bias(x.float(), e)
+        with pytest.raises(RuntimeError, match="matching nonempty"):
+            torch.ops.memsolve_equilibrium.linear_weight_bias(x, e[:30])
+
+
+@pytest.mark.parametrize("upstream_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_fused_projection_bias_uses_original_upstream_dtype(upstream_dtype):
+    _require_native_cuda()
+    from memsolve.ball.reference import tensor_core_linear
+
+    torch.manual_seed(843)
+    x = torch.randn(3, 129, 32, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    w = torch.randn(48, 32, device="cuda", requires_grad=True)
+    b = torch.randn(48, device="cuda", requires_grad=True)
+    e = torch.randn(3, 129, 48, device="cuda", dtype=upstream_dtype)
+    fused = tensor_core_linear(x, w, b, output_dtype=upstream_dtype, fuse_weight_bias_grad=True)
+    plain = tensor_core_linear(x, w, b, output_dtype=upstream_dtype)
+    actual = torch.autograd.grad(fused, (x, w, b), e)
+    expected = torch.autograd.grad(plain, (x, w, b), e)
+    for got, oracle in zip(actual, expected):
+        _assert_mixed_close(got, oracle, limit=1e-4)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("complete", [False, True])
+@pytest.mark.parametrize("columns", [1, 65])
+def test_fused_factor_solve_matches_fp64_and_preserves_inputs(rank, complete, columns):
+    _require_native_cuda()
+    torch.manual_seed(913 + rank)
+    a = torch.randn(2, 3, rank + 7, rank, device="cuda") / rank**0.5
+    gram = (a.mT @ a).contiguous()
+    rhs = torch.randn(2, 3, rank, columns, device="cuda")
+    before = (gram.clone(), rhs.clone())
+    factor, state = torch.ops.memsolve_equilibrium.compact_factor_solve(gram, rhs, complete)
+    expected_factor = torch.linalg.cholesky(gram.double() + torch.eye(rank, device="cuda"))
+    expected_state = (
+        torch.cholesky_solve(rhs.double(), expected_factor) if complete
+        else torch.linalg.solve_triangular(expected_factor, rhs.double(), upper=False)
+    )
+    _assert_mixed_close(factor, expected_factor, limit=2e-6)
+    _assert_mixed_close(state, expected_state, limit=3e-6)
+    for got, original in zip((gram, rhs), before):
+        torch.testing.assert_close(got, original, rtol=0, atol=0)
+
+
+def test_factor_solve_rejects_invalid_inputs_and_unowned_autograd():
+    _require_native_cuda()
+    gram = torch.eye(16, device="cuda").requires_grad_()
+    rhs = torch.ones(16, 7, device="cuda")
+    with pytest.raises(RuntimeError, match="explicit autograd owner"):
+        torch.ops.memsolve_equilibrium.compact_factor_solve(gram, rhs, True)
+    with torch.no_grad():
+        with pytest.raises(RuntimeError, match="CUDA FP32"):
+            torch.ops.memsolve_equilibrium.compact_factor_solve(gram, rhs.bfloat16(), True)
+        with pytest.raises(RuntimeError, match="batch/rank mismatch"):
+            torch.ops.memsolve_equilibrium.compact_factor_solve(gram, rhs[:15], False)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("shape", [(3, 17), (129, 64)])
+def test_head_gradient_reduction_matches_fp64(rank, shape):
+    _require_native_cuda()
+    batch, channels = shape
+    torch.manual_seed(951)
+    left = torch.randn(batch, 2, rank, channels, device="cuda")
+    right = torch.randn_like(left)
+    actual = cuda._head_product_sum(left, right)
+    expected = (left.double() @ right.double().mT).sum(0)
+    _assert_mixed_close(actual, expected, limit=2e-6)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_fused_cholesky_adjoint_matches_fp64(rank):
+    _require_native_cuda()
+    torch.manual_seed(412 + rank)
+    x = torch.randn(3, 2, rank, rank, device="cuda") / rank**0.5
+    factor = torch.linalg.cholesky(torch.eye(rank, device="cuda") + x @ x.mT).contiguous()
+    product = torch.randn_like(factor)
+    before = (factor.clone(), product.clone())
+    lower = product.double().tril()
+    symmetric = 0.5 * (lower + lower.tril(-1).mT)
+    intermediate = torch.linalg.solve_triangular(factor.double().mT, symmetric, upper=True)
+    expected = torch.linalg.solve_triangular(factor.double(), intermediate, upper=False, left=False)
+    actual = torch.ops.memsolve_equilibrium.compact_cholesky_backward(factor, product)
+    _assert_mixed_close(actual, expected, limit=2e-6)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(factor, before[0], rtol=0, atol=0)
+    torch.testing.assert_close(product, before[1], rtol=0, atol=0)
+
+
+def test_fused_cholesky_adjoint_rejects_unowned_or_mismatched_inputs():
+    _require_native_cuda()
+    factor = torch.eye(16, device="cuda")
+    product = torch.randn_like(factor).requires_grad_()
+    with pytest.raises(RuntimeError, match="explicit autograd owner"):
+        torch.ops.memsolve_equilibrium.compact_cholesky_backward(factor, product)
+    with torch.no_grad():
+        with pytest.raises(RuntimeError, match="contiguous CUDA FP32"):
+            torch.ops.memsolve_equilibrium.compact_cholesky_backward(factor, product.bfloat16())
+        with pytest.raises(RuntimeError, match="match the factor"):
+            torch.ops.memsolve_equilibrium.compact_cholesky_backward(factor, product.expand(2, 16, 16).contiguous())
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+def test_compact_product_adjoint_epilogues_match_fp64(rank):
+    _require_native_cuda()
+    torch.manual_seed(581 + rank)
+    left = torch.randn(3, 2, rank, 17, device="cuda")
+    right = torch.randn_like(left)
+    expected = left.double() @ right.double().mT
+    negative = cuda._compact_product(left, right.mT, negative=True)
+    symmetric = cuda._compact_product(left, right.mT, negative=True, symmetrize=True)
+    accumulator = torch.randn_like(negative)
+    before = accumulator.clone()
+    actual = cuda._compact_product(left, right.mT, subtract_from=accumulator)
+    assert actual.data_ptr() == accumulator.data_ptr()
+    _assert_mixed_close(negative, -expected, limit=2e-6)
+    _assert_mixed_close(symmetric, -0.5 * (expected + expected.mT), limit=2e-6)
+    _assert_mixed_close(actual, before.double() - expected, limit=2e-6)
+
+
+@pytest.mark.parametrize("batch,rank,channels", [(3, 16, 17), (129, 32, 64), (2, 64, 257)])
+@pytest.mark.parametrize("scale", [2.0**-24, 1.0, 2.0**12])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_compact_eta_adjoint_matches_fp64(batch, rank, channels, scale, transposed):
+    _require_native_cuda()
+    torch.manual_seed(756 + rank)
+    gradient = torch.randn(batch, 3, rank, channels, device="cuda") * scale
+    state = torch.randn_like(gradient)
+    if transposed:
+        gradient = gradient.mT.contiguous().mT
+        state = state.mT.contiguous().mT
+    direct = torch.randn(3, device="cuda") * scale
+    derivative = torch.tensor([1.0, 1e-8, 0.2], device="cuda")
+    expected = (direct.double() - (gradient.double() * state.double()).sum((0, 2, 3))) * derivative.double()
+    actual = cuda._eta_adjoint(gradient, state, direct, derivative)
+    _assert_mixed_close(actual, expected, limit=2e-6)
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_linear_plan_cache_refreshes_pointers_and_respects_alignment(offset):
+    _require_native_cuda()
+    torch.manual_seed(998)
+    inputs, outputs, tokens = 32, 48, 257
+    graphs, tensors = [], []
+    for _ in range(2):
+        x = torch.randn(tokens * inputs + offset, device="cuda", dtype=torch.bfloat16)[offset:].view(tokens, inputs)
+        e = torch.randn(tokens * outputs + offset, device="cuda", dtype=torch.bfloat16)[offset:].view(tokens, outputs)
+        torch.ops.memsolve_equilibrium.linear_weight_bias(x, e)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            weight, bias = torch.ops.memsolve_equilibrium.linear_weight_bias(x, e)
+        graphs.append(graph)
+        tensors.append((x, e, weight, bias))
+    for graph, (x, e, weight, bias) in zip(graphs, tensors):
+        x.normal_(); e.normal_()
+        graph.replay()
+        _assert_mixed_close(weight, e.double().mT @ x.double(), limit=1e-4)
+        _assert_mixed_close(bias, e.double().sum(0), limit=2e-6)

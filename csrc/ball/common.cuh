@@ -47,4 +47,8 @@ inline int supported_sm() {
 std::tuple<at::Tensor, at::Tensor, at::Tensor> compact_lu_cuda(const at::Tensor& a);
 at::Tensor compact_getrs_cuda(const at::Tensor& lu, const at::Tensor& pivots,
                              const at::Tensor& rhs, bool transpose);
+at::Tensor compact_potrs_cuda(const at::Tensor& factor, const at::Tensor& rhs);
+at::Tensor compact_trsm_cuda(const at::Tensor& factor, const at::Tensor& rhs, bool transpose);
+std::tuple<at::Tensor,at::Tensor> compact_factor_solve_cuda(const at::Tensor& gram,const at::Tensor& rhs,bool complete);
+at::Tensor compact_cholesky_backward_cuda(const at::Tensor& factor, const at::Tensor& product);
 }  // namespace memsolve_equilibrium

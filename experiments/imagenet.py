@@ -552,6 +552,8 @@ def _validate_run(
         raise ValueError("the current ImageNet contract requires train.amp_dtype = 'bfloat16'")
     if not isinstance(train["ema"], bool):
         raise ValueError("ema must be a boolean")
+    if not isinstance(train["repeated_aug"], bool):
+        raise ValueError("repeated_aug must be a boolean")
     if train["ema"]:
         decay = _probability(train.get("ema_decay"), "ema_decay")
         if decay >= 1:
@@ -563,9 +565,6 @@ def _validate_run(
             raise ValueError("plain ViT³ uses RandAugment")
         if model["drop_path_schedule"] != "linear":
             raise ValueError("plain ViT³ requires linear DropPath")
-        for key in ("repeated_aug", "ema"):
-            if train[key] is not False:
-                raise ValueError(f"plain ViT³ requires {key} = false")
     else:
         family = "RoPE-ViT" if recipe == "ropevit_400" else "DeiT III"
         group_size = _positive_int(train.get("augmentation_group_size"), "augmentation_group_size")
@@ -966,7 +965,8 @@ class ImageNetWebDatasetManifest:
     def data_contract(
         self, *, repeated_augmentation: bool, augmentation_group_size: int | None = None,
     ) -> dict[str, Any]:
-        indexed = augmentation_group_size is not None
+        grouped = augmentation_group_size is not None
+        indexed = grouped or repeated_augmentation
         return {
             "format": "webdataset-v1",
             "source": IMAGENET_WDS_SOURCE,
@@ -975,18 +975,22 @@ class ImageNetWebDatasetManifest:
             "validation": self.validation.contract(),
             "streaming": {
                 "shard_order": (
-                    "global-sample-permutation-then-virtual-group-rank-stride" if indexed
+                    "global-sample-permutation-then-virtual-group-rank-stride" if grouped
+                    else "global-sample-repeat-then-rank-stride" if indexed
                     else "global-epoch-permutation-then-rank-stride-worker-quota"
                 ),
-                "sample_shuffle": {"algorithm": "torch.randperm", "seed_policy": "seed-epoch-v1"} if indexed else {
+                "sample_shuffle": {"algorithm": "torch.randperm", "seed_policy": (
+                    "seed-epoch-v1" if grouped else "timm-epoch-plus-seed-v1"
+                )} if indexed else {
                     "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
                     "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
                 },
                 "source_views": 3 if repeated_augmentation else 1,
                 "repeated_augmentation_placement": (
-                    "global-virtual-group-repeat-then-rank-stride" if indexed else "rank-local-physical-batch-interleave"
+                    "global-virtual-group-repeat-then-rank-stride" if grouped
+                    else "timm-repeat-aug-3" if indexed else "rank-local-physical-batch-interleave"
                 ),
-                **({"augmentation_group_size": augmentation_group_size} if indexed else {}),
+                **({"augmentation_group_size": augmentation_group_size} if grouped else {}),
                 "validation_partition": "worker-stride-full-per-rank",
                 "worker_rng": "epoch-rank-worker-v1",
             },
@@ -1233,14 +1237,18 @@ def _validate_webdataset_contract(value: object) -> None:
         ),
         "checkpoint WebDataset streaming contract",
     )
-    indexed = streaming["shard_order"] == "global-sample-permutation-then-virtual-group-rank-stride"
+    grouped = streaming["shard_order"] == "global-sample-permutation-then-virtual-group-rank-stride"
+    repeated = streaming["shard_order"] == "global-sample-repeat-then-rank-stride"
+    indexed = grouped or repeated
     if not indexed and streaming["shard_order"] != "global-epoch-permutation-then-rank-stride-worker-quota":
         raise ValueError("checkpoint WebDataset shard ordering is invalid")
     sample_shuffle = _as_mapping(
         streaming["sample_shuffle"],
         "checkpoint WebDataset sample shuffle contract",
     )
-    expected_shuffle = {"algorithm": "torch.randperm", "seed_policy": "seed-epoch-v1"} if indexed else {
+    expected_shuffle = {"algorithm": "torch.randperm", "seed_policy": (
+        "seed-epoch-v1" if grouped else "timm-epoch-plus-seed-v1"
+    )} if indexed else {
         "buffer_size": WDS_SAMPLE_SHUFFLE_SIZE,
         "initial_size": WDS_SAMPLE_SHUFFLE_INITIAL,
     }
@@ -1250,10 +1258,13 @@ def _validate_webdataset_contract(value: object) -> None:
         raise ValueError("checkpoint WebDataset source view count is invalid")
     if (
         streaming["repeated_augmentation_placement"]
-        != ("global-virtual-group-repeat-then-rank-stride" if indexed else "rank-local-physical-batch-interleave")
+        != ("global-virtual-group-repeat-then-rank-stride" if grouped
+            else "timm-repeat-aug-3" if repeated else "rank-local-physical-batch-interleave")
     ):
         raise ValueError("checkpoint WebDataset repeated-augmentation placement is invalid")
-    if indexed:
+    if repeated and (streaming["source_views"] != 3 or "augmentation_group_size" in streaming):
+        raise ValueError("checkpoint timm repeated augmentation requires three views and no virtual groups")
+    if grouped:
         group_size = _positive_int(streaming.get("augmentation_group_size"), "data.augmentation_group_size")
         if group_size % 2:
             raise ValueError("checkpoint augmentation group size must be even")
@@ -1349,7 +1360,7 @@ class _ImageNetIndexedDataset(Dataset[tuple[torch.Tensor, int]]):
             try:
                 from wids import ShardListDataset
             except ImportError as error:
-                raise RuntimeError("virtual-group ImageNet loading requires wids; install the vision extra") from error
+                raise RuntimeError("indexed ImageNet loading requires wids; install the vision extra") from error
             import resource
             import warnings
 
@@ -1394,6 +1405,37 @@ class _ImageNetIndexedDataset(Dataset[tuple[torch.Tensor, int]]):
             {"jpg": sample[".jpg"].getvalue(), "cls": sample[".cls"].getvalue()},
             transform=self.transform, num_classes=self.num_classes,
         )
+
+
+class RepeatedAugmentationSampler(Sampler[int]):
+    """Use timm's DeiT RA sampler with the runner's fixed update budget.
+
+    Only truncate an incomplete update and propagate epochs to persistent
+    dataset workers. Sampling and rank distribution are owned by timm.
+    """
+
+    def __init__(self, dataset: _ImageNetIndexedDataset, *, samples_per_rank: int) -> None:
+        from timm.data.distributed_sampler import RepeatAugSampler
+
+        self.dataset = dataset
+        self.num_samples = _positive_int(samples_per_rank, "samples_per_rank")
+        self.sampler = RepeatAugSampler(
+            dataset, num_replicas=dataset.state.world_size, rank=dataset.state.rank,
+            num_repeats=3, selected_round=0,
+        )
+        if self.num_samples > len(self.sampler):
+            raise ValueError("repeated augmentation cannot exceed the per-rank epoch budget")
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.dataset.set_epoch(epoch)
+        self.sampler.set_epoch(int(epoch) + self.dataset.seed)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        return itertools.islice(iter(self.sampler), self.num_samples)
 
 
 class VirtualGroupSampler(Sampler[int]):
@@ -1728,7 +1770,7 @@ def build_loaders(
 ) -> tuple[
     DataLoader[Any],
     DataLoader[Any],
-    _ImageNetWebDataset | VirtualGroupSampler,
+    _ImageNetWebDataset | VirtualGroupSampler | RepeatedAugmentationSampler,
     BatchingPlan,
     LoaderRandomGenerators,
     dict[str, Any],
@@ -1748,7 +1790,8 @@ def build_loaders(
         batching_plan.microbatches_per_epoch,
     )
     group_size = batching_plan.augmentation_group_size
-    if group_size is None and state.world_size * effective_train_workers > len(manifest.train.paths):
+    indexed = group_size is not None or bool(run.train["repeated_aug"])
+    if not indexed and state.world_size * effective_train_workers > len(manifest.train.paths):
         raise ValueError("train worker count exceeds the available WebDataset shard partition")
     if val_workers > len(manifest.validation.paths):
         raise ValueError("validation worker count exceeds the 64 validation shards")
@@ -1758,15 +1801,20 @@ def build_loaders(
         repeated_augmentation=bool(run.train["repeated_aug"]),
         augmentation_group_size=group_size,
     )
-    if group_size is not None:
+    if indexed:
         train_dataset = _ImageNetIndexedDataset(
             manifest.train, transform=build_train_transform(run), state=state,
             seed=int(run.train["seed"]), num_classes=int(run.model["num_classes"]),
         )
-        epoch_controller = VirtualGroupSampler(
-            train_dataset, samples_per_rank=batching_plan.samples_per_rank,
-            group_size=group_size, num_repeats=source_views,
-        )
+        if group_size is not None:
+            epoch_controller = VirtualGroupSampler(
+                train_dataset, samples_per_rank=batching_plan.samples_per_rank,
+                group_size=group_size, num_repeats=source_views,
+            )
+        else:
+            epoch_controller = RepeatedAugmentationSampler(
+                train_dataset, samples_per_rank=batching_plan.samples_per_rank,
+            )
     else:
         train_dataset = _ImageNetWebDataset(
             manifest.train, transform=build_train_transform(run), state=state,
@@ -1795,7 +1843,7 @@ def build_loaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batching_plan.physical_batch_size,
-        **({"sampler": epoch_controller} if group_size is not None else {}),
+        **({"sampler": epoch_controller} if indexed else {}),
         drop_last=True,
         **_loader_kwargs(
             workers=0 if train_workers == 0 else effective_train_workers,

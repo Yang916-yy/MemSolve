@@ -20,8 +20,9 @@ def select_tasks(suite, names=None):
         return mteb.get_tasks(tasks=names)
     if suite == "longembed":
         return mteb.get_tasks(tasks=LONGEMBED)
-    if suite == "mteb-eng-v2":
-        return mteb.get_benchmark("MTEB(eng, v2)").tasks
+    if suite in ("mteb-eng-v2", "mteb-eng-v2-retrieval"):
+        tasks = mteb.get_benchmark("MTEB(eng, v2)").tasks
+        return [t for t in tasks if t.metadata.type == "Retrieval"] if suite.endswith("-retrieval") else tasks
     raise ValueError("Choose a suite or explicit MTEB task names")
 
 
@@ -32,6 +33,8 @@ def evaluate(checkpoint, output, max_length=512, implementation="cuda", device="
         raise ValueError("CUDA evaluation requires bf16 AMP with FP32 weights")
     selected = [] if local_ir else list(select_tasks(suite, tasks))
     metadata = {"checkpoint_sha256": checkpoint_digest(checkpoint), "max_length": max_length,
+                "model_type": model[0].auto_model.config.model_type,
+                "position_capacity": model[0].auto_model.config.max_position_embeddings,
                 "precision": "bf16_amp" if bf16 else "fp32", "implementation": implementation,
                 "normalize_embeddings": True, "batch_size": batch_size,
                 "length_policy": "truncate_to_max_length; no position extension or chunking",
@@ -70,7 +73,7 @@ def main():
     parser.add_argument("--checkpoint")
     parser.add_argument("--output")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--suite", choices=("mteb-eng-v2", "longembed"), default="mteb-eng-v2")
+    selection.add_argument("--suite", choices=("mteb-eng-v2", "mteb-eng-v2-retrieval", "longembed"), default="mteb-eng-v2")
     selection.add_argument("--tasks", nargs="+")
     selection.add_argument("--local-ir", help="JSON with queries, corpus and relevant_docs dictionaries")
     parser.add_argument("--max-length", type=int, default=512)

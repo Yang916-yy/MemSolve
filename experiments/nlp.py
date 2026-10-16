@@ -44,11 +44,25 @@ def checkpoint_digest(path):
     return result.hexdigest()
 
 
+def source_digest():
+    """Fingerprint the operator, native source and NLP pipeline, including local edits."""
+    root = Path(__file__).resolve().parents[1]
+    files = list((root / "memsolve").rglob("*.py"))
+    files += [p for p in (root / "csrc").rglob("*") if p.is_file()
+              and p.suffix in (".cpp", ".cu", ".cuh", ".h", ".txt")]
+    files += [root / "integrations/transformers.py", root / "integrations/distributed.py", root / "pyproject.toml"]
+    files += [root / "experiments" / name for name in
+              ("nlp.py", "prepare_c4.py", "train_mlm.py", "train_retrieval.py", "evaluate_embeddings.py")]
+    return digest({p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in sorted(files)})
+
+
 def versions():
-    return {name: importlib.metadata.version(name) for name in
+    packages = {name: importlib.metadata.version(name) for name in
             ("torch", "transformers", "datasets", "accelerate",
              "sentence-transformers", "mteb")
             if importlib.util.find_spec(name.replace("-", "_")) is not None}
+    return {**packages, "memsolve_source_sha256": source_digest()}
 
 
 def tokenizer_digest(tokenizer):
@@ -66,34 +80,48 @@ def accumulation_steps(global_batch, micro_batch, world_size):
 
 
 def check_training_precision(settings, implementation):
+    if implementation not in ("cuda", "reference"):
+        raise ValueError("implementation must be cuda or reference")
     if settings.get("fp16") or settings.get("bf16_full_eval") or settings.get("fp16_full_eval"):
         raise ValueError("Use bf16 AMP with FP32 parameters, not fp16/full_eval casts")
-    if implementation == "cuda" and (not torch.cuda.is_available() or not settings.get("bf16")):
+    if implementation == "cuda" and (settings.get("use_cpu") or not torch.cuda.is_available()
+                                      or not settings.get("bf16")):
         raise ValueError("The cuda implementation requires a CUDA device and bf16 AMP")
 
 
 def record_run(output, manifest, resume=None):
-    """Rank zero validates before Trainer writes. Never overwrite an unrelated run."""
-    if int(os.environ.get("RANK", "0")) != 0:
-        return
+    """Validate/write on rank zero and propagate failure before Trainer starts."""
+    manifest = {**manifest, "experiment": {**manifest["experiment"],
+                                         "source_sha256": source_digest()}}
     output = Path(output)
     path = output / "run.json"
-    if resume:
-        if Path(resume).resolve().parent != output.resolve():
-            raise ValueError("Resume checkpoint must belong to this output directory")
-        if not (Path(resume) / "trainer_state.json").is_file():
-            raise ValueError("Resume requires a Trainer checkpoint, not just exported weights")
-        if not path.is_file() or read_json(path)["experiment"] != manifest["experiment"]:
-            raise ValueError("Resume recipe/data differ from output/run.json")
-    elif output.exists() and any(output.iterdir()):
-        raise ValueError(f"Output directory is not empty: {output}; use --resume")
-    if int(os.environ.get("RANK", "0")) == 0:
-        write_json(path, manifest)
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    error = [None]
+    if not distributed or torch.distributed.get_rank() == 0:
+        try:
+            if resume:
+                if Path(resume).resolve().parent != output.resolve():
+                    raise ValueError("Resume checkpoint must belong to this output directory")
+                if not (Path(resume) / "trainer_state.json").is_file():
+                    raise ValueError("Resume requires a Trainer checkpoint, not just exported weights")
+                if not path.is_file() or read_json(path)["experiment"] != manifest["experiment"]:
+                    raise ValueError("Resume recipe/data differ from output/run.json")
+            elif output.exists() and any(output.iterdir()):
+                raise ValueError(f"Output directory is not empty: {output}; use --resume")
+            write_json(path, manifest)
+        except (ValueError, OSError, KeyError) as exc:
+            error[0] = str(exc)
+    if distributed:
+        torch.distributed.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise ValueError(error[0])
 
 
 class MLMCollator:
     """HF stochastic training masks; prepared validation already has fixed labels."""
     def __init__(self, tokenizer, probability):
+        if not 0 < probability <= 1:
+            raise ValueError("MLM mask probability must be in (0, 1]")
         self.training = DataCollatorForLanguageModeling(tokenizer, mlm_probability=probability)
 
     def __call__(self, examples):
@@ -135,35 +163,101 @@ def masked_metrics(prediction):
             "masked_perplexity": math.exp(nll), "masked_tokens": int(count)}
 
 
-def load_prepared(root):
+def load_prepared(root, splits=("train", "validation")):
     from datasets import concatenate_datasets, load_from_disk
     root = Path(root)
     result, manifests, tokenizer_path = {}, {}, None
-    for split in ("train", "validation"):
+    if not splits or any(split not in ("train", "validation") for split in splits):
+        raise ValueError("Choose train and/or validation prepared splits")
+    for split in splits:
         paths = sorted(path for path in (root / split).glob("part-*/manifest.json")
                        if not path.parent.name.endswith(".incomplete"))
         if not paths:
             raise ValueError(f"No complete {split} partitions in {root}")
         metadata = [read_json(path) for path in paths]
+        if any(m.get("format") != 1 or m.get("split") != split for m in metadata):
+            raise ValueError(f"Unsupported format or mislabeled {split} partition")
         total = metadata[0]["num_shards"]
         if len(paths) != total or sorted(m["shard_index"] for m in metadata) != list(range(total)):
             raise ValueError(f"Incomplete or duplicate {split} partitions")
         common = [{k: v for k, v in m.items() if k not in
-                   ("shard_index", "rows", "fingerprint")} for m in metadata]
+                   ("shard_index", "rows", "fingerprint", "token_counts")} for m in metadata]
         if any(m != common[0] for m in common):
             raise ValueError(f"Inconsistent {split} preparation settings")
         parts = [load_from_disk(str(path.parent / "dataset")) for path in paths]
         if any(len(part) != meta["rows"] or part._fingerprint != meta["fingerprint"]
                for part, meta in zip(parts, metadata)):
             raise ValueError("Prepared data fingerprint or row count changed")
+        required = {"input_ids", "attention_mask",
+                    "labels" if split == "validation" else "special_tokens_mask"}
+        if any(not len(part) or not required.issubset(part.column_names) for part in parts):
+            raise ValueError(f"Empty {split} data or missing MLM columns")
+        for part, meta in zip(parts, metadata):
+            if any(getattr(part.features[key], "length", None) != meta["max_length"]
+                   for key in required):
+                raise ValueError(f"Prepared {split} sequence length differs from its manifest")
         result[split] = concatenate_datasets(parts)
         manifests[split] = metadata
         tokenizer_path = tokenizer_path or paths[0].parent / "tokenizer"
-    train, val = manifests["train"][0], manifests["validation"][0]
-    for key in ("tokenizer_hash", "max_length"):
-        if train[key] != val[key]:
-            raise ValueError(f"Train/validation {key} mismatch")
+    if "train" in manifests and "validation" in manifests:
+        train, val = manifests["train"][0], manifests["validation"][0]
+        for key in ("tokenizer_hash", "max_length", "packing"):
+            if train[key] != val[key]:
+                raise ValueError(f"Train/validation {key} mismatch")
     return result, manifests, tokenizer_path
+
+
+def _stream_tokenize(examples, tokenizer, max_length):
+    # Share the exact per-document truncation/filtering with Arrow preparation.
+    from experiments.prepare_c4 import tokenized_documents
+    rows = list(tokenized_documents(({"text": text} for text in examples["text"]),
+                tokenizer, max_length, False, 0.15, 17))
+    keys = [*tokenizer.model_input_names, "special_tokens_mask"]
+    return {key: [row[key] for row in rows] for key in keys}
+
+
+def load_mlm_data(root, streaming_manifest=None, *, seed=17, shuffle_buffer=10000):
+    """Prepared validation plus either prepared training or full local JSONL streaming.
+
+    HF Datasets owns file/worker sharding and buffered shuffle. Accelerate must
+    shard the returned HF IterableDataset exactly once across DDP ranks, with
+    dispatch_batches=False and split_batches=False. Never pre-shard here.
+    """
+    if streaming_manifest is None:
+        return load_prepared(root)
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    data, manifests, tokenizer_path = load_prepared(root, splits=("validation",))
+    manifest = read_json(streaming_manifest)
+    if manifest.get("format") != "memsolve-local-text-stream-v1":
+        raise ValueError("Unsupported local streaming manifest")
+    files = manifest["files"]
+    if not files or len(files) != manifest["num_source_files"]:
+        raise ValueError("Incomplete local streaming source")
+    paths = [str(Path(item["path"]).resolve()) for item in files]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Duplicate local streaming files")
+    for item, path in zip(files, paths):
+        stat = Path(path).stat()
+        if stat.st_size != item["size"] or stat.st_mtime_ns != item["mtime_ns"]:
+            raise ValueError(f"Local streaming file changed: {path}")
+    validation = manifests["validation"][0]
+    for key in ("tokenizer_hash", "max_length", "packing"):
+        if manifest[key] != validation[key]:
+            raise ValueError(f"Streaming train/validation {key} mismatch")
+    if manifest["packing"] != "one_document" or shuffle_buffer < 1:
+        raise ValueError("Streaming requires per-document truncation and a positive shuffle buffer")
+    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path), local_files_only=True)
+    source = load_dataset("json", data_files=paths, split="train", streaming=True).select_columns(["text"])
+    source = source.shuffle(seed=seed, buffer_size=shuffle_buffer)
+    source = source.map(_stream_tokenize, batched=True, batch_size=256,
+                        fn_kwargs={"tokenizer": tokenizer, "max_length": manifest["max_length"]},
+                        remove_columns=["text"])
+    data["train"] = source
+    manifests["train"] = [{**manifest, "shuffle_seed": seed, "shuffle_buffer": shuffle_buffer,
+                           "tokenize_batch_size": 256, "row_count": None,
+                           "resume": "HF Trainer replays/skips consumed batches; worker mask RNG is not bitwise restored"}]
+    return data, manifests, tokenizer_path
 
 
 def load_sentence_model(checkpoint, max_length, implementation, device):
@@ -173,7 +267,14 @@ def load_sentence_model(checkpoint, max_length, implementation, device):
     if max_length < 3:
         raise ValueError("max_length must leave room for text and BERT special tokens")
     path = Path(checkpoint)
-    overrides = {"memsolve_implementation": implementation} if implementation else {}
+    from transformers import AutoConfig
+    transformer_path = path
+    if (path / "modules.json").is_file():
+        modules = read_json(path / "modules.json")
+        transformer_path = path / modules[0].get("path", "")
+    config = AutoConfig.from_pretrained(str(transformer_path))
+    overrides = ({"memsolve_implementation": implementation}
+                 if implementation and config.model_type == "memsolve_bert" else {})
     if (path / "modules.json").is_file():
         model = SentenceTransformer(str(path), device=device, config_kwargs=overrides)
     else:

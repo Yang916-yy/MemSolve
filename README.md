@@ -2,10 +2,10 @@
 
 **Full-context associative memory through compact equilibrium solves.**
 
-This research checkout restores the no-RankRotary LSSO operator from `e769a9a`.
-Its visual shell uses ordinary ViT3-style mean readout and residuals. Names remain **MemSolve**,
-**MemSolve-ViT** and **MemSolve-BERT**. The independent-Q/K/V redesign is retained
-in Git history, not mixed into this implementation.
+**MemSolve** is the operator; **MemSolve-ViT** and **MemSolve-BERT** adapt it to
+vision and text. It combines an input-dependent relation frame with a learned
+compact core shared across samples. The visual shell uses ordinary ViT3-style
+mean readout and residuals. Earlier LSSO/Ridgon architectures remain in Git history.
 
 ## How it works
 
@@ -51,7 +51,7 @@ PYTHON=python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
 
 Set `CUDA_HOME` and `MATHDX_ROOT` if the toolkit locations differ from the
 defaults in `tools/build_cuda.sh`. Select the target architecture listed in the
-[CUDA guide](docs/CUDA_CONTRACT.md#build-and-runtime-artifacts). Native ABI 16
+[CUDA guide](docs/CUDA_CONTRACT.md#build-and-runtime-artifacts). Native ABI 17
 requires rebuilding older extensions; the model checkpoint contract remains 26.
 
 The reference also runs on CUDA and needs no extension. LAMB training recipes
@@ -71,9 +71,14 @@ y_reference = layer(x, implementation="reference")
 ```
 
 CUDA supports ranks **16 / 32 / 48 / 64** and boolean validity masks.
-Parameters remain FP32. The restored native implementation uses BF16 packed
+Parameters remain FP32. The native implementation uses BF16 packed
 projections with FP32 compact statistics/solves; public outputs follow the input
 dtype. See the CUDA guide for exact precision and supported boundaries.
+
+Exact sequence sharding is available from the source checkout through
+`integrations.distributed.SequenceParallel`, including unequal shards and
+centered-convolution halos. See the [sequence-parallel contract](docs/CUDA_CONTRACT.md#exact-sequence-parallelism)
+for global loss normalization, gradient SUM, and CUDA Graph usage.
 
 Train with an ordinary optimizer, for example fused AdamW:
 
@@ -96,10 +101,10 @@ There is no RankRotary or absolute patch position table.
 | MemSolve-ViT-S | 384 | 6 | 32 | 1584 |
 | MemSolve-ViT-B | 768 | 12 | 48 | 3072 |
 
-S has **19,876,336** parameters including its 1,000-class head. The operator
-is restored from historical Small; mean pooling and removal of LayerScale
-change that run's visual scaffold, so its measured accuracy is not inherited. The historical Base result used a different
-position mechanism; it is not an exact result for this restored configuration.
+S has **19,876,336** parameters including its 1,000-class head. Current results
+and their protocols are described in the [paper draft](paper/main.pdf).
+Historical LSSO checkpoints used different scaffolds or position mechanisms;
+their accuracy is not assigned to the current model.
 
 Training recipes specify their own
 DropPath, optimizer, augmentation and schedule.
@@ -144,9 +149,12 @@ specified. No pretrained weights for this model contract are published yet.
 ## Text model
 
 **MemSolve-BERT** retains BERT's embeddings, Post-LayerNorm residuals and tied
-MLM head, with MemSolve mixers and SwiGLU FFNs. It uses learned absolute positions and the restored
-relation/content mixer without short convolution. The default Base geometry is
-width 768, 12 layers, 12 heads and rank 32.
+MLM head, with MemSolve mixers and SwiGLU FFNs. It uses learned absolute positions
+and a centered residual depthwise convolution (kernel 3) before each mixer.
+The default Base geometry is width 768, 14 layers, 12 heads and rank 32:
+**111,517,154** parameters including the tied MLM head, approximately matching
+the parameter budget of 12-layer BERT-base. Set `memsolve_short_conv_kernel=0`
+explicitly for the no-convolution ablation.
 
 ```python
 from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
@@ -159,7 +167,13 @@ model = MemSolveBertForMaskedLM(MemSolveBertConfig(
 Importing the adapter registers `memsolve_bert` with Hugging Face `AutoConfig`,
 `AutoModel` and `AutoModelForMaskedLM`. [Text workflows](docs/BERT_MLM.md) cover
 C4 MLM, Sentence Transformers retrieval fine-tuning and MTEB/LongEmbed
-evaluation. Both modalities call the same MemSolve operator and CUDA path.
+evaluation. They include CPU preflight, independent fixed-mask MLM evaluation,
+best-validation export, local full-corpus C4 streaming, and continued pretraining
+from a checkpoint. The full
+default is 70,000 updates at sequence length 128 and global batch 4096;
+measure runtime before launch. LongEmbed currently truncates to 512 and does
+not establish full long-document context capability. Both modalities call
+the same MemSolve operator and CUDA path.
 
 ## Documentation
 
@@ -174,21 +188,27 @@ evaluation. Both modalities call the same MemSolve operator and CUDA path.
 | GenomicBenchmarks and Long Range Arena | [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) |
 | Assembly101 integration | [Assembly101](docs/ASSEMBLY101.md) |
 | Food-101 training | [Food-101](docs/FOOD101.md) |
-| Future component studies | [Research scope](docs/ABLATIONS.md) |
+| Mechanism studies and additional experiment priorities | [Research scope](docs/ABLATIONS.md) |
 | Validation and historical measurements | [Tests](tests/README.md), [results](results/README.md) |
 
 ## Research status and provenance
 
-Current model checkpoint contract: **26**; native CUDA contract: **16**;
+Current model checkpoint contract: **26**; native CUDA contract: **17**;
 source version: **0.15.0**. The current API is `MemSolve` / `MemSolveConfig`.
 Older model checkpoints and the former `lsso` namespace are not supported.
 
-The [paper draft](paper/main.pdf) carries the MemSolve title, but its technical
-body, figures and experimental tables still describe the earlier LSSO model.
-The [archived results](results/README.md) retain their original names and source
-contracts. They are not measurements or theoretical guarantees for the current
-MemSolve architecture. The current equations are documented in the core contract;
-new task results require their own training records and provenance.
+The [paper draft](paper/main.pdf) describes the current shared-frame
+Equilibrium / Complement operator, its compact CUDA computation, and completed
+Small ImageNet-1K and ImageNet-100 experiments. It remains a working draft;
+unfinished Base runs are not reported as final results. The
+[archived results](results/README.md) retain their original names and source
+contracts and are not relabeled as measurements of the current architecture.
+Editable vector figures can be regenerated with [paper/figures.py](paper/figures.py)
+from explicit local run records; raw experiment artifacts stay outside Git.
+Appendix B includes forward, rank-space backward, and shared-core gradient
+pseudocode. Build the manuscript with `latexmk -pdf -cd paper/main.tex`;
+the LaTeX dependencies include `algorithm` and `algpseudocode` (available in
+TeX Live's `texlive-science` package on Debian/Ubuntu).
 
 MemSolve draws on the error-correcting memory and test-time regression viewpoints
 of DeltaNet and MesaNet. Global ridge regression with query readout also has

@@ -13,8 +13,10 @@ rather than a local experiment or benchmark.
 | `repository` | `python -m pytest tests/repository` | Repository shape and ownership contract. |
 
 `tests/experiments/test_nlp.py` uses the optional `nlp` environment. It checks
-fixed MLM masks, token-weighted loss, C4 partition integrity, MLM/retrieval
-Trainer resume and a local MTEB retrieval task without downloading datasets.
+fixed MLM masks, token-weighted loss, C4 partition/window integrity, preflight,
+best-validation export, independent MLM evaluation, continued pretraining,
+MLM/retrieval Trainer resume, disjoint rank/worker local-stream sharding,
+streaming resume and a local MTEB retrieval task without downloading datasets. A local stock BERT checkpoint also exercises the evaluation baseline path.
 
 ImageNet data checks use WebDataset and WIDS from the `vision` or `test` extra.
 They cover global virtual-group RA, independent group mixing with one physical
@@ -28,8 +30,9 @@ that crosses multiple scopes.
 
 CUDA math changes also require the relevant `tests/core` checks: projection
 fusion, FP32 bias cancellation, strided tails and gradient comparisons live
-there. Some CUDA-dependent core tests use availability guards rather than the
-`cuda` marker, so `-m cuda` alone is not the entire GPU numerical test domain.
+there. GPU core checks carry the `cuda` marker, including bias cancellation and
+strided tails. Set `CUDA_VISIBLE_DEVICES=''` for an explicitly CPU-only audit
+on a machine with ongoing training.
 
 ```bash
 python -m pytest -q tests/core tests/cuda
@@ -46,13 +49,13 @@ Before the 2026-09-12 main publication, the full suite passed 342 tests with
 6 skips; only SM120 was executed. This is a dated verification record, not a
 promise that all optional stacks or architectures were exercised.
 
-Model contract 26 / native ABI 16 covers the accretive-equilibrium
+Model contract 26 / native ABI 17 covers the accretive-equilibrium
 oracle checks: equilibrium/complement, masks, compact solves, complement tails,
 forward/parameter/input gradients and CUDA Graph replay. The native extension
 must be built before GPU tests; skipped native tests are not successful oracle
 validation. See the [CUDA contract](../docs/CUDA_CONTRACT.md).
 
-The fused Cholesky adjoint and compact-product epilogues have independent
+The inverse factor, common compact adjoint, and product epilogues have independent
 FP64 oracle checks. Eta-adjoint reductions cover small/large scales and both
 row-major and transposed dense inputs; they must respect incoming strides.
 
@@ -61,3 +64,9 @@ On 2026-10-12, SM80/A800 validation passed 363 checks across `tests/core`,
 `tests/integrations/test_transformers.py` using the NLP environment. These checks
 cover operator and adapter correctness, not a new training run or validation
 of other GPU architectures. Performance probes and their logs remain outside Git.
+
+On 2026-10-16, the full suite in the NLP environment passed **561 checks**,
+with 9 optional checks skipped and 3 upstream MTEB deprecation warnings.
+This includes local C4 streaming, rank/worker partitioning, Trainer resume,
+SM80 inverse-factor accuracy and exact sequence-parallel checks. The manuscript
+also compiled successfully. These checks do not establish NLP task accuracy.

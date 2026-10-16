@@ -23,6 +23,7 @@ def config(**kwargs):
         vocab_size=43, hidden_size=64, num_hidden_layers=2,
         num_attention_heads=2, intermediate_size=128,
         max_position_embeddings=32, memsolve_rank=16, hidden_dropout_prob=0,
+        memsolve_short_conv_kernel=0,
     )
     return MemSolveBertConfig(**(values | kwargs))
 
@@ -75,6 +76,37 @@ def test_swiglu_width_and_packed_projection_gradients():
         torch.testing.assert_close(a, b)
     # Only the encoder FFN changes; the MLM prediction transform keeps GELU.
     assert model.config.hidden_act == "gelu"
+
+
+def test_centered_short_conv_identity_gradients_padding_and_reload(tmp_path):
+    torch.manual_seed(7)
+    plain = MemSolveBertForMaskedLM(config()).eval()
+    local = MemSolveBertForMaskedLM(config(memsolve_short_conv_kernel=3)).eval()
+    missing, unexpected = local.load_state_dict(plain.state_dict(), strict=False)
+    assert missing and all("attention.short_conv.conv." in key for key in missing)
+    assert not unexpected
+    data = batch()
+    torch.testing.assert_close(local(**data).logits, plain(**data).logits, rtol=0, atol=0)
+    local(**data).loss.backward()
+    for layer in local.bert.encoder.layer:
+        conv = layer.attention.short_conv.conv
+        assert conv.groups == conv.in_channels == conv.out_channels
+        assert conv.weight.grad is not None and torch.isfinite(conv.weight.grad).all()
+        assert conv.weight.grad.abs().sum() > 0
+        with torch.no_grad():
+            conv.weight.normal_(std=0.1)
+            conv.bias.fill_(0.1)
+    original = local(**data).logits
+    changed = dict(data, input_ids=data["input_ids"].clone())
+    changed["input_ids"][0, 6:] = torch.tensor([37, 41])
+    torch.testing.assert_close(local(**changed).logits[data["attention_mask"]],
+                               original[data["attention_mask"]], rtol=0, atol=0)
+    short = {k: v[:1, :6] for k, v in data.items()}
+    torch.testing.assert_close(local(**short).logits, original[:1, :6], atol=2e-5, rtol=2e-4)
+    local.save_pretrained(tmp_path)
+    restored = AutoModelForMaskedLM.from_pretrained(tmp_path)
+    assert restored.config.memsolve_short_conv_kernel == 3
+    torch.testing.assert_close(restored(**data).logits, original, rtol=0, atol=0)
 
 
 def test_checkpoint_requires_swiglu_architecture_metadata(tmp_path):
@@ -213,10 +245,14 @@ def test_unsupported_attention_interfaces_fail_explicitly():
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rank", [32, 48])
-def test_bf16_cuda_mlm_matches_reference_and_updates(rank):
+@pytest.mark.parametrize("rank,conv_kernel", [(32, 0), (48, 0), (32, 3)])
+def test_bf16_cuda_mlm_matches_reference_and_updates(rank, conv_kernel):
     torch.manual_seed(43)
-    reference = MemSolveBertForMaskedLM(config(memsolve_rank=rank)).cuda().train()
+    reference = MemSolveBertForMaskedLM(config(memsolve_rank=rank, memsolve_short_conv_kernel=conv_kernel)).cuda().train()
+    if conv_kernel:
+        with torch.no_grad():
+            for layer in reference.bert.encoder.layer:
+                layer.attention.short_conv.conv.weight.normal_(std=0.02)
     fast = copy.deepcopy(reference)
     for layer in fast.bert.encoder.layer:
         layer.attention.implementation = "cuda"

@@ -1,10 +1,10 @@
 # Historical LSSO results
 
-> The current source is MemSolve, model contract 22 / CUDA contract 18.
+> The current source is MemSolve, model contract 26 / CUDA contract 17.
 > The earlier model was named LSSO; archived names and measurements are unchanged.
 > All measurements in this directory retain their original operator and source
-> contracts. None is a trained result or contraction certificate for the new
-> independent-QKV architecture.
+> contracts. They are not automatically measurements or certificates for the
+> current shared-frame Equilibrium / Complement operator.
 
 
 This directory contains the compact, machine-readable evidence behind the
@@ -34,12 +34,15 @@ comparison values in the paper remain attributed to their original sources.
 ## Historical evidence versus current source
 
 The published CUDA metadata records native contract **6**. Current source uses
-CUDA contract **18** and model contract **22**, with an identity-plus-delta
-query map, centered Q/K filters, vision RoPE, and a low-rank sigmoid output gate. There is no custom native
-extension. These source updates do not rewrite the
-CSV measurements or establish new task results. Consult each panel's metadata
-for its actual runtime and protocol; do not label historical tables as current
-source benchmarks.
+CUDA contract **17** and model contract **26**, with a shared relation/content
+frame and Equilibrium / Complement modes. The fast path uses compact statistics,
+Triton kernels and native compact linear-algebra primitives without materializing
+P. These updates do not rewrite the historical CSV measurements. Consult each
+panel's metadata for its actual runtime and protocol.
+
+The refreshed [paper draft](../paper/main.pdf) reports separately verified,
+completed Small ImageNet-1K runs and an ImageNet-100 core comparison. Raw run
+logs and local ablation artifacts remain outside this directory.
 
 The September 2026 optimization measurements are exploratory operator checks.
 They do not provide new ImageNet accuracy, COCO AP or ADE20K mIoU. New formal

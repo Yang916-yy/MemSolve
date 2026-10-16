@@ -41,6 +41,9 @@ def retrieval_data(settings, local_data=None):
     if set(columns) - set(dataset.column_names):
         raise ValueError("Retrieval data must contain query, positive, negative text columns")
     dataset = dataset.select_columns(columns)
+    if any(getattr(dataset.features[name], "dtype", None) not in ("string", "large_string")
+           for name in columns):
+        raise ValueError("Retrieval query, positive, negative columns must contain strings")
     size = settings["validation_triplets"]
     if not 0 < size < len(dataset):
         raise ValueError("validation_triplets must leave nonempty train and validation sets")
@@ -52,8 +55,15 @@ def retrieval_data(settings, local_data=None):
     # Ettin's row-wise split can share queries with training. Remove those rows
     # from the bounded training subset without materializing the full corpus.
     heldout = set(validation["query"])
-    training = training.filter(lambda queries: [q not in heldout for q in queries],
-                               input_columns="query", batched=True)
+
+    def validated_selection(queries, positives, negatives):
+        if any(not isinstance(text, str) or not text.strip()
+               for batch in (queries, positives, negatives) for text in batch):
+            raise ValueError("Retrieval triplets contain null or empty text")
+        return [query not in heldout for query in queries]
+
+    validated_selection(*(validation[name] for name in columns))
+    training = training.filter(validated_selection, input_columns=columns, batched=True)
     if not len(training) or not len(validation):
         raise ValueError("Empty retrieval split")
     return training, validation, {**source, "train_rows": len(training), "validation_rows": len(validation),

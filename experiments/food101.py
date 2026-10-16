@@ -135,8 +135,8 @@ def main() -> None:
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     contract = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "resume"}
-    contract.update(ffn="swiglu", gate_width=1024, architecture="MemSolve-S/16", dim=384, depth=12, heads=6, rank=32,
-                    position_encoding="qk-dwconv-3x3-learned2d-token-ln-mean-no-cls",
+    contract.update(ffn="gelu", ffn_width=1584, architecture="MemSolve-ViT-S/16", dim=384, depth=12, heads=6, rank=32,
+                    core_mode="equilibrium", position_encoding="residual-cpe-3x3-token-ln-mean-no-cls",
                     precision="bf16-autocast-fp32-core", implementation=args.implementation,
                     pretrained=False, weight_decay=0.05, label_smoothing=0.1,
                     warmup_epochs=min(3, args.epochs), evaluation="official-test-curve-fixed-final-epoch",

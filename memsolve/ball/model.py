@@ -159,6 +159,9 @@ class MemSolve(nn.Module):
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor | None,
+        *,
+        sequence_parallel=None,
+        valid_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the explicit strict native implementation of the default operator."""
 
@@ -220,29 +223,28 @@ class MemSolve(nn.Module):
                 device=x.device,
             )
         )
-        if all_valid:
-            valid_counts = None
-        else:
-            assert mask is not None
-            valid_counts = (
-                mask.sum(dim=-1).to(dtype=torch.float32).clamp_min(1.0).contiguous()
-            )
+        if sequence_parallel is not None:
+            sequence_parallel.validate(length, config.rank)
+        if valid_counts is None:
+            if sequence_parallel is not None:
+                valid_counts = sequence_parallel.valid_counts(mask, batch_size=batch, device=x.device)
+            elif not all_valid:
+                valid_counts = mask.sum(dim=-1, dtype=torch.float32).clamp_min_(1)
+        elif (valid_counts.shape != (batch,) or valid_counts.device != x.device
+              or valid_counts.dtype != torch.float32 or valid_counts.requires_grad
+              or not valid_counts.is_contiguous()):
+            raise ValueError("valid_counts must be non-differentiable contiguous FP32 [batch] on the input device")
 
         # The native mixer consumes wide-range BF16 packed coordinates directly.
         if all_valid:
             safe_x = x
         else:
             assert mask is not None
-            safe_x = torch.where(mask[:, :, None], x, torch.zeros_like(x))
+            safe_x = x.masked_fill(~mask[:, :, None], 0)
         projected = tensor_core_linear(
             safe_x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16,
-            fuse_weight_bias_grad=True,
+            fuse_weight_bias_grad=True, output_mask=mask,
         )
-        if not all_valid:
-            assert mask is not None
-            projected = torch.where(
-                mask[:, :, None], projected, torch.zeros_like(projected)
-            )
         if not projected.is_contiguous():
             raise RuntimeError(
                 "implementation='cuda' requires w_bc to produce contiguous "
@@ -255,14 +257,12 @@ class MemSolve(nn.Module):
             self.core_base_raw if self.core_base_raw is not None else self.eta_raw.new_empty((config.num_heads, config.rank, 0)),
             self.eta_raw,
             valid_counts,
+            **({"sequence_parallel": sequence_parallel} if sequence_parallel is not None else {}),
         )
         output = tensor_core_linear(
             mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype,
-            fuse_weight_bias_grad=True,
+            fuse_weight_bias_grad=True, output_mask=mask,
         )
-        if not all_valid:
-            assert mask is not None
-            output = torch.where(mask[:, :, None], output, torch.zeros_like(output))
         return output
 
     def _reference_compact_problem(
@@ -397,18 +397,23 @@ class MemSolve(nn.Module):
         valid_mask: torch.Tensor | None = None,
         *,
         implementation: str = "reference",
+        sequence_parallel=None,
+        valid_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._validate_input(x)
         config = self.config
         batch, length, _dim = x.shape
 
         if implementation == "cuda":
-            return self._forward_cuda(x, valid_mask)
+            return self._forward_cuda(x, valid_mask, sequence_parallel=sequence_parallel, valid_counts=valid_counts)
         if implementation != "reference":
             raise ValueError(
                 "implementation must be 'reference' or 'cuda', "
                 f"got {implementation!r}"
             )
+
+        if sequence_parallel is not None or valid_counts is not None:
+            raise ValueError("sequence_parallel and precomputed valid_counts require implementation='cuda'")
 
         projected, frame, compact_state, content, generator, eta, mask = (
             self._reference_compact_problem(x, valid_mask)

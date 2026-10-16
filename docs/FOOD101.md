@@ -24,7 +24,7 @@ stopping or checkpoint selection.
 
 ```bash
 python -m experiments.food101 \
-  --data /path/to/food101 --output /path/outside/repository/food101-qkv \
+  --data /path/to/food101 --output /path/outside/repository/food101-equilibrium \
   --implementation cuda --epochs 30 --seed 0
 ```
 

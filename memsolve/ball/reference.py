@@ -24,11 +24,12 @@ def _biased_gemm_kernel():
 
     @jit
     def kernel(
-        X, W, B, Y,
+        X, W, B, Y, MASK,
         M, N, K: tl.constexpr,
         XM: tl.constexpr, XK: tl.constexpr,
         WK: tl.constexpr, WN: tl.constexpr, BS: tl.constexpr,
         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_MASK: tl.constexpr,
     ):
         rows = tl.program_id(0) * BM + tl.arange(0, BM)
         columns = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -45,18 +46,23 @@ def _biased_gemm_kernel():
                 (columns[None, :] < N) & (indices[:, None] < K), 0,
             )
             accumulator = tl.dot(left, right, accumulator)
-        bias = tl.load(B + columns * BS, columns < N, 0)
+        if HAS_BIAS:
+            bias = tl.load(B + columns * BS, columns < N, 0)
+            accumulator += bias[None, :]
+        if HAS_MASK:
+            valid = tl.load(MASK + rows, rows < M, 0)
+            accumulator = tl.where(valid[:, None], accumulator, 0)
         tl.store(
             Y + rows[:, None] * N + columns[None, :],
-            accumulator + bias[None, :],
+            accumulator,
             (rows[:, None] < M) & (columns[None, :] < N),
         )
     return kernel
 
 
 def _biased_gemm(
-    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor,
-    output_dtype: torch.dtype,
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor | None,
+    output_dtype: torch.dtype, output_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # AB + bias: FP32 accumulation/addition, then one output rounding.
     # Blocked GEMM follows Triton's official matrix-multiplication tutorial:
@@ -71,16 +77,16 @@ def _biased_gemm(
     large = rows >= 128 and columns >= 128
     bm, bn, bk, warps = (128, 128, 32, 8) if large else (64, 64, 32, 4)
     _biased_gemm_kernel()[((rows + bm - 1) // bm, (columns + bn - 1) // bn)](
-        left, right, bias, output, rows, columns, inner,
-        *left.stride(), *right.stride(), bias.stride(0),
-        bm, bn, bk, num_warps=warps,
+        left, right, bias, output, output_mask, rows, columns, inner,
+        *left.stride(), *right.stride(), 0 if bias is None else bias.stride(0),
+        bm, bn, bk, bias is not None, output_mask is not None, num_warps=warps,
     )
     return output
 
 
 def _wide_gemm(
     left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor | None = None,
-    *, output_dtype: torch.dtype = torch.float32,
+    *, output_dtype: torch.dtype = torch.float32, output_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """BF16 operands with FP32 accumulation, independent of ambient AMP policy."""
     matmul = torch.backends.cuda.matmul
@@ -88,6 +94,8 @@ def _wide_gemm(
     matmul.allow_bf16_reduced_precision_reduction = False
     try:
         with torch.autocast(device_type="cuda", enabled=False):
+            if output_mask is not None:
+                return _biased_gemm(left, right, bias, output_dtype, output_mask)
             if bias is not None:
                 if output_dtype in (torch.float16, torch.bfloat16):
                     return _biased_gemm(left, right, bias, output_dtype)
@@ -181,10 +189,11 @@ class _TensorCoreLinear(torch.autograd.Function):
         bias: torch.Tensor | None,
         output_dtype: torch.dtype | None,
         fuse_weight_bias_grad: bool,
+        output_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         value_bf16 = value.to(dtype=torch.bfloat16)
         weight_bf16 = weight.to(dtype=torch.bfloat16)
-        ctx.save_for_backward(value_bf16, weight_bf16)
+        ctx.save_for_backward(value_bf16, weight_bf16, output_mask)
         ctx.value_shape = value.shape
         ctx.value_dtype = value.dtype
         ctx.weight_dtype = weight.dtype
@@ -204,6 +213,7 @@ class _TensorCoreLinear(torch.autograd.Function):
                 and (bias is not None or output_dtype == torch.bfloat16)
                 else torch.float32
             ),
+            output_mask=output_mask,
         ).reshape(value.shape[:-1] + (weight.shape[0],))
         return output if output_dtype is None else output.to(dtype=output_dtype)
 
@@ -212,8 +222,10 @@ class _TensorCoreLinear(torch.autograd.Function):
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None]:
-        value, weight = ctx.saved_tensors
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None, None]:
+        value, weight, output_mask = ctx.saved_tensors
+        if output_mask is not None:
+            grad_output = grad_output.masked_fill(~output_mask[..., None], 0)
         flat_value = value.reshape(-1, value.shape[-1])
         flat_gradient = grad_output.to(dtype=torch.bfloat16).reshape(
             -1,
@@ -260,7 +272,7 @@ class _TensorCoreLinear(torch.autograd.Function):
                 else grad_output.to(dtype=torch.float32)
             ).to(device=ctx.bias_device, dtype=ctx.bias_dtype)
 
-        return grad_value, grad_weight, grad_bias, None, None
+        return grad_value, grad_weight, grad_bias, None, None, None
 
 
 @contextmanager
@@ -441,6 +453,7 @@ def tensor_core_linear(
     *,
     output_dtype: torch.dtype | None = None,
     fuse_weight_bias_grad: bool = False,
+    output_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a BF16/FP32 projection, with FP32 accumulation/bias and an optional final cast.
 
@@ -467,6 +480,11 @@ def tensor_core_linear(
             f"[{weight.shape[0]}], got {tuple(bias.shape)}"
         )
 
+    if output_mask is not None:
+        if output_mask.dtype != torch.bool or output_mask.shape != value.shape[:-1] or output_mask.device != value.device:
+            raise ValueError("output_mask must be boolean with the input's token shape and device")
+        output_mask = output_mask.contiguous()
+
     if (
         value.device.type == "cuda"
         and value.dtype != torch.float64
@@ -481,7 +499,7 @@ def tensor_core_linear(
             or (bias is not None and bias.requires_grad)
         )
         if needs_backward:
-            return _TensorCoreLinear.apply(value, weight, bias, output_dtype, fuse_weight_bias_grad)
+            return _TensorCoreLinear.apply(value, weight, bias, output_dtype, fuse_weight_bias_grad, output_mask)
         # Low-precision biased outputs fuse the FP32 bias and final cast;
         # other outputs retain the established GEMM conversion boundary.
         direct_dtype = (
@@ -490,12 +508,15 @@ def tensor_core_linear(
             and (bias is not None or output_dtype == torch.bfloat16)
             else None
         )
-        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype, fuse_weight_bias_grad)
+        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype, fuse_weight_bias_grad, output_mask)
         bias = None
+        output_mask = None
     else:
         output = tensor_core_matmul(value, weight.mT)
     if bias is not None:
         output = output + bias.to(device=output.device, dtype=output.dtype)
+    if output_mask is not None:
+        output = output.masked_fill(~output_mask[..., None], 0)
     return output if output_dtype is None else output.to(dtype=output_dtype)
 
 
@@ -538,12 +559,33 @@ def qr_soft_frame(relation: torch.Tensor) -> torch.Tensor:
         return (orthogonal * signs.unsqueeze(-2))[..., :length, :]
 
 
+class _BoundedComplement(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        ctx.save_for_backward(value)
+        return (1.0 - torch.finfo(value.dtype).eps) * value.tanh()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        (value,) = ctx.saved_tensors
+        # Differentiate the mathematical tanh, not its rounded output. The
+        # usual 1-tanh(x)^2 loses representable gradients in the FP32 tails.
+        # where (rather than abs) also preserves higher derivatives at zero.
+        magnitude = torch.where(value >= 0, value, -value)
+        exponent = torch.exp(-2.0 * magnitude)
+        derivative = (1.0 - torch.finfo(value.dtype).eps) * (
+            4.0 * exponent / (1.0 + exponent).square()
+        )
+        return gradient * derivative
+
+
 def bounded_complement(raw: torch.Tensor) -> torch.Tensor:
     """Map learned complement coordinates to the strict contractive interior.
 
     ``tanh`` rounds to exactly ``+/-1`` in FP32 for otherwise reachable raw
-    coordinates.  Evaluate its logistic identity so the tail VJP remains
-    representable, then reserve one dtype ULP from the boundary.
+    coordinates. Use native tanh for a cancellation-free value near zero,
+    but its analytic exponential derivative so the tail VJP remains
+    representable. Reserve one dtype ULP from the boundary.
     """
 
     if not raw.is_floating_point():
@@ -551,15 +593,7 @@ def bounded_complement(raw: torch.Tensor) -> torch.Tensor:
 
     calc_dtype = _calculation_dtype(raw)
     with torch.autocast(device_type=raw.device.type, enabled=False):
-        value = raw.to(dtype=calc_dtype)
-        interior_scale = 1.0 - torch.finfo(calc_dtype).eps
-        # Select safe exponent inputs explicitly. Clamp's boundary subgradient
-        # can be zero at raw=0, although this smooth map has derivative 1-eps.
-        positive_exponent = torch.exp(-2.0 * torch.where(value >= 0, value, 0.0))
-        negative_exponent = torch.exp(2.0 * torch.where(value < 0, value, 0.0))
-        positive = (1.0 - positive_exponent) / (1.0 + positive_exponent)
-        negative = (negative_exponent - 1.0) / (1.0 + negative_exponent)
-        return interior_scale * torch.where(value >= 0.0, positive, negative)
+        return _BoundedComplement.apply(raw.to(dtype=calc_dtype))
 
 
 def accretive_generator(raw: torch.Tensor, *, skew_coupling: bool = True) -> torch.Tensor:

@@ -37,6 +37,7 @@ class MemSolveBertConfig(BertConfig):
         memsolve_core_mode: str = "equilibrium",
         memsolve_implementation: str = "reference",
         memsolve_contract: dict | None = None,
+        memsolve_short_conv_kernel: int = 3,
         ffn_type: str = "swiglu",
         **kwargs,
     ):
@@ -45,6 +46,7 @@ class MemSolveBertConfig(BertConfig):
         # intermediate_size is the width of EACH gated branch, not their sum.
         # Match the weights of a conventional 4d FFN: 3dm = 8d^2.
         dim = kwargs.get("hidden_size", 768)
+        kwargs.setdefault("num_hidden_layers", 14)
         kwargs.setdefault("intermediate_size", ((8 * dim + 47) // 48) * 16)
         kwargs.setdefault("use_cache", False)
         # MemSolve has no materialized attention probabilities to drop out.
@@ -65,10 +67,13 @@ class MemSolveBertConfig(BertConfig):
             raise ValueError("MemSolve-BERT currently uses BERT absolute position embeddings")
         if self.attention_probs_dropout_prob != 0:
             raise ValueError("Use hidden_dropout_prob; MemSolve has no attention-probability dropout")
+        if memsolve_short_conv_kernel not in (0, 3):
+            raise ValueError("memsolve_short_conv_kernel must be 0 (off) or 3 (centered)")
         self.memsolve_rank = memsolve_rank
         self.memsolve_core_mode = CoreMode(memsolve_core_mode).value
         self.memsolve_implementation = memsolve_implementation
         self.memsolve_contract = copy.deepcopy(memsolve_contract)
+        self.memsolve_short_conv_kernel = memsolve_short_conv_kernel
         self.ffn_type = ffn_type
 
     @classmethod
@@ -96,6 +101,36 @@ def _tensor_only_state_dict(module, state_dict, prefix, local_metadata):
             state_dict.pop(prefix + name + "._extra_state", None)
 
 
+class _CenteredShortConv(nn.Module):
+    """Identity-initialized local residual using native depthwise Conv1d.
+
+    Both masks are necessary: padding must neither enter the convolution nor
+    become a nonzero input to the following global mixer.
+    """
+
+    def __init__(self, dim, kernel):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, kernel, padding=kernel // 2, groups=dim)
+
+    def forward(self, x, valid_mask, *, sequence_parallel=None):
+        if valid_mask is not None:
+            x = x.masked_fill(~valid_mask[..., None], 0)
+        if sequence_parallel is None:
+            local = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        else:
+            # The halo owns global-end padding; native Conv1d must not pad
+            # each shard boundary again. Its weights and arithmetic are shared.
+            padded = sequence_parallel.halo(x, self.conv.kernel_size[0] // 2)
+            local = torch.nn.functional.conv1d(
+                padded.transpose(1, 2), self.conv.weight, self.conv.bias,
+                groups=self.conv.groups,
+            ).transpose(1, 2)
+        x = x + local
+        if valid_mask is not None:
+            x = x.masked_fill(~valid_mask[..., None], 0)
+        return x
+
+
 class _MemSolveBertAttention(nn.Module):
     def __init__(self, config: MemSolveBertConfig):
         super().__init__()
@@ -112,6 +147,8 @@ class _MemSolveBertAttention(nn.Module):
         self.mixer._hf_contract = copy.deepcopy(config.memsolve_contract)
         self.mixer.register_load_state_dict_pre_hook(_restore_core_contract)
         self.implementation = config.memsolve_implementation
+        self.short_conv = (_CenteredShortConv(config.hidden_size, config.memsolve_short_conv_kernel)
+                           if config.memsolve_short_conv_kernel else None)
         self.output = BertSelfOutput(config)
         # MemSolve already owns Wo. Keep only BERT's dropout + residual + LN.
         self.output.dense = nn.Identity()
@@ -132,7 +169,8 @@ class _MemSolveBertAttention(nn.Module):
             if attention_mask.shape != expected:
                 raise ValueError("MemSolve-BERT accepts a 2D padding mask, not pairwise masks")
             valid_mask = attention_mask[:, 0, 0, :] == 0
-        x = hidden_states
+        x = (self.short_conv(hidden_states, valid_mask)
+             if self.short_conv is not None else hidden_states)
         if self.implementation == "cuda":
             # HF AutoModel/Trainer does not call the standalone operator loader.
             # Load the matching native artifact before the first CUDA forward;
@@ -158,6 +196,9 @@ class _MemSolveBertMixin:
 
     def _init_weights(self, module):
         super()._init_weights(module)
+        if isinstance(module, _CenteredShortConv):
+            nn.init.zeros_(module.conv.weight)
+            nn.init.zeros_(module.conv.bias)
         if isinstance(module, MemSolve):
             with torch.no_grad():
                 if module.core_base_raw is not None:
@@ -173,6 +214,8 @@ class _MemSolveBertMixin:
             raise RuntimeError("Checkpoint is missing MemSolve mixer weights; cannot load a stock BERT checkpoint")
         if any("intermediate.gate_up_proj." in key for key in missing_keys):
             raise RuntimeError("Checkpoint is missing SwiGLU gate/up weights")
+        if any("attention.short_conv." in key for key in missing_keys):
+            raise RuntimeError("Checkpoint is missing centered short-convolution weights")
         return result
 
 

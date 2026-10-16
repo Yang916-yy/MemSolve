@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import itertools
 import shutil
 from pathlib import Path
@@ -13,17 +14,28 @@ from transformers import AutoTokenizer
 from experiments.nlp import digest, freeze_mask, read_json, tokenizer_digest, write_json
 
 
-def tokenized_documents(source, tokenizer, max_length, validation, probability, seed):
+def tokenized_documents(source, tokenizer, max_length, validation, probability, seed,
+                        document_policy="truncate", token_counts=None):
+    if document_policy not in ("truncate", "split"):
+        raise ValueError("document_policy must be truncate or split")
     source = iter(source)
     while batch := list(itertools.islice(source, 256)):
         encoded = tokenizer([row["text"] for row in batch], truncation=True,
                             max_length=max_length, padding="max_length",
-                            return_special_tokens_mask=True)
-        for index in range(len(batch)):
+                            return_special_tokens_mask=True,
+                            return_overflowing_tokens=document_policy == "split")
+        encoded.pop("overflow_to_sample_mapping", None)
+        for index in range(len(encoded["input_ids"])):
             row = {key: value[index] for key, value in encoded.items()}
             if not any(a and not s for a, s in zip(row["attention_mask"], row["special_tokens_mask"])):
                 continue
-            yield freeze_mask(row, tokenizer, probability, seed) if validation else row
+            content_tokens = sum(a and not s for a, s in zip(row["attention_mask"], row["special_tokens_mask"]))
+            row = freeze_mask(row, tokenizer, probability, seed) if validation else row
+            if token_counts is not None:
+                token_counts["attention_tokens"] += sum(row["attention_mask"])
+                token_counts["content_tokens"] += content_tokens
+                token_counts["masked_targets"] += sum(x != -100 for x in row.get("labels", []))
+            yield row
 
 
 def prepare(args):
@@ -31,7 +43,23 @@ def prepare(args):
         raise ValueError("Invalid sequence length or shard selection")
     if args.max_docs is not None and args.max_docs < 1:
         raise ValueError("max_docs must be positive (per partition)")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    if not 0 < args.eval_mask_probability <= 1:
+        raise ValueError("eval_mask_probability must be in (0, 1]")
+    output = Path(args.output) / args.split / f"part-{args.shard_index:05d}-of-{args.num_shards:05d}"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # The OS releases this lock even after interruption; a second process must
+    # never remove an active job's .incomplete partition.
+    with output.with_suffix(".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError(f"Partition is already being prepared: {output}") from exc
+        return _prepare_partition(args, output)
+
+
+def _prepare_partition(args, output):
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True,
+                    revision=getattr(args, "tokenizer_revision", "main"))
     if not tokenizer.is_fast or tokenizer.mask_token_id is None or tokenizer.pad_token_id is None:
         raise ValueError("A fast tokenizer with MASK and PAD tokens is required")
     if args.files:
@@ -46,12 +74,13 @@ def prepare(args):
     if args.num_shards > source.num_shards:
         raise ValueError(f"Source exposes {source.num_shards} file shards; reduce --num-shards")
     source = source.shard(num_shards=args.num_shards, index=args.shard_index)
+    policy = getattr(args, "document_policy", "truncate")
     settings = {"format": 1, "source": source_id, "split": args.split,
                 "num_shards": args.num_shards, "shard_index": args.shard_index,
                 "max_docs": args.max_docs, "max_length": args.max_length,
-                "tokenizer_hash": tokenizer_digest(tokenizer), "packing": "one_document",
+                "tokenizer_hash": tokenizer_digest(tokenizer),
+                "packing": "one_document" if policy == "truncate" else "within_document_windows",
                 "eval_mask_probability": args.eval_mask_probability, "mask_seed": args.seed}
-    output = Path(args.output) / args.split / f"part-{args.shard_index:05d}-of-{args.num_shards:05d}"
     if output.exists():
         previous = read_json(output / "manifest.json")
         if {k: previous[k] for k in settings} != settings:
@@ -63,9 +92,12 @@ def prepare(args):
         shutil.rmtree(temporary)  # Only this job's explicitly incomplete partition.
     temporary.mkdir(parents=True)
 
+    token_counts = dict(attention_tokens=0, content_tokens=0, masked_targets=0)
+
     def generate():
         rows = tokenized_documents(source, tokenizer, args.max_length,
-                                   args.split == "validation", args.eval_mask_probability, args.seed)
+                                   args.split == "validation", args.eval_mask_probability, args.seed,
+                                   policy, token_counts)
         yield from itertools.islice(rows, args.max_docs) if args.max_docs is not None else rows
 
     columns = {name: Sequence(Value("int32" if name == "input_ids" else "int8"),
@@ -79,6 +111,7 @@ def prepare(args):
     stored = load_from_disk(str(temporary / "dataset"))
     tokenizer.save_pretrained(str(temporary / "tokenizer"))
     write_json(temporary / "manifest.json", {**settings, "rows": len(dataset),
+                                           "token_counts": token_counts,
                                            "fingerprint": stored._fingerprint})
     del dataset, stored
     shutil.rmtree(temporary / "arrow-cache")
@@ -96,10 +129,13 @@ def main():
     parser.add_argument("--revision", default="main")
     parser.add_argument("--files", nargs="+", help="Local JSONL text files instead of Hub C4")
     parser.add_argument("--tokenizer", default="bert-base-uncased")
+    parser.add_argument("--tokenizer-revision", default="main")
+    parser.add_argument("--document-policy", choices=("truncate", "split"), default="truncate",
+                        help="Keep each document's prefix, or make nonoverlapping within-document windows")
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
-    parser.add_argument("--max-docs", type=int, help="Prepared document limit PER partition")
+    parser.add_argument("--max-docs", type=int, help="Prepared row limit PER partition (windows with --document-policy split)")
     parser.add_argument("--eval-mask-probability", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=17)
     prepare(parser.parse_args())

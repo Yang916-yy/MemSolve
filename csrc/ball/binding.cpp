@@ -108,33 +108,24 @@ std::tuple<at::Tensor, at::Tensor> linear_weight_bias_cuda(
 }  // namespace memsolve_equilibrium
 
 namespace memsolve_equilibrium {
-int64_t contract_version() { return 16; }
+int64_t contract_version() { return 17; }
 }
 TORCH_LIBRARY(memsolve_equilibrium, module) {
     module.def("contract_version() -> int", TORCH_FN(memsolve_equilibrium::contract_version));
     module.def("linear_weight_bias(Tensor value, Tensor gradient) -> (Tensor, Tensor)");
-    module.def("compact_factor_solve(Tensor gram, Tensor rhs, bool complete) -> (Tensor, Tensor)");
-    module.def("compact_cholesky_backward(Tensor factor, Tensor product) -> Tensor");
-    module.def("compact_potrs(Tensor factor, Tensor rhs) -> Tensor");
-    module.def("compact_trsm(Tensor factor, Tensor rhs, bool transpose=False) -> Tensor");
+    module.def("compact_inverse(Tensor gram) -> Tensor");
     module.def("compact_lu(Tensor a) -> (Tensor, Tensor, Tensor)");
     module.def("compact_getrs(Tensor lu, Tensor pivots, Tensor rhs, bool transpose=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(memsolve_equilibrium, CUDA, module) {
     module.impl("linear_weight_bias", TORCH_FN(memsolve_equilibrium::linear_weight_bias_cuda));
-    module.impl("compact_factor_solve", TORCH_FN(memsolve_equilibrium::compact_factor_solve_cuda));
-    module.impl("compact_cholesky_backward", TORCH_FN(memsolve_equilibrium::compact_cholesky_backward_cuda));
-    module.impl("compact_potrs", TORCH_FN(memsolve_equilibrium::compact_potrs_cuda));
-    module.impl("compact_trsm", TORCH_FN(memsolve_equilibrium::compact_trsm_cuda));
+    module.impl("compact_inverse", TORCH_FN(memsolve_equilibrium::compact_inverse_cuda));
     module.impl("compact_lu", TORCH_FN(memsolve_equilibrium::compact_lu_cuda));
     module.impl("compact_getrs", TORCH_FN(memsolve_equilibrium::compact_getrs_cuda));
 }
 TORCH_LIBRARY_IMPL(memsolve_equilibrium, Autograd, module) {
     module.impl("linear_weight_bias", TORCH_FN(memsolve_equilibrium::linear_weight_bias_cuda));
-    module.impl("compact_factor_solve", TORCH_FN(memsolve_equilibrium::compact_factor_solve_cuda));
-    module.impl("compact_cholesky_backward", TORCH_FN(memsolve_equilibrium::compact_cholesky_backward_cuda));
-    module.impl("compact_potrs", TORCH_FN(memsolve_equilibrium::compact_potrs_cuda));
-    module.impl("compact_trsm", TORCH_FN(memsolve_equilibrium::compact_trsm_cuda));
+    module.impl("compact_inverse", TORCH_FN(memsolve_equilibrium::compact_inverse_cuda));
     module.impl("compact_lu", TORCH_FN(memsolve_equilibrium::compact_lu_cuda));
     module.impl("compact_getrs", TORCH_FN(memsolve_equilibrium::compact_getrs_cuda));
 }

@@ -555,6 +555,7 @@ def test_linear_fp16_output_does_not_round_through_bf16() -> None:
     torch.testing.assert_close(output, torch.full_like(output, 1.0 + 1.0 / 512), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_biased_linear_fused_store_preserves_fp32_bias(dtype) -> None:
@@ -575,6 +576,7 @@ def test_biased_linear_fused_store_preserves_fp32_bias(dtype) -> None:
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_biased_linear_fused_store_handles_strides_and_tails(dtype) -> None:
@@ -693,3 +695,25 @@ def test_bounded_complement_has_the_tanh_derivative_at_zero():
     actual = torch.autograd.grad(bounded_complement(raw).sum(), raw)[0]
     expected = (1 - torch.finfo(raw.dtype).eps) / raw.cosh().square()
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-15)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_bounded_complement_preserves_values_near_zero(dtype):
+    raw = torch.tensor([-1e-10, -1e-8, 0.0, 1e-8, 1e-10], dtype=dtype,
+                       requires_grad=True)
+    actual = bounded_complement(raw)
+    # tanh(x)=x+O(x^3); these inputs must not disappear in 1-exp(-2x).
+    scale = 1.0 - torch.finfo(dtype).eps
+    torch.testing.assert_close(actual, scale * raw, rtol=2 * torch.finfo(dtype).eps, atol=0)
+    derivative = torch.autograd.grad(actual.sum(), raw)[0]
+    torch.testing.assert_close(derivative, torch.full_like(raw, scale),
+                               rtol=2 * torch.finfo(dtype).eps, atol=0)
+
+
+def test_bounded_complement_higher_derivatives_at_zero():
+    raw = torch.zeros(1, dtype=torch.float64, requires_grad=True)
+    value = bounded_complement(raw)
+    for expected in (1.0 - torch.finfo(raw.dtype).eps, 0.0,
+                     -2.0 * (1.0 - torch.finfo(raw.dtype).eps)):
+        value = torch.autograd.grad(value.sum(), raw, create_graph=True)[0]
+        torch.testing.assert_close(value, torch.full_like(raw, expected), rtol=1e-14, atol=1e-14)

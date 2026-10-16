@@ -108,6 +108,10 @@ def test_prepared_partition_integrity(prepared):
     assert "labels" in data["validation"].column_names
     assert data["train"].features["input_ids"].feature.dtype == "int32"
     assert data["train"].features["attention_mask"].feature.dtype == "int8"
+    assert metadata["train"][0]["token_counts"]["content_tokens"] > 0
+    assert metadata["validation"][0]["token_counts"]["masked_targets"] > 0
+    validation, _, _ = load_prepared(prepared, splits=("validation",))
+    assert set(validation) == {"validation"}
     path = next((prepared / "train").glob("*/manifest.json"))
     manifest = read_json(path)
     manifest["num_shards"] = 2
@@ -116,8 +120,110 @@ def test_prepared_partition_integrity(prepared):
         load_prepared(prepared)
 
 
+def test_document_windows_preserve_content_and_boundaries(tokenizer):
+    from experiments.prepare_c4 import tokenized_documents
+    tok, _ = tokenizer
+    texts = ["the red bird " * 9, "blue fish water " * 7]
+    rows = list(tokenized_documents([{"text": t} for t in texts], tok, 8, False, .15, 17,
+                                   document_policy="split"))
+    flattened = [x for row in rows for x, special, valid in
+                 zip(row["input_ids"], row["special_tokens_mask"], row["attention_mask"])
+                 if valid and not special]
+    expected = sum([tok(t, add_special_tokens=False)["input_ids"] for t in texts], [])
+    assert flattened == expected
+    red, blue = tok.convert_tokens_to_ids(["red", "blue"])
+    assert all(not (red in row["input_ids"] and blue in row["input_ids"]) for row in rows)
+    assert all(len(row["input_ids"]) == 8 for row in rows)
+    prefixes = list(tokenized_documents([{"text": t} for t in texts], tok, 8, False, .15, 17))
+    assert len(prefixes) == 2
+
+
+def test_prepared_rejects_mislabeled_split(prepared):
+    path = next((prepared / "validation").glob("*/manifest.json"))
+    manifest = read_json(path)
+    manifest["split"] = "train"
+    write_json(path, manifest)
+    with pytest.raises(ValueError, match="mislabeled"):
+        load_prepared(prepared)
+
+
+@pytest.fixture
+def streaming_manifest(prepared, tmp_path):
+    metadata = read_json(next((prepared / "validation").glob("*/manifest.json")))
+    files = []
+    for shard in range(4):
+        path = tmp_path / f"stream-{shard}.jsonl"
+        texts = [" ".join("red" if (i >> bit) & 1 else "blue" for bit in range(5))
+                 for i in range(shard * 8, (shard + 1) * 8)]
+        path.write_text("\n".join(json.dumps({"text": text, "url": "unused"}) for text in texts))
+        stat = path.stat()
+        files.append({"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    path = tmp_path / "stream.json"
+    write_json(path, {"format": "memsolve-local-text-stream-v1", "files": files,
+                     "num_source_files": 4, **{key: metadata[key] for key in
+                     ("max_length", "packing", "tokenizer_hash")}})
+    return path
+
+
+def test_streaming_worker_and_rank_shards_are_disjoint(prepared, streaming_manifest):
+    from accelerate.data_loader import prepare_data_loader
+    from transformers import default_data_collator
+    from experiments.nlp import load_mlm_data
+    seen = []
+    for rank in range(2):
+        data, _, _ = load_mlm_data(prepared, streaming_manifest, shuffle_buffer=3)
+        loader = torch.utils.data.DataLoader(data["train"], batch_size=2, num_workers=2,
+                                             collate_fn=default_data_collator)
+        loader = prepare_data_loader(loader, num_processes=2, process_index=rank,
+                                     put_on_device=False, dispatch_batches=False, split_batches=False)
+        rows = [tuple(row) for batch in loader for row in batch["input_ids"].tolist()]
+        assert len(rows) == len(set(rows)) == 16
+        seen.append(set(rows))
+    assert not seen[0] & seen[1] and len(seen[0] | seen[1]) == 32
+    manifest = read_json(streaming_manifest)
+    Path(manifest["files"][0]["path"]).write_text('{"text":"changed"}\n')
+    with pytest.raises(ValueError, match="file changed"):
+        load_mlm_data(prepared, streaming_manifest)
+
+
+def test_streaming_mlm_train_and_resume(prepared, streaming_manifest, tokenizer, tmp_path):
+    from experiments.train_mlm import train, preflight
+    torch.set_num_threads(2)
+    recipe = {"model": {"vocab_size": len(tokenizer[0]), "hidden_size": 32,
+              "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 64,
+              "max_position_embeddings": 32, "memsolve_rank": 16,
+              "memsolve_implementation": "reference"}, "global_batch_size": 4,
+              "train_mask_probability": .3, "streaming_shuffle_buffer": 3,
+              "training": {"max_steps": 2, "per_device_train_batch_size": 2,
+                  "per_device_eval_batch_size": 4, "learning_rate": 1e-4,
+                  "optim": "adamw_torch", "use_cpu": True, "report_to": "none",
+                  "dataloader_num_workers": 2, "dataloader_persistent_workers": True,
+                  "save_steps": 1, "disable_tqdm": True, "remove_unused_columns": False,
+                  "accelerator_config": {"dispatch_batches": False, "split_batches": False}}}
+    plan = preflight(recipe, prepared, world_size=2, streaming_manifest=streaming_manifest)
+    assert plan["train_rows"] is None and plan["train_source_files"] == 4
+    output = tmp_path / "stream-run"
+    metrics = train(recipe, prepared, output, streaming_manifest=streaming_manifest)
+    assert np.isfinite(metrics["eval_masked_nll"])
+    metrics = train(recipe, prepared, output, resume=output / "checkpoint-1",
+                    streaming_manifest=streaming_manifest)
+    assert read_json(output / "trainer_state.json")["global_step"] == 2
+    assert np.isfinite(metrics["eval_masked_nll"])
+
+
+@pytest.mark.parametrize("invalid", [None, "", 17])
+def test_retrieval_rejects_invalid_text(tmp_path, invalid):
+    from experiments.train_retrieval import retrieval_data
+    path = tmp_path / "triplets"
+    Dataset.from_dict({"query": [invalid] * 4,
+                       "positive": ["a bird"] * 4,
+                       "negative": ["a fish"] * 4}).save_to_disk(str(path))
+    with pytest.raises(ValueError, match="strings|null or empty"):
+        retrieval_data({"validation_triplets": 1, "split_seed": 12}, str(path))
+
+
 def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypatch):
-    from experiments.train_mlm import train as train_mlm
+    from experiments.train_mlm import train as train_mlm, preflight, evaluate as evaluate_mlm
     from experiments.train_retrieval import train as train_retrieval
     from experiments import evaluate_embeddings as evaluation
     torch.set_num_threads(2)
@@ -131,13 +237,33 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
               "memsolve_implementation": "reference"}, "global_batch_size": 8,
               "train_mask_probability": 0.3,
               "training": {**common, "remove_unused_columns": False,
+                           "eval_strategy": "steps", "eval_steps": 1,
+                           "load_best_model_at_end": True, "metric_for_best_model": "masked_nll",
+                           "greater_is_better": False,
                            "average_tokens_across_devices": True}}
+    plan = preflight(recipe, prepared, world_size=2)
+    assert plan["gradient_accumulation_steps"] == 1
+    assert plan["parameters"] > 0
+    assert plan["full_batch_token_slots"] == 2 * 8 * 16
+    with pytest.raises(ValueError):
+        preflight(recipe, prepared, world_size=0)
     mlm = tmp_path / "mlm"
     metrics = train_mlm(recipe, prepared, mlm)
     assert np.isfinite(metrics["eval_masked_nll"])
     exported = read_json(mlm / "final" / "config.json")
     assert exported["model_type"] == "memsolve_bert"
     assert exported["architectures"] == ["MemSolveBertForMaskedLM"]
+    selection = read_json(mlm / "final" / "selection.json")
+    assert selection["selection"] == "best_validation"
+    assert selection["best_checkpoint"] is not None
+    independent = evaluate_mlm(recipe, prepared, mlm / "final", tmp_path / "mlm-eval")
+    assert independent["eval_masked_nll"] == pytest.approx(metrics["eval_masked_nll"], abs=1e-6)
+    continued = tmp_path / "continued"
+    train_mlm(recipe, prepared, continued, init_checkpoint=mlm / "final")
+    assert read_json(continued / "run.json")["experiment"]["initialization"]["sha256"]
+    invalid = {**recipe, "model": {**recipe["model"], "memsolve_rank": 32}}
+    with pytest.raises(ValueError, match="differs"):
+        preflight(invalid, prepared, checkpoint=mlm / "final")
     metrics = train_mlm(recipe, prepared, mlm, str(mlm / "checkpoint-1"))
     assert read_json(mlm / "trainer_state.json")["global_step"] == 2
     encoder = load_sentence_model(mlm / "final", 16, "reference", "cpu")
@@ -185,3 +311,21 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
              implementation="reference", device="cpu", bf16=False)
     assert list((result / "cache").rglob("MemSolveLocalRetrievalFixture.json"))
     assert (result / "evaluation.json").is_file()
+
+
+def test_stock_bert_baseline_evaluation(prepared, tokenizer, tmp_path):
+    from transformers import BertConfig, BertForMaskedLM
+    from experiments.train_mlm import evaluate
+    checkpoint = tmp_path / "bert"
+    model = BertForMaskedLM(BertConfig(vocab_size=len(tokenizer[0]), hidden_size=32,
+                intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, max_position_embeddings=32))
+    model.save_pretrained(checkpoint)
+    tokenizer[0].save_pretrained(checkpoint)
+    recipe = {"model": {"memsolve_implementation": "reference"}, "train_mask_probability": .3,
+              "training": {"use_cpu": True, "bf16": False, "report_to": "none",
+                           "per_device_eval_batch_size": 4, "remove_unused_columns": False}}
+    metrics = evaluate(recipe, prepared, checkpoint, tmp_path / "baseline-eval")
+    assert np.isfinite(metrics["eval_masked_nll"])
+    embedding = load_sentence_model(checkpoint, 16, "reference", "cpu")
+    assert embedding[0].auto_model.config.model_type == "bert"
+    assert not hasattr(embedding[0].auto_model.config, "memsolve_implementation")

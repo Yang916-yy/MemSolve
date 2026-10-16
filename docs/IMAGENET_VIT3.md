@@ -97,6 +97,16 @@ group size or divisibility-by-128 requirement. The upstream default batch size
 of 128 is configurable; it is not an additional augmentation grouping rule.
 Changing physical batch size changes the batch-mode mixing correlations and
 pairing pool, even when gradient accumulation preserves the effective batch.
+An optional RA ablation can set `repeated_aug = true` in a separate copy of
+this TOML. It is recorded as `explicitly-modified`, not the plain ViT³ recipe.
+This uses timm's DeiT-derived `RepeatAugSampler` with three independently
+augmented views, global repetition before rank distribution, and WIDS indexed
+tar access. The epoch budget stays at 1,251 updates for global batch1,024;
+RA therefore exposes fewer distinct source images per epoch rather than
+tripling epoch length. Epoch-dependent shuffling changes that subset.
+Mixup/CutMix still uses the full physical batch; RA does not enable virtual
+augmentation groups. The sampler propagates epochs to persistent workers and
+records its sampling policy in checkpoint metadata.
 Worker quotas use complete physical batches. The separate
 [DeiT III recipe](IMAGENET_DEIT3.md) explicitly enables virtual augmentation
 groups and repeated augmentation; it does not change the ViT³ recipe above.
@@ -152,7 +162,15 @@ torchrun --standalone --nproc_per_node=2 experiments/train_imagenet.py \
 Select `--tier tiny` or `--tier base` for the other sizes. All tiers train at
 224px in one stage; there is no 192px pretraining or resolution fine-tuning.
 `--epochs 30` is a diagnostic override and is recorded as `explicitly-modified`.
-No MESA teacher or EMA model is allocated, updated, evaluated or checkpointed.
+The default allocates no MESA teacher or EMA model. An explicit custom TOML
+may set `ema = true` and `ema_decay = 0.9999`; this is recorded as
+`explicitly-modified`, rather than the default ViT³-derived recipe. It reuses
+timm `ModelEmaV3` with FP32 shadow weights and foreach updates, once after each
+optimizer step (not each accumulation microbatch). Ordinary and EMA weights
+are evaluated separately, and `checkpoint_best_ema.pt` stores the independently
+selected EMA best. EMA does not feed back into training. Starting a fresh run
+enables averaging from the first optimizer step; resuming an EMA run requires
+its saved EMA state.
 
 Resume with the same command and `--resume PATH/checkpoint_last.pt`. Outputs
 include `metadata.json`, `metrics.jsonl`, `checkpoint_last.pt`, and
@@ -170,7 +188,7 @@ epoch. Workers use `spawn` and prefetch one physical batch each. Defaults are
 semantics in the [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.14/data.html).
 
 The ImageNet checkpoint envelope remains 12. The restored vision scaffold
-contract is 7 and the operator contract is 26; native ABI is 16. Metadata records
+contract is 7 and the operator contract is 26; native ABI is 17. Metadata records
 `vit3_cpe_accretive_mean_gelu_v7`, GELU, token-LN mean pooling, no LayerScale
 and CPE. Previous Q/K/V
 checkpoints cannot resume as this model. Historical Small weights were checked

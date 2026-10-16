@@ -1412,6 +1412,100 @@ def test_custom_recipe_is_not_mislabeled_as_vit3(tmp_path):
                             resolved_optimizer="torch.adamw.fused") == "explicitly-modified"
 
 
+def test_vit3_optional_ema_is_explicitly_modified(tmp_path):
+    config = tmp_path / "vit3_ema.toml"
+    config.write_text(imagenet.VIT3_CONFIG.read_text().replace(
+        "ema = false", "ema = true\nema_decay = 0.9999"))
+    run = load_run(_args(tmp_path, "--config", str(config)))
+    assert run.train["ema"] is True and run.train["ema_decay"] == .9999
+    assert _recipe_fidelity(run, batching_plan=_checkpoint_batching_plan(),
+                            resolved_optimizer="torch.adamw.fused") == "explicitly-modified"
+    model = torch.nn.Linear(4, 2)
+    ema = imagenet.build_model_ema(model, run)
+    assert all(p.dtype == torch.float32 and not p.requires_grad for p in ema.module.parameters())
+    assert not ema.module.training
+    before = [p.detach().clone() for p in model.parameters()]
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.)
+    ema.update(model)
+    for shadow, initial in zip(ema.module.parameters(), before):
+        torch.testing.assert_close(shadow, initial + .0001)
+    config.write_text(config.read_text().replace("ema_decay = 0.9999", "ema_decay = 1.0"))
+    with pytest.raises(ValueError, match="ema_decay"):
+        load_run(_args(tmp_path, "--config", str(config)))
+
+
+def test_vit3_repeated_augmentation_uses_timm_and_fixed_updates(tmp_path, monkeypatch):
+    pytest.importorskip("wids")
+    from timm.data.distributed_sampler import RepeatAugSampler
+
+    config = tmp_path / "vit3_ra.toml"
+    config.write_text(imagenet.VIT3_CONFIG.read_text().replace(
+        "repeated_aug = false", "repeated_aug = true"))
+    run = load_run(_args(tmp_path, "--config", str(config),
+                         "--train-workers", "0", "--val-workers", "0"))
+    assert _recipe_fidelity(run, batching_plan=_checkpoint_batching_plan(),
+                            resolved_optimizer="torch.adamw.fused") == "explicitly-modified"
+    root = _write_webdataset_root(tmp_path, monkeypatch)
+    plan = BatchingPlan(world_size=1, physical_batch_size=4, effective_batch_size=8,
+                        grad_accum=2, samples_per_epoch=8, updates_per_epoch=1)
+    monkeypatch.setattr(imagenet, "resolve_batching_plan", lambda *_args, **_kwargs: plan)
+    calls = []
+
+    def transform(_image):
+        calls.append(len(calls))
+        return torch.tensor(calls[-1])
+
+    monkeypatch.setattr(imagenet, "build_train_transform", lambda _run: transform)
+    loader, _, sampler, _, _, data = build_loaders(run, root, _cpu_state(), requested_grad_accum=None)
+    assert isinstance(sampler, imagenet.RepeatedAugmentationSampler)
+    assert len(loader) == 2 and len(sampler) == 8
+    assert data["streaming"]["source_views"] == 3
+    assert data["streaming"]["repeated_augmentation_placement"] == "timm-repeat-aug-3"
+    assert "augmentation_group_size" not in data["streaming"]
+    imagenet._validate_webdataset_contract(data)
+    sampler.set_epoch(4)
+    expected = RepeatAugSampler(sampler.dataset, num_replicas=1, rank=0,
+                                num_repeats=3, selected_round=0)
+    expected.set_epoch(4 + run.train["seed"])
+    assert list(sampler) == list(expected)[:8]
+    assert sampler.dataset._shared_epoch.item() == 4
+    assert torch.cat([images for images, _ in loader]).tolist() == list(range(8))
+    order = list(sampler)
+    sampler.set_epoch(5)
+    assert list(sampler) != order
+    sampler.set_epoch(4)
+    assert list(sampler) == order
+
+
+def test_repeated_augmentation_distributes_three_views_across_ranks():
+    from types import SimpleNamespace
+    from collections import Counter
+    from timm.data.distributed_sampler import RepeatAugSampler
+
+    class Dataset:
+        seed = 0
+        def __len__(self):
+            return 120
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+    combined = []
+    for rank in range(2):
+        dataset = Dataset()
+        dataset.state = SimpleNamespace(world_size=2, rank=rank)
+        sampler = imagenet.RepeatedAugmentationSampler(dataset, samples_per_rank=60)
+        sampler.set_epoch(7)
+        expected = RepeatAugSampler(dataset, num_replicas=2, rank=rank, num_repeats=3)
+        expected.num_selected_samples = 60
+        expected.set_epoch(7)
+        assert list(sampler) == list(expected)
+        combined.extend(sampler)
+    assert len(Counter(combined)) == 40
+    assert set(Counter(combined).values()) == {3}
+
+
 def test_vit3_transforms_and_soft_targets(tmp_path):
     pytest.importorskip("timm")
     from PIL import Image

@@ -72,9 +72,8 @@ MIT License
 
 Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 
-The vision scaffold in integrations/timm.py follows the Pre-LN and token-LN
-mean readout in the MIT-licensed ViT³ implementation (its residual CPE has
-been replaced by Q/K convolution followed by 2D RoPE):
+The vision scaffold in integrations/timm.py follows the Pre-LN, residual CPE
+and token-LN mean readout in the MIT-licensed ViT³ implementation:
 https://github.com/LeapLabTHU/ViTTT/blob/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt/models/vittt.py
 ViT³ modifications by Dongchen Han; upstream license copyright
 (c) Microsoft Corporation. The MIT permission notice below applies.
@@ -147,23 +146,40 @@ https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.
 These references inform algorithm/scheduling choices; MemSolve's equations
 and analytic derivatives remain independently defined in reference.py.
 
-The complement solve calls NVIDIA cuSOLVERDx POTRS; the projection
-weight/bias gradient calls the cuBLASLt BGRADB epilogue with FP32 accumulation.
+Earlier revisions used NVIDIA cuSOLVERDx POTRS for complement; the current
+common path uses POTRF/TRSM inverse factors. The projection weight/bias gradient calls the cuBLASLt BGRADB epilogue with FP32 accumulation.
 These are library API integrations, not vendored solver or GEMM implementations.
 https://docs.nvidia.com/cuda/cusolverdx/get_started/potrs.html
 https://docs.nvidia.com/cuda/cublas/index.html#cublasltepilogue-t
 
-Compact factor/solve composition uses the NVIDIA cuSOLVERDx POTRF, TRSM and
-POTRS APIs, factoring each system once before processing its RHS panels.
-The shared-map gradient follows the split-reduction organization described by
-CUTLASS, implemented for MemSolve's FP32 compact products in Triton.
+Earlier compact factor/solve composition used the NVIDIA cuSOLVERDx POTRF,
+TRSM and POTRS APIs. Its shared-map gradient used the split-reduction
+organization described by CUTLASS. The current path reuses the already-needed
+compact product instead; these algorithm attributions are retained.
 cuBLASLt host-plan reuse follows NVIDIA's heuristics-cache guidance.
 https://docs.nvidia.com/cuda/cusolverdx/get_started/posv.html
 https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html#parallelized-reductions
 https://docs.nvidia.com/cuda/cublas/index.html#heuristics-cache
 
-Cholesky-adjoint fusion composes the cuSOLVERDx left/transposed and
+Earlier Cholesky-adjoint fusion composed the cuSOLVERDx left/transposed and
 right/nontransposed TRSM operations cited above in shared memory. No solver
 source is vendored. Compact-product epilogues follow the cited Triton
 post-accumulation fusion pattern; the analytic VJP remains the repository's
 reference contract.
+
+The common inverse-factor CUDA path reuses the cuSOLVERDx POTRF/TRSM APIs
+above and is informed by selective triangular inversion:
+Wicky, Solomonik, Hoefler (IPDPS 2017), https://arxiv.org/abs/1612.01855.
+The compact adjoint follows Cholesky differentiation (Murray, 2016,
+https://arxiv.org/abs/1602.07527) with MemSolve-specific common-subexpression
+reuse. No solver source from these papers is vendored.
+Exact sequence statistics use PyTorch/NCCL SUM collectives; convolution halos
+use PyTorch's autograd-enabled functional all_gather_single. Parameter gradients
+use SUM across sequence shards, following PyTorch's sequence-parallel examples:
+https://github.com/pytorch/pytorch/blob/main/torch/distributed/_functional_collectives.py
+https://github.com/pytorch/pytorch/blob/main/test/distributed/tensor/parallel/test_tp_examples.py
+Compact scalar precision: NVIDIA libdevice tanh/log1p are called through
+Triton's supported external-function interface; no library implementation is
+copied. The tanh value and its analytic exponential derivative are evaluated
+separately to retain both small values and representable tail gradients.
+https://triton-lang.org/main/getting-started/tutorials/07-extern-functions.html

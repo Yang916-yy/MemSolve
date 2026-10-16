@@ -1,0 +1,17 @@
+[experiment]
+suite = "lra"
+task = "listops"
+data_root = "data/lra"
+cache_root = "data/sequence_cache"
+
+[model]
+mixer = "memsolve"
+implementation = "cuda"
+
+[training]
+execution = "compile"
+pad_to_max_length = true
+amp_dtype = "bfloat16"
+min_lr_ratio = 0.01
+workers = 8
+eval_workers = 4

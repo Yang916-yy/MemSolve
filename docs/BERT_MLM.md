@@ -98,8 +98,8 @@ MLM stage uses length 128, and retrieval fine-tuning uses up to 512 positions.
 The BERT/Phi3 source links are listed below. The operator's exact library/custom
 kernel boundary and precision choices are documented in [CUDA_CONTRACT.md](CUDA_CONTRACT.md).
 Reusing mature primitives does not make the custom operator, masking adapter or
-architecture choices an unmodified upstream model. The default training entry
-does not enable whole-model compile or CUDA Graph.
+architecture choices an unmodified upstream model. The training entry supports explicit `eager`, `graph` and `compile-graph`
+execution; the measured two-A800 recipe selects `compile-graph` (details below).
 
 ## Use from the source checkout
 
@@ -339,14 +339,48 @@ global batch 4096, 70,000 optimizer updates, seed 17, training mask probability
 motivates these settings. The measured two-A800 configuration uses microbatch 512 per GPU and four
 accumulation steps, with eight persistent loader workers per rank and prefetch
 factor two. Change microbatch and accumulation together to preserve global 4096. HF Trainer handles DDP, BF16 AMP, fused AdamW, scheduling and resume.
-Parameters stay FP32, including evaluation. The entrypoint does not enable
-whole-model CUDA Graph or compile.
+Parameters stay FP32, including evaluation. The entrypoint uses `compile-graph` for model/loss forward and backward,
+with DDP communication and optimizer steps outside capture.
 
 The full schedule targets 286,720,000 sequence presentations, or 36.70 billion
 tensor token slots at length 128. These are not unique documents or non-padding
 tokens. The complete 70,000-step recipe is retained; measure real-data step time,
 validation cost, peak memory and I/O before starting it. A CPU preflight is not a
 CUDA throughput measurement. No formal C4 pretraining result is available yet.
+
+### Compiled CUDA Graph execution
+
+The recipe's top-level `execution` selects `eager`, `graph` or `compile-graph`.
+`compile-graph` uses Inductor to fuse the BERT scaffold and MLM loss while
+retaining the existing MemSolve CUDA boundary. It disables Inductor's internal
+CUDA Graphs and captures the tensor-only forward/loss and backward with
+[PyTorch `make_graphed_callables`](https://docs.pytorch.org/docs/stable/generated/torch.cuda.make_graphed_callables.html).
+Capture happens before DDP construction. DDP reduction, accumulation, clipping,
+fused AdamW, the scheduler and checkpointing remain in HF Trainer.
+
+Parameters stay FP32; forward uses BF16 autocast with its weight cache disabled.
+AOTAutograd specializes for backward outside autocast. Inductor preserves eager
+precision casts (`emulate_precision_casts=true`). Capture warmup does not update
+weights and restores CPU/CUDA RNG state and buffers before training. Graph RNG
+advances on replay; compiler dropout is not required to be bitwise identical to
+eager dropout. Validation uses the ordinary forward, includes every validation
+sample, and never replays the fixed training graph.
+
+Loss normalization still uses the masked-target count over the complete global
+accumulation group. Independent parameter-gradient accumulators prevent the
+replay-buffer aliasing reported in
+[PyTorch issue #181723](https://github.com/pytorch/pytorch/issues/181723).
+No optimizer update occurs during graph capture. The graph is recreated on
+resume and checkpoint weights are loaded in place; graph objects are not saved
+in HF checkpoints.
+
+Training IDs, masks, token types and labels must retain the captured CUDA int64
+shape. A partial training microbatch is rejected rather than silently padded,
+dropped or switched to eager. The full local C4 source exceeds this run's sample
+budget. Do not combine this execution mode with Trainer's separate
+`torch_compile`, gradient checkpointing, full-parameter BF16 casts or changes to
+parameter storage after capture. Startup compilation is excluded from steady
+throughput. `execution=eager` retains the ordinary HF path.
 
 Composer's decay multiplies weights by `1 - (lr_t / lr_peak) * wd_composer`.
 PyTorch multiplies by `1 - lr_t * wd_torch`; therefore the equivalent coefficient

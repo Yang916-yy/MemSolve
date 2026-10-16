@@ -60,5 +60,6 @@
       "split_batches": false
     }
   },
-  "streaming_shuffle_buffer": 10000
+  "streaming_shuffle_buffer": 10000,
+  "execution": "compile-graph"
 }

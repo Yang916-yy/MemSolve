@@ -70,3 +70,10 @@ with 9 optional checks skipped and 3 upstream MTEB deprecation warnings.
 This includes local C4 streaming, rank/worker partitioning, Trainer resume,
 SM80 inverse-factor accuracy and exact sequence-parallel checks. The manuscript
 also compiled successfully. These checks do not establish NLP task accuracy.
+
+The MLM compile-graph path has focused CUDA tests for masked-target-weighted
+gradient accumulation, parameter updates, HF save/load, zero-target batches,
+train/eval switching and advancing dropout RNG. On 2026-10-16 these 3 CUDA
+checks and all 12 CPU NLP workflow checks passed. A separate two-A800 real-C4
+probe exercised validation, checkpoint reload and continued graph replay;
+profiling confirmed Inductor kernels and forward/backward graph launches.

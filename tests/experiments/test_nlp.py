@@ -329,3 +329,83 @@ def test_stock_bert_baseline_evaluation(prepared, tokenizer, tmp_path):
     embedding = load_sentence_model(checkpoint, 16, "reference", "cpu")
     assert embedding[0].auto_model.config.model_type == "bert"
     assert not hasattr(embedding[0].auto_model.config, "memsolve_implementation")
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compile_model", [False, True])
+def test_mlm_compile_graph_accumulation_eval_and_reload(tmp_path, compile_model):
+    """Graph replay preserves weighted accumulation, updates and the HF export."""
+    from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
+    from experiments.nlp import prepare_mlm_graph
+    torch.manual_seed(71)
+    config = MemSolveBertConfig(vocab_size=32, hidden_size=32, num_hidden_layers=1,
+        num_attention_heads=2, intermediate_size=64, memsolve_rank=16,
+        memsolve_implementation="cuda", hidden_dropout_prob=0., attention_probs_dropout_prob=0.)
+    eager = MemSolveBertForMaskedLM(config).cuda()
+    graph = MemSolveBertForMaskedLM(config).cuda()
+    graph.load_state_dict(eager.state_dict())
+    batches = []
+    for index in range(2):
+        ids = torch.randint(5, 32, (2, 40), device="cuda")
+        mask = torch.ones_like(ids); mask[:, -(index + 2):] = 0
+        labels = ids.clone(); labels[:, :10 * (index + 1)] = -100; labels[mask == 0] = -100
+        batches.append(dict(input_ids=ids, attention_mask=mask, token_type_ids=torch.zeros_like(ids), labels=labels))
+    rng = torch.cuda.get_rng_state().clone()
+    prepare_mlm_graph(graph, batches[0], compile_model=compile_model)
+    assert torch.equal(rng, torch.cuda.get_rng_state())
+    count = sum(batch['labels'].ne(-100).sum() for batch in batches)
+    optimizers = [torch.optim.AdamW(m.parameters(), lr=1e-4, fused=True) for m in (eager, graph)]
+    for _ in range(2):
+        for model, optimizer in zip((eager, graph), optimizers):
+            optimizer.zero_grad(set_to_none=True)
+            for batch in batches:
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    if model is eager:
+                        output = model(**{k:v for k,v in batch.items() if k != 'labels'})
+                        loss = masked_loss(output, batch['labels'], count)
+                    else:
+                        loss = model(**batch, num_items_in_batch=count).loss
+                loss.backward()
+        for (name, p), q in zip(eager.named_parameters(), graph.parameters()):
+            torch.testing.assert_close(p.grad, q.grad, rtol=.025, atol=2e-4, msg=name)
+        for optimizer in optimizers: optimizer.step()
+    graph.eval(); eager.eval()
+    with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+        result = graph(**batches[0]); expected = eager(**batches[0])
+    assert "loss" in result and torch.isfinite(result["loss"])
+    torch.testing.assert_close(result.logits, expected.logits, rtol=.025, atol=.003)
+    graph.save_pretrained(tmp_path / 'model')
+    restored = MemSolveBertForMaskedLM.from_pretrained(tmp_path / 'model').cuda()
+    graph.load_state_dict(restored.state_dict())
+    graph.train()
+    empty = {**batches[0], 'labels': torch.full_like(batches[0]['labels'], -100)}
+    graph.zero_grad(set_to_none=True)
+    loss = graph(**empty, num_items_in_batch=0).loss
+    loss.backward()
+    assert loss.item() == 0
+    assert all(p.grad is not None and torch.count_nonzero(p.grad) == 0 for p in graph.parameters())
+    assert graph._memsolve_graph_info['replays'] == 5
+    with pytest.raises(ValueError, match='shape/dtype/device'):
+        graph(**{k:v[:1] for k,v in batches[0].items()})
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mlm_compile_graph_dropout_advances():
+    from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
+    from experiments.nlp import prepare_mlm_graph
+    model = MemSolveBertForMaskedLM(MemSolveBertConfig(vocab_size=32, hidden_size=32,
+        num_hidden_layers=1, num_attention_heads=2, intermediate_size=64, memsolve_rank=16,
+        memsolve_implementation='cuda', hidden_dropout_prob=.3)).cuda()
+    ids = torch.randint(5, 32, (2, 40), device='cuda')
+    batch = dict(input_ids=ids, attention_mask=torch.ones_like(ids),
+                 token_type_ids=torch.zeros_like(ids), labels=ids.clone())
+    prepare_mlm_graph(model, batch)
+    values = []
+    for _ in range(3):
+        model.zero_grad(set_to_none=True)
+        loss = model(**batch).loss
+        loss.backward()
+        values.append(loss.item())
+    assert all(np.isfinite(values)) and len(set(values)) > 1

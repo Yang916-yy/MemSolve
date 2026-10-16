@@ -170,8 +170,9 @@ C4 MLM, Sentence Transformers retrieval fine-tuning and MTEB/LongEmbed
 evaluation. They include CPU preflight, independent fixed-mask MLM evaluation,
 best-validation export, local full-corpus C4 streaming, and continued pretraining
 from a checkpoint. The full
-default is 70,000 updates at sequence length 128 and global batch 4096;
-measure runtime before launch. LongEmbed currently truncates to 512 and does
+default is 70,000 updates at sequence length 128 and global batch 4096,
+with Inductor fusion and CUDA Graph forward/backward capture; measure runtime
+before launch. DDP communication and optimization remain in HF Trainer. LongEmbed currently truncates to 512 and does
 not establish full long-document context capability. Both modalities call
 the same MemSolve operator and CUDA path.
 

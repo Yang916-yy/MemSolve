@@ -144,6 +144,104 @@ def masked_loss(outputs, labels, num_items_in_batch=None):
                            ignore_index=-100, reduction="sum") / count
 
 
+class _MLMSumLoss(torch.nn.Module):
+    """Tensor-only capture surface; the original HF model still owns all weights."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.original_forward = model.forward
+
+    def forward(self, input_ids, attention_mask, token_type_ids, labels):
+        with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+            output = self.original_forward(input_ids=input_ids, attention_mask=attention_mask,
+                                           token_type_ids=token_type_ids, return_dict=True)
+            return masked_loss(output, labels, labels.new_ones(()))
+
+
+def prepare_mlm_graph(model, sample_batch, *, compile_model=True):
+    """Capture forward/loss/backward before DDP using PyTorch graphed callables.
+
+    HF Trainer retains accumulation, global target normalization, DDP reduction,
+    optimizer and checkpoints. Only training with labels uses the fixed-shape
+    graph; validation retains full logits and its ordinary model forward.
+    """
+    from transformers.modeling_outputs import MaskedLMOutput
+    from memsolve import MemSolve
+    from memsolve.ball import cuda
+    keys = ("input_ids", "attention_mask", "token_type_ids", "labels")
+    samples = tuple(sample_batch[key].clone() for key in keys)
+    device = next(model.parameters()).device
+    if device.type != "cuda" or any(t.device != device or t.dtype != torch.int64 for t in samples):
+        raise ValueError("MLM graph requires CUDA int64 IDs, masks, token types and labels")
+    if any(t.shape != samples[0].shape for t in samples) or samples[0].ndim != 2:
+        raise ValueError("MLM graph samples must share [batch, length]")
+    if model.is_gradient_checkpointing:
+        raise ValueError("MLM graph does not support gradient checkpointing")
+    cuda.load(device=device)
+    model.train()
+    loss_module = _MLMSumLoss(model)
+    if compile_model:
+        import torch._functorch.config as functorch_config
+        import torch._dynamo.config as dynamo_config
+        functorch_config.backward_pass_autocast = "off"
+        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 2 * model.config.num_hidden_layers + 4)
+        for module in model.modules():
+            if isinstance(module, MemSolve):
+                module.forward = torch.compiler.disable(module.forward)
+        loss_module.forward = torch.compile(loss_module.forward, backend="inductor", dynamic=False,
+            fullgraph=False, options={"triton.cudagraphs": False, "emulate_precision_casts": True})
+    cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state(device)
+    buffers = [(buffer, buffer.clone()) for buffer in model.buffers()]
+    try:
+        # No DDP exists during capture: its hooks run outside these graphs.
+        graphed = torch.cuda.make_graphed_callables(loss_module, samples, num_warmup_iters=3)
+    finally:
+        with torch.no_grad():
+            for buffer, saved in buffers:
+                buffer.copy_(saved)
+        torch.set_rng_state(cpu_rng)
+        torch.cuda.set_rng_state(cuda_rng, device)
+    original_forward = loss_module.original_forward
+    # make_graphed_callables returns reusable gradient storage. AccumulateGrad
+    # may otherwise adopt it when .grad is None and overwrite prior microsteps
+    # on the next replay (pytorch/pytorch#181723). Keep separate accumulators.
+    parameters = tuple(model.parameters())
+    gradient_buffers = tuple(torch.zeros_like(p) for p in parameters)
+    info = {"execution": "compile-graph" if compile_model else "graph",
+            "shape": list(samples[0].shape), "captures": 1, "replays": 0,
+            "ddp_in_graph": False, "optimizer_in_graph": False}
+
+    def forward(input_ids=None, attention_mask=None, token_type_ids=None, labels=None,
+                num_items_in_batch=None, **kwargs):
+        if not model.training or labels is None:
+            output = original_forward(input_ids=input_ids, attention_mask=attention_mask,
+                                      token_type_ids=token_type_ids, **kwargs)
+            if labels is not None:
+                output["loss"] = masked_loss(output, labels, num_items_in_batch)
+            return output
+        if kwargs:
+            raise ValueError(f"MLM training graph does not accept extra inputs: {tuple(kwargs)}")
+        tensors = (input_ids, attention_mask, token_type_ids, labels)
+        if any(t is None or t.shape != sample.shape or t.dtype != sample.dtype or t.device != sample.device
+               for t, sample in zip(tensors, samples)):
+            raise ValueError("MLM training graph input shape/dtype/device changed")
+        missing = [(p, buffer) for p, buffer in zip(parameters, gradient_buffers) if p.grad is None]
+        if missing:
+            torch._foreach_zero_([buffer for _, buffer in missing])
+            for parameter, buffer in missing:
+                parameter.grad = buffer
+        total = graphed(*tensors)
+        count = labels.ne(-100).sum() if num_items_in_batch is None else num_items_in_batch
+        count = torch.as_tensor(count, device=labels.device).clamp_min(1)
+        info["replays"] += 1
+        return MaskedLMOutput(loss=total / count)
+
+    model.forward = forward
+    model.accepts_loss_kwargs = True
+    model._memsolve_graph_info = info
+    return model
+
+
 def masked_statistics(logits, labels):
     if isinstance(logits, tuple):
         logits = logits[0]

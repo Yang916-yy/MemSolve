@@ -12,7 +12,7 @@ from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer, Traine
 from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
 from experiments.nlp import (MLMCollator, accumulation_steps, check_training_precision, checkpoint_digest, digest,
     load_prepared, load_mlm_data, masked_loss, masked_metrics, masked_statistics, read_json,
-    record_run, tokenizer_digest, versions, write_json)
+    record_run, tokenizer_digest, versions, write_json, prepare_mlm_graph)
 
 
 def check_data(config, manifests, tokenizer, checkpoint=None):
@@ -105,6 +105,12 @@ def train(recipe, data_root, output, resume=None, init_checkpoint=None, streamin
     set_seed(args.seed)
     model = (MemSolveBertForMaskedLM.from_pretrained(str(init_checkpoint), config=config)
              if init_checkpoint else MemSolveBertForMaskedLM(config))
+    execution = recipe.get("execution", "eager")
+    if execution not in ("eager", "graph", "compile-graph"):
+        raise ValueError("execution must be eager, graph or compile-graph")
+    if execution != "eager" and (config.memsolve_implementation != "cuda" or args.torch_compile
+                                  or args.gradient_checkpointing):
+        raise ValueError("MLM graph requires CUDA without nested Trainer compile or checkpointing")
     record_run(output, {"experiment": {"kind": "mlm", "recipe": recipe,
                "data": manifests, "world_size": args.world_size,
                "dataloader_drop_last": args.dataloader_drop_last,
@@ -112,10 +118,18 @@ def train(recipe, data_root, output, resume=None, init_checkpoint=None, streamin
                                     "sha256": checkpoint_digest(init_checkpoint)} if init_checkpoint else "random"),
                "gradient_accumulation_steps": args.gradient_accumulation_steps},
                "versions": versions()}, resume)
+    if execution != "eager":
+        batch = args.per_device_train_batch_size
+        rows = [data["validation"][i % len(data["validation"])] for i in range(batch)]
+        sample = MLMCollator(tokenizer, recipe["train_mask_probability"])(rows)
+        sample = {key: value.to(args.device) for key, value in sample.items()}
+        model.to(args.device)
+        prepare_mlm_graph(model, sample, compile_model=execution == "compile-graph")
+        print(f"Rank {args.process_index}: MLM execution ready: {model._memsolve_graph_info}", flush=True)
     trainer = Trainer(model=model, args=args, train_dataset=data["train"],
                       eval_dataset=data["validation"], processing_class=tokenizer,
                       data_collator=MLMCollator(tokenizer, recipe["train_mask_probability"]),
-                      compute_loss_func=masked_loss, compute_metrics=masked_metrics,
+                      compute_loss_func=masked_loss if execution == "eager" else None, compute_metrics=masked_metrics,
                       preprocess_logits_for_metrics=masked_statistics)
     result = trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(Path(output) / "final"))

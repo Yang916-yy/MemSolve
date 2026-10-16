@@ -183,3 +183,10 @@ Triton's supported external-function interface; no library implementation is
 copied. The tanh value and its analytic exponential derivative are evaluated
 separately to retain both small values and representable tail gradients.
 https://triton-lang.org/main/getting-started/tutorials/07-extern-functions.html
+
+MLM forward/loss/backward graph capture reuses PyTorch make_graphed_callables:
+https://docs.pytorch.org/docs/stable/generated/torch.cuda.make_graphed_callables.html
+Independent accumulation buffers address the upstream static-gradient alias:
+https://github.com/pytorch/pytorch/issues/181723
+HF Trainer/Accelerate continues to own DDP, loss normalization, optimization
+and checkpoint lifecycle; no PyTorch graph implementation is vendored.

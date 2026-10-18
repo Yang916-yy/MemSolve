@@ -47,8 +47,7 @@ def prepare(args):
         raise ValueError("eval_mask_probability must be in (0, 1]")
     output = Path(args.output) / args.split / f"part-{args.shard_index:05d}-of-{args.num_shards:05d}"
     output.parent.mkdir(parents=True, exist_ok=True)
-    # The OS releases this lock even after interruption; a second process must
-    # never remove an active job's .incomplete partition.
+    # Lock this partition while rebuilding its incomplete Arrow cache.
     with output.with_suffix(".lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -59,7 +58,7 @@ def prepare(args):
 
 def _prepare_partition(args, output):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True,
-                    revision=getattr(args, "tokenizer_revision", "main"))
+                    revision=args.tokenizer_revision)
     if not tokenizer.is_fast or tokenizer.mask_token_id is None or tokenizer.pad_token_id is None:
         raise ValueError("A fast tokenizer with MASK and PAD tokens is required")
     if args.files:
@@ -74,7 +73,7 @@ def _prepare_partition(args, output):
     if args.num_shards > source.num_shards:
         raise ValueError(f"Source exposes {source.num_shards} file shards; reduce --num-shards")
     source = source.shard(num_shards=args.num_shards, index=args.shard_index)
-    policy = getattr(args, "document_policy", "truncate")
+    policy = args.document_policy
     settings = {"format": 1, "source": source_id, "split": args.split,
                 "num_shards": args.num_shards, "shard_index": args.shard_index,
                 "max_docs": args.max_docs, "max_length": args.max_length,
@@ -89,7 +88,7 @@ def _prepare_partition(args, output):
         return output
     temporary = output.with_name(output.name + ".incomplete")
     if temporary.exists():
-        shutil.rmtree(temporary)  # Only this job's explicitly incomplete partition.
+        shutil.rmtree(temporary)
     temporary.mkdir(parents=True)
 
     token_counts = dict(attention_tokens=0, content_tokens=0, masked_targets=0)

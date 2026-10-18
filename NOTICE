@@ -1,8 +1,11 @@
 Restoration note (0.15.0): the no-RankRotary accretive core and native MathDx
-backend from e769a9a are restored. Notices describing Q/K/V, rotary kernels,
-RMSNorm and gated readout below refer to earlier repository revisions; their
-licenses are retained. Current vision reuses the historical residual CPE,
-GELU scaffold with mean pooling and no LayerScale. The current core retains
+backend from e769a9a are restored. Notices describing the former Q/K/V,
+RankRotary, RMSNorm and gated readout below refer to earlier repository revisions;
+their licenses are retained.
+Current RoVE, projection GEMM and ViT-Adapter attributions are recorded in
+THIRD_PARTY_NOTICES.md; redistributed license texts are in licenses/. Current
+vision reuses the historical residual CPE, GELU scaffold with mean pooling and
+no LayerScale. The current core retains
 equilibrium/complement modes; the content-conditioned generator and unused
 materialized-frame CUDA interfaces have been removed.
 

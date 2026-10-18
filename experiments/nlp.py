@@ -52,7 +52,7 @@ def source_digest():
               and p.suffix in (".cpp", ".cu", ".cuh", ".h", ".txt")]
     files += [root / "integrations/transformers.py", root / "integrations/distributed.py", root / "pyproject.toml"]
     files += [root / "experiments" / name for name in
-              ("nlp.py", "prepare_c4.py", "train_mlm.py", "train_retrieval.py", "evaluate_embeddings.py")]
+              ("nlp.py", "prepare_c4.py", "train_mlm.py", "train_glue.py", "train_retrieval.py", "evaluate_embeddings.py")]
     return digest({p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted(files)})
 
@@ -151,11 +151,26 @@ class _MLMSumLoss(torch.nn.Module):
         self.model = model
         self.original_forward = model.forward
 
-    def forward(self, input_ids, attention_mask, token_type_ids, labels):
+    def forward(self, input_ids, attention_mask, token_type_ids, labels, position_ids=None):
         with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
             output = self.original_forward(input_ids=input_ids, attention_mask=attention_mask,
-                                           token_type_ids=token_type_ids, return_dict=True)
+                                           token_type_ids=token_type_ids, position_ids=position_ids,
+                                           return_dict=True)
             return masked_loss(output, labels, labels.new_ones(()))
+
+
+def prepare_nlp_compile(model):
+    """Fuse the BERT scaffold while retaining MemSolve's native precision policy."""
+    from memsolve import MemSolve
+    import torch._functorch.config as functorch_config
+    import torch._dynamo.config as dynamo_config
+    import torch._inductor.config as inductor_config
+    functorch_config.backward_pass_autocast = "off"
+    dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 2 * model.config.num_hidden_layers + 4)
+    inductor_config.emulate_precision_casts = True
+    for module in model.modules():
+        if isinstance(module, MemSolve):
+            module.forward = torch.compiler.disable(module.forward)
 
 
 def prepare_mlm_graph(model, sample_batch, *, compile_model=True):
@@ -166,13 +181,15 @@ def prepare_mlm_graph(model, sample_batch, *, compile_model=True):
     graph; validation retains full logits and its ordinary model forward.
     """
     from transformers.modeling_outputs import MaskedLMOutput
-    from memsolve import MemSolve
     from memsolve.ball import cuda
     keys = ("input_ids", "attention_mask", "token_type_ids", "labels")
+    capture_positions = "position_ids" in sample_batch
+    if capture_positions:
+        keys += ("position_ids",)
     samples = tuple(sample_batch[key].clone() for key in keys)
     device = next(model.parameters()).device
     if device.type != "cuda" or any(t.device != device or t.dtype != torch.int64 for t in samples):
-        raise ValueError("MLM graph requires CUDA int64 IDs, masks, token types and labels")
+        raise ValueError("MLM graph requires CUDA int64 IDs, masks, token types, labels and positions")
     if any(t.shape != samples[0].shape for t in samples) or samples[0].ndim != 2:
         raise ValueError("MLM graph samples must share [batch, length]")
     if model.is_gradient_checkpointing:
@@ -181,13 +198,7 @@ def prepare_mlm_graph(model, sample_batch, *, compile_model=True):
     model.train()
     loss_module = _MLMSumLoss(model)
     if compile_model:
-        import torch._functorch.config as functorch_config
-        import torch._dynamo.config as dynamo_config
-        functorch_config.backward_pass_autocast = "off"
-        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 2 * model.config.num_hidden_layers + 4)
-        for module in model.modules():
-            if isinstance(module, MemSolve):
-                module.forward = torch.compiler.disable(module.forward)
+        prepare_nlp_compile(model)
         loss_module.forward = torch.compile(loss_module.forward, backend="inductor", dynamic=False,
             fullgraph=False, options={"triton.cudagraphs": False, "emulate_precision_casts": True})
     cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state(device)
@@ -212,16 +223,20 @@ def prepare_mlm_graph(model, sample_batch, *, compile_model=True):
             "ddp_in_graph": False, "optimizer_in_graph": False}
 
     def forward(input_ids=None, attention_mask=None, token_type_ids=None, labels=None,
-                num_items_in_batch=None, **kwargs):
+                position_ids=None, num_items_in_batch=None, **kwargs):
         if not model.training or labels is None:
             output = original_forward(input_ids=input_ids, attention_mask=attention_mask,
-                                      token_type_ids=token_type_ids, **kwargs)
+                                      token_type_ids=token_type_ids, position_ids=position_ids, **kwargs)
             if labels is not None:
                 output["loss"] = masked_loss(output, labels, num_items_in_batch)
             return output
         if kwargs:
             raise ValueError(f"MLM training graph does not accept extra inputs: {tuple(kwargs)}")
         tensors = (input_ids, attention_mask, token_type_ids, labels)
+        if capture_positions:
+            tensors += (position_ids,)
+        elif position_ids is not None:
+            raise ValueError("MLM training graph was captured without explicit position_ids")
         if any(t is None or t.shape != sample.shape or t.dtype != sample.dtype or t.device != sample.device
                for t, sample in zip(tensors, samples)):
             raise ValueError("MLM training graph input shape/dtype/device changed")
@@ -358,6 +373,13 @@ def load_mlm_data(root, streaming_manifest=None, *, seed=17, shuffle_buffer=1000
     return data, manifests, tokenizer_path
 
 
+def position_capacity(config):
+    """Only the absolute-position mode has a learned position-table limit."""
+    if config.model_type == "memsolve_bert" and config.position_embedding_type != "absolute":
+        return None
+    return config.max_position_embeddings
+
+
 def load_sentence_model(checkpoint, max_length, implementation, device):
     import integrations.transformers  # registers the model in HF Auto classes
     from sentence_transformers import SentenceTransformer
@@ -379,8 +401,8 @@ def load_sentence_model(checkpoint, max_length, implementation, device):
         encoder = Transformer(str(path), config_kwargs=overrides, max_seq_length=max_length)
         model = SentenceTransformer(modules=[encoder, Pooling(
             encoder.get_embedding_dimension(), pooling_mode="mean")], device=device)
-    capacity = model[0].auto_model.config.max_position_embeddings
-    if max_length > capacity:
+    capacity = position_capacity(model[0].auto_model.config)
+    if capacity is not None and max_length > capacity:
         raise ValueError(f"Requested {max_length} tokens but position capacity is {capacity}; "
                          "position extension and longer-context training are separate work")
     model.max_seq_length = max_length

@@ -46,8 +46,7 @@ std::tuple<at::Tensor, at::Tensor> linear_weight_bias_cuda(
     auto options = value.options().dtype(at::kFloat);
     auto weight = at::empty({n, m}, options);
     auto bias = at::empty({n}, options);
-    // Cache host plans, never tensor storage or device workspaces. Per-thread
-    // descriptors avoid races when bias pointers are refreshed on other streams.
+    // Thread-local plans let each caller refresh its own bias pointer.
     auto alignment = [](const at::Tensor& t) -> uint32_t {
         const auto address = reinterpret_cast<uintptr_t>(t.data_ptr());
         return static_cast<uint32_t>(std::min<uintptr_t>(256, address & (~address + 1)));
@@ -59,8 +58,7 @@ std::tuple<at::Tensor, at::Tensor> linear_weight_bias_cuda(
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
     auto found = plans.find(key);
     if (found == plans.end()) {
-        // Bound host metadata for variable-length workloads. Eviction does not
-        // invalidate captured graphs: their launch arguments are already copied.
+        // Bound the plan cache; captured graphs retain their launch arguments.
         if (plans.size() >= 256) plans.clear();
         auto plan = std::make_unique<LinearGradientDescriptors>();
         auto& desc = *plan;
@@ -82,8 +80,7 @@ std::tuple<at::Tensor, at::Tensor> linear_weight_bias_cuda(
         TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_limit, sizeof(workspace_limit)));
         TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &alignment_a, sizeof(alignment_a)));
         TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &alignment_b, sizeof(alignment_b)));
-        // Do not permit a reduced-precision accumulator even if process-wide
-        // PyTorch settings allow one. D and the split-K reduction are FP32.
+        // Require FP32 accumulation, including split-K reduction.
         const uint64_t implementation_mask = ~uint64_t(CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_16F);
         TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(desc.preference, CUBLASLT_MATMUL_PREF_IMPL_MASK, &implementation_mask, sizeof(implementation_mask)));
 

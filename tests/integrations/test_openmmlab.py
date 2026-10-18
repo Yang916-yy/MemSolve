@@ -21,7 +21,6 @@ from experiments.imagenet import (
     WDS_SAMPLE_SHUFFLE_INITIAL,
     WDS_SAMPLE_SHUFFLE_SIZE,
     checkpoint_contract_digest,
-    interpolate_position_embedding,
 )
 from experiments.train_openmmlab import _configure_checkpoint
 from integrations.timm import VisionSpec, MemSolveViT
@@ -55,6 +54,7 @@ def _tiny_imagenet_checkpoint(
             "num_heads": 4,
             "rank": 4,
             "drop_path_rate": 0.0,
+            "position_encoding": "cpe",
         },
         "operator": {
             "core_mode": "equilibrium",
@@ -105,7 +105,7 @@ def _tiny_imagenet_checkpoint(
 
 @pytest.fixture
 def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.MemSolveViTBackbone:
-    """Build the real downstream adapter with a CPU-sized DeiT-shaped encoder."""
+    """Build the real downstream adapter with a CPU-sized CPE encoder."""
 
     spec = VisionSpec(
         embed_dim=32,
@@ -118,7 +118,7 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.MemSolveViTBackb
         variant="small",
         image_size=32,
         rank=4,
-        out_indices=(0, 1, 2, 3),
+        mlp_ratio=4.0, conv_inplane=8, deform_num_heads=4, drop_path_rate=0.0,
         core_mode=CoreMode.EQUILIBRIUM,
 
         implementation="reference",
@@ -127,7 +127,7 @@ def tiny_backbone(monkeypatch: pytest.MonkeyPatch) -> openmmlab.MemSolveViTBackb
     return model
 
 
-def test_backbone_emits_xcit_style_four_level_pyramid(
+def test_backbone_emits_adapter_four_level_pyramid(
     tiny_backbone: openmmlab.MemSolveViTBackbone,
 ) -> None:
     """A plain ViT grid must become strides 4, 8, 16, and 32 for OpenMMLab."""
@@ -166,12 +166,13 @@ def test_backbone_masks_padded_pixels_before_global_mixing(
     with torch.inference_mode():
         expected = tiny_backbone(image, valid_mask=valid_mask)
         actual = tiny_backbone(changed_padding, valid_mask=valid_mask)
-        patch_mask = tiny_backbone._patch_valid_mask(image, valid_mask)
+
 
     for index, (expected_feature, actual_feature) in enumerate(
         zip(expected, actual, strict=True)
     ):
-        output_mask = tiny_backbone._scale_mask(patch_mask, index)
+        padded = torch.nn.functional.pad(valid_mask[:, None].float(), (0, 16, 0, 16))
+        output_mask = torch.nn.functional.max_pool2d(padded, 4 * 2**index).bool()
         expanded_mask = output_mask.expand_as(actual_feature)
         torch.testing.assert_close(
             actual_feature[expanded_mask],
@@ -230,7 +231,7 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
         num_heads=4,
         rank=4,
         core_mode=CoreMode.EQUILIBRIUM,
-        position_encoding="learned",
+        position_encoding="cpe",
 
         bias=True,
         implementation="reference",
@@ -246,49 +247,28 @@ def test_backbone_accepts_the_imagenet_checkpoint_contract(
         source.encoder.patch_embed.proj.weight,
     )
     torch.testing.assert_close(
-        tiny_backbone.encoder.pos_embed,
-        source.encoder.pos_embed,
+        tiny_backbone.encoder.blocks[0].cpe.weight,
+        source.encoder.blocks[0].cpe.weight,
     )
 
 
-def test_backbone_interpolates_a_smaller_pretrain_position_table(
-    tiny_backbone: openmmlab.MemSolveViTBackbone,
-    tmp_path: Path,
-) -> None:
-    target = type(tiny_backbone)(
-        variant="small",
-        image_size=48,
-        rank=4,
-        out_indices=(0, 1, 2, 3),
-        core_mode=CoreMode.EQUILIBRIUM,
-
-        implementation="reference",
-    ).eval()
-    source = MemSolveViT(
-        image_size=32,
-        patch_size=16,
-        num_classes=1000,
-        embed_dim=32,
-        depth=4,
-        num_heads=4,
-        rank=4,
-        core_mode=CoreMode.EQUILIBRIUM,
-        position_encoding="learned",
-
-        bias=True,
-        implementation="reference",
-        drop_path_rate=0.0,
-    )
-    checkpoint = tmp_path / "imagenet-32px.pt"
-    torch.save(_tiny_imagenet_checkpoint(source, image_size=32), checkpoint)
-
-    expected = interpolate_position_embedding(
-        source.encoder.pos_embed,
-        target.encoder.pos_embed,
-    )
-    target.load_pretrained(checkpoint)
-
-    torch.testing.assert_close(target.encoder.pos_embed, expected)
+def test_pretrained_ema_selection_and_rectangular_grid(tiny_backbone, tmp_path):
+    source = MemSolveViT(image_size=32, patch_size=16, num_classes=1000,
+        embed_dim=32, depth=4, num_heads=4, rank=4, implementation="reference")
+    payload = _tiny_imagenet_checkpoint(source)
+    payload["model_ema"] = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                            for k, v in payload["model"].items()}
+    payload["model_ema"]["encoder.patch_embed.proj.weight"].add_(1)
+    payload["selected_weights"] = "model_ema"
+    checkpoint = tmp_path / "ema.pt"
+    torch.save(payload, checkpoint)
+    tiny_backbone.load_pretrained(checkpoint)
+    assert tiny_backbone.pretrained_weights == "model_ema"
+    torch.testing.assert_close(tiny_backbone.patch_embed.proj.weight,
+                               source.patch_embed.proj.weight + 1)
+    with torch.no_grad():
+        maps = tiny_backbone(torch.randn(1, 3, 32, 64))
+    assert maps[-1].shape == (1, 32, 1, 2)
 
 
 def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
@@ -304,7 +284,7 @@ def test_backbone_rejects_a_digest_valid_but_incompatible_imagenet_checkpoint(
         num_heads=4,
         rank=4,
         core_mode=CoreMode.EQUILIBRIUM,
-        position_encoding="learned",
+        position_encoding="cpe",
 
         bias=True,
         implementation="reference",
@@ -341,76 +321,172 @@ def test_launcher_places_new_run_checkpoint_on_backbone(tmp_path: Path) -> None:
     assert not hasattr(config.model.backbone, "init_cfg")
 
 
-def test_coco_leaf_configs_keep_the_mask_rcnn_3x_contract() -> None:
-    """COCO leaves should vary only the MemSolve DeiT III scale and rank."""
-
-    expected = {
-        "small": (32, 384, (3, 5, 7, 11)),
-        "base": (48, 768, (3, 5, 7, 11)),
-        "large": (64, 1024, (7, 11, 15, 23)),
-    }
-    for variant, (rank, channels, out_indices) in expected.items():
-        path = CONFIG_ROOT / f"coco_mask_rcnn_memsolve_deit3_{variant}_3x.py"
-        config = runpy.run_path(str(path))
-        backbone = config["model"]["backbone"]
-        assert config["_base_"] == "./_base_/coco_mask_rcnn_fpn_3x.py"
-        assert config["custom_imports"] == {
-            "imports": ["integrations.openmmlab"],
-            "allow_failed_imports": False,
-        }
-        assert backbone == {
-            "type": "MemSolveViTBackbone",
-            "variant": variant,
-            "rank": rank,
-            "out_indices": out_indices,
-            "implementation": "cuda",
-            "core_mode": "equilibrium",
-        }
-        assert config["model"]["neck"] == {
-            "in_channels": [channels] * 4,
-        }
-
-    base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "coco_mask_rcnn_fpn_3x.py"))
-    assert base["model"]["type"] == "MemSolveMaskRCNN"
-    assert "init_cfg" not in base["model"]["backbone"]
-    assert base["model"]["neck"]["type"] == "FPN"
-    assert base["model"]["neck"]["num_outs"] == 5
-    assert base["max_epochs"] == 36
-    assert base["param_scheduler"][1]["milestones"] == [27, 33]
-    policy = base["train_pipeline"][3]["transforms"]
-    assert policy[0][0]["scales"] == [
-        (1333, short_side) for short_side in range(480, 801, 32)
-    ]
-    assert policy[1][0]["scales"] == [(1333, short_side) for short_side in (400, 500, 600)]
+@pytest.mark.parametrize("variant", ["tiny", "small", "base"])
+def test_adapter_recipe_budget(variant):
+    for task, suffix in [("coco_mask_rcnn", "1x"), ("ade20k_upernet", "160k")]:
+        leaf = runpy.run_path(str(CONFIG_ROOT / f"{task}_memsolve_adapter_{variant}_{suffix}.py"))
+        base = runpy.run_path(str(CONFIG_ROOT / leaf["_base_"]))
+        assert base["train_dataloader"]["batch_size"] * 2 == 16
+        assert base["optim_wrapper"]["dtype"] == "bfloat16"
+        if suffix == "1x":
+            assert base["train_cfg"]["max_epochs"] == 12
+            assert base["param_scheduler"][1]["milestones"] == [8, 11]
+        else:
+            assert base["train_cfg"]["max_iters"] == 160000
+            assert base["model"]["test_cfg"]["mode"] == "slide"
 
 
-def test_ade20k_leaf_configs_keep_the_upernet_160k_contract() -> None:
-    """ADE20K leaves should preserve the common UperNet 160k protocol."""
+def test_full_adapter_gradients_include_injector_and_spatial_prior(tiny_backbone):
+    outputs = tiny_backbone(torch.randn(2, 3, 32, 64))
+    sum(x.square().mean() for x in outputs).backward()
+    for name, parameter in tiny_backbone.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+    assert tiny_backbone.interactions[0].injector.gamma.grad.abs().sum() > 0
 
-    expected = {
-        "small": (32, 384, (3, 5, 7, 11), 384),
-        "base": (48, 768, (3, 5, 7, 11), 512),
-        "large": (64, 1024, (7, 11, 15, 23), 512),
-    }
-    for variant, (rank, channels, out_indices, decoder_channels) in expected.items():
-        path = CONFIG_ROOT / f"ade20k_upernet_memsolve_deit3_{variant}_160k.py"
-        config = runpy.run_path(str(path))
-        backbone = config["model"]["backbone"]
-        assert config["_base_"] == "./_base_/ade20k_upernet_160k.py"
-        assert backbone["variant"] == variant
-        assert backbone["rank"] == rank
-        assert backbone["out_indices"] == out_indices
-        assert backbone["implementation"] == "cuda"
-        assert backbone["core_mode"] == "equilibrium"
-        assert config["model"]["decode_head"] == {
-            "in_channels": [channels] * 4,
-            "channels": decoder_channels,
-        }
-        assert config["model"]["auxiliary_head"] == {"in_channels": channels}
 
-    base = runpy.run_path(str(CONFIG_ROOT / "_base_" / "ade20k_upernet_160k.py"))
-    assert base["model"]["type"] == "MemSolveEncoderDecoder"
-    assert "init_cfg" not in base["model"]["backbone"]
-    assert base["model"]["decode_head"]["type"] == "UPerHead"
-    assert base["crop_size"] == (512, 512)
-    assert base["train_cfg"]["max_iters"] == 160000
+def test_layer_decay_assigns_backbone_and_new_parameters(tiny_backbone):
+    model = torch.nn.Module()
+    model.backbone = tiny_backbone
+    groups = openmmlab.layer_decay_groups(model, depth=4, decay_rate=.8, lr=.001, weight_decay=.05)
+    by_id = {id(p): g for g in groups for p in g["params"]}
+    assert len(by_id) == len(list(model.parameters()))
+    assert by_id[id(tiny_backbone.patch_embed.proj.weight)]["lr"] == pytest.approx(.001 * .8**5)
+    assert by_id[id(tiny_backbone.interactions[0].injector.gamma)]["weight_decay"] == 0
+    assert by_id[id(tiny_backbone.up.weight)]["lr"] == .001
+
+
+def test_dynamic_cpe_matches_fixed_classifier():
+    kwargs = dict(image_size=32, num_classes=7, embed_dim=32, depth=2,
+                  num_heads=4, rank=4, implementation="reference")
+    fixed = MemSolveViT(**kwargs).eval()
+    dynamic = MemSolveViT(**kwargs, dynamic_img_size=True, dynamic_img_pad=True).eval()
+    dynamic.load_state_dict(fixed.state_dict())
+    with torch.no_grad():
+        image = torch.randn(2, 3, 32, 32)
+        torch.testing.assert_close(dynamic(image), fixed(image), rtol=0, atol=0)
+        assert dynamic(torch.randn(2, 3, 35, 60)).shape == (2, 7)
+
+
+def test_sliding_inference_slices_masks_and_preserves_metadata():
+    class Segmenter(openmmlab._SegmentationMaskMixin):
+        test_cfg = SimpleNamespace(stride=(16, 16), crop_size=(32, 32))
+        out_channels = 1
+        def encode_decode(self, crop, metas):
+            assert self._memsolve_valid_mask.shape == crop[:, 0].shape
+            return crop[:, :1].masked_fill(~self._memsolve_valid_mask[:, None], 0)
+    model = Segmenter()
+    mask = torch.ones(1, 40, 50, dtype=torch.bool)
+    mask[:, 35:, :] = False
+    model._memsolve_valid_mask = mask
+    image = torch.randn(1, 3, 40, 50)
+    metas = [dict(img_shape=(35, 50))]
+    result = model.slide_inference(image, metas)
+    torch.testing.assert_close(result, image[:, :1].masked_fill(~mask[:, None], 0))
+    assert model._memsolve_valid_mask is mask
+    assert metas[0]["img_shape"] == (35, 50)
+
+
+@pytest.mark.parametrize("task", ["mmdet", "mmseg"])
+@pytest.mark.parametrize("amp", [False, True])
+def test_openmmlab_heads_train_and_predict(task, amp, monkeypatch):
+    """Exercise the actual heads, loss functions and framework dispatch on CPU."""
+    pytest.importorskip("mmcv.ops")
+    torch.manual_seed(19)
+    from mmengine.config import Config
+    from mmengine.registry import init_default_scope
+    from mmengine.structures import InstanceData, PixelData
+    import numpy as np
+
+    monkeypatch.setattr(openmmlab, "vision_spec", lambda _: VisionSpec(32, 4, 4, 0))
+    name = ("coco_mask_rcnn_memsolve_adapter_small_1x.py" if task == "mmdet"
+            else "ade20k_upernet_memsolve_adapter_small_160k.py")
+    cfg = Config.fromfile(CONFIG_ROOT / name)
+    cfg.model.backbone.update(rank=4, mlp_ratio=4, implementation="reference",
+                             deform_num_heads=4, conv_inplane=8, drop_path_rate=0)
+    init_default_scope(task)
+    if task == "mmdet":
+        from mmdet.registry import MODELS
+        from mmdet.structures import DetDataSample
+        from mmdet.structures.mask import BitmapMasks
+        cfg.model.neck.in_channels = [32] * 4
+        model = MODELS.build(cfg.model)
+        samples = []
+        for _ in range(2):
+            sample = DetDataSample(metainfo=dict(img_shape=(64, 64), ori_shape=(64, 64),
+                                                 batch_input_shape=(64, 64), scale_factor=(1., 1.)))
+            mask = np.zeros((1, 64, 64), dtype=np.uint8)
+            mask[:, 8:40, 8:40] = 1
+            sample.gt_instances = InstanceData(bboxes=torch.tensor([[8., 8., 40., 40.]]),
+                labels=torch.tensor([0]), masks=BitmapMasks(mask, 64, 64))
+            samples.append(sample)
+    else:
+        from mmseg.registry import MODELS
+        from mmseg.structures import SegDataSample
+        cfg.model.data_preprocessor.size = (64, 64)
+        cfg.model.decode_head.update(in_channels=[32] * 4, channels=16)
+        cfg.model.auxiliary_head.update(in_channels=32, channels=16)
+        cfg.model.test_cfg.update(crop_size=(32, 32), stride=(24, 24))
+        model = MODELS.build(cfg.model)
+        samples = [SegDataSample(metainfo=dict(img_shape=(64, 64), ori_shape=(64, 64),
+                   pad_shape=(64, 64), padding_size=[0, 0, 0, 0]),
+                   gt_sem_seg=PixelData(data=torch.randint(0, 150, (1, 64, 64))))
+                   for _ in range(2)]
+    model.init_weights()
+    batch = model.data_preprocessor(dict(inputs=[torch.randn(3, 64, 64) for _ in range(2)],
+                                         data_samples=samples), training=True)
+    image, samples = batch["inputs"], batch["data_samples"]
+    model.train()
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
+        losses = model(image, samples, mode="loss")
+    loss = sum(sum(v) if isinstance(v, list) else v for k, v in losses.items() if "loss" in k)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.backbone.encoder.blocks[0].cpe.weight.grad is not None
+    model.eval()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
+        predictions = model(image, samples, mode="predict")
+    assert len(predictions) == 2
+
+
+def test_adapter_checkpointing_preserves_gradients_and_batchnorm(tiny_backbone):
+    import copy
+    direct = tiny_backbone.train()
+    checkpointed = copy.deepcopy(direct)
+    for module in checkpointed.modules():
+        if isinstance(module, (openmmlab.InteractionBlock,)):
+            module.injector.with_cp = True
+            module.extractor.with_cp = True
+            if module.extra_extractors is not None:
+                for extractor in module.extra_extractors:
+                    extractor.with_cp = True
+    image = torch.randn(2, 3, 32, 64)
+    for model in (direct, checkpointed):
+        sum(x.square().mean() for x in model(image)).backward()
+    for (name, p), (_, q) in zip(direct.named_parameters(), checkpointed.named_parameters()):
+        torch.testing.assert_close(p.grad, q.grad, msg=name)
+    for (name, p), (_, q) in zip(direct.named_buffers(), checkpointed.named_buffers()):
+        torch.testing.assert_close(p, q, msg=name)
+
+
+@pytest.mark.cuda
+def test_mmcv_sampling_matches_upstream_cpu_oracle():
+    pytest.importorskip("mmcv.ops")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttnFunction
+    from integrations.deform_attention import ms_deform_attn_core_pytorch
+    torch.manual_seed(42)
+    shape = torch.tensor([[2, 4]])
+    starts = torch.tensor([0])
+    value = torch.randn(2, 8, 4, 8, requires_grad=True)
+    locations = torch.rand(2, 6, 4, 1, 4, 2, requires_grad=True)
+    weights = torch.randn(2, 6, 4, 1, 4).softmax(-1).requires_grad_()
+    expected = ms_deform_attn_core_pytorch(value, shape, locations, weights)
+    gpu = [x.detach().cuda().requires_grad_() for x in (value, locations, weights)]
+    actual = MultiScaleDeformableAttnFunction.apply(gpu[0], shape.cuda(), starts.cuda(), gpu[1], gpu[2], 64)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-6)
+    expected.square().sum().backward()
+    actual.square().sum().backward()
+    for x, y in zip((value, locations, weights), gpu):
+        torch.testing.assert_close(y.grad.cpu(), x.grad, rtol=1e-4, atol=1e-5)

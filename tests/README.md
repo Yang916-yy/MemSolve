@@ -77,3 +77,30 @@ train/eval switching and advancing dropout RNG. On 2026-10-16 these 3 CUDA
 checks and all 12 CPU NLP workflow checks passed. A separate two-A800 real-C4
 probe exercised validation, checkpoint reload and continued graph replay;
 profiling confirmed Inductor kernels and forward/backward graph launches.
+
+## RoVE, downstream adapters and memory lifetimes
+
+The current CUDA oracle suite covers optional RoVE in both core modes, batched
+position tables, nonmultiple token/channel tiles, sparse and fully masked
+samples, long-chunk statistics, and sequence-sharded gradients. FP64 comparisons
+retain the existing error thresholds. Scratch-alias checks cover multiple output
+CTAs; repeated-backward checks verify saved inputs and parameters are unchanged.
+
+GLUE checks cover the task metrics, MLM/classifier checkpoint transfer, and
+Composer-to-PyTorch AdamW decay conversion. The dense integration checks cover
+ViT-Adapter, rectangular CPE, padding, EMA checkpoint selection, layer decay,
+MMDetection/MMSegmentation heads, and the BF16/FP32 native-operator boundaries.
+Use the dedicated OpenMMLab environment for these optional checks.
+
+The supported compile path keeps `MemSolve.forward` outside Dynamo tracing,
+compiles the surrounding model blocks, and captures both in an outer CUDA
+Graph. This is the configuration used by the ImageNet and MLM entrypoints;
+it does not assert full-graph Dynamo support for the native mixer itself.
+
+On 2026-10-18, the full suite in the NLP environment passed **695 tests**, with
+14 skips and 4 warnings on SM80/A800. Three warnings concern upstream MTEB APIs;
+one reports an AccumulateGrad stream mismatch during a passing compile/graph
+test. In the dedicated OpenMMLab environment, 29 CPU checks and 3 CUDA checks
+passed. These are separate environment runs, not additional unique test cases.
+The repository consistency check passed, and a wheel build verified that the
+project notices and redistributed third-party license texts are packaged.

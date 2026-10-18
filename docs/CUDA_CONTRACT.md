@@ -14,19 +14,32 @@ output follows the input dtype. Boolean masks may contain gaps or completely
 masked samples. Projection GEMM epilogues mask packed outputs and final outputs
 after bias.
 Inputs are sanitized before projection so invalid NaNs cannot enter weight
-gradients. Normalization uses `max(valid_tokens, 1)`. Optional precomputed FP32
+gradients. Input sanitization and BF16 conversion share one pass. The input
+projection's VJP applies its mask in the GEMM store, eliminating a separate
+masked-gradient tensor. This evaluates the same `D_out (X_safe W^T + b)`
+and its VJP; invalid inputs and upstream gradients are still sanitized before
+weight-gradient GEMMs. FP16/FP32 bias gradients retain their original precision.
+Normalization uses `max(valid_tokens, 1)`. Optional precomputed FP32
 valid counts can be reused across layers.
 These counts must equal `max(valid_tokens, 1)` for the same mask (globally
 when sequence parallelism is active).
 No-skew and no-complement component ablations are reference-only.
 
-`cuda.fast_mix(projected, core_base_raw, eta_raw, valid_counts=None)` accepts
+`cuda.fast_mix(projected, core_base_raw, eta_raw, valid_counts=None, ...)` accepts
 contiguous CUDA BF16 `[B,N,H*R+D]` packed inputs. The base is FP32 `[H,R,R]`
 for equilibrium or empty `[H,R,0]` for complement; eta is FP32 `[H]`.
 Optional counts are contiguous FP32 `[B]`, non-differentiable metadata.
 Direct callers must provide positive finite counts, zero masked packed rows,
 and mask invalid upstream gradients. The model wrapper handles this contract.
 Unsupported shapes, layouts and dtypes raise errors.
+
+Optional `rotary_cos` and `rotary_sin` are a matched pair of contiguous FP32
+tables `[1 or B,N,head_dim/2]` on the same device, without gradients. The model
+constructs them from its RoVE configuration and position IDs. Its optional
+`rotary_factors=(cos, sin)` argument reuses these tables instead of accepting
+position/context inputs; BERT shares them within one forward call. Rotary head
+widths must be even; positions and frequency scaling are defined in the
+[core contract](CORE_CONTRACT.md#optional-rotary-value-encoding).
 
 ## Computation without token-sized P
 
@@ -57,6 +70,17 @@ relations span a short sequence. The learned correction still uses the compact
 rank system. This is an algebraic shape choice with systems no larger than
 64-by-64, not an empirical mode or performance heuristic. Neither branch
 constructs P or an unbounded N-by-N attention matrix.
+
+With RoVE, the cross-statistic becomes `Q=A^T rot(C)`, while Gram, the compact
+solve and shared-core map are unchanged. Readout uses
+`Y=eta C+invrot(A W)`. Backward similarly rotates the upstream content gradient
+for cross-statistics and inversely rotates the indirect content gradient.
+The direct eta adjoint remains the unrotated inner product of upstream and C.
+Rotations are fused into token kernels and evaluated in FP32; rotated content
+is not rounded into a token-sized BF16 buffer. Products involving a rotated
+FP32 operand use the same multiword BF16 strategy as sensitive compact products.
+The short-token branch applies the equivalent rotation around its stable
+token-system solve. Native compact primitives and ABI 17 are unchanged.
 
 The ordinary branch has one inverse-factor forward/backward organization for
 both modes, without rank- or mode-dependent solver selection. With lower
@@ -128,28 +152,60 @@ there is no full-mixer native forward/backward ABI. Direct native solves reject
 autograd-enabled inputs because their derivatives belong to the Python owner.
 Factorization status remains on GPU, without a CPU status poll.
 
-For at most 256 physical tokens, statistics fit in one bounded token tile;
-there is no intermediate Gram/cross-state reduction. Longer sequences retain
-parallel partial statistics and reduction. Both modes share this schedule.
+Short statistics use at most 256 tokens per tile without RoVE, or 128 with
+RoVE to limit live FP32 rotation operands. At N >= 512, when the resulting grid
+supplies at least two CTAs per SM, each CTA accumulates 512 tokens in 64-token
+steps. Otherwise the existing parallel partial-statistics schedule is used.
+This regrouping computes the same Gram, cross-statistic and direct eta adjoint;
+it changes only FP32 summation order. RoVE high/low-word products retain separate
+FP32 accumulators. At lengths divisible by 512, the long schedule reduces the
+partial buffers fourfold relative to 128-token tiles. Both core modes use the
+same device-aware schedule, including exact sequence-parallel local statistics.
 Shared-head maps are loaded directly by compact-product CTAs without expanding
 them across the batch. Inverse-factor TRSM uses 32-column identity panels, 128 threads and the actual
 rank (including rank 48); no RHS tensor or layout copy is materialized.
-Biased large projections use 128x128 output tiles with eight warps; small
-projections retain compact tiles. These are scheduling choices, not model modes.
+Projection GEMMs use Inductor-derived grouped scheduling and contiguous-load
+hints. Large projections use 128x128 output tiles with four warps: inner tiles
+are 64 wide with three stages for K >= 512, otherwise 32 wide with four stages.
+Small projections use 64x64x32 tiles, four warps and three stages. Tile choices
+are fixed before launch; there is no runtime autotuning inside CUDA Graphs.
+All schedules compute the same AB+bias with FP32 accumulation and bias addition,
+apply the token mask, then round once at the output store. There is no dense
+FP32 projection scratch or change to the saved tensors/backward contract.
+See `THIRD_PARTY_NOTICES.md` for the upstream source and license.
 Compact GEMMs use 16-wide inner tiles for odd multiples of 16 and otherwise
 32-wide tiles. This avoids padding inner dimensions 16/48 to 32/64 while
 retaining the same FP32/TF32x3 algorithm for every rank and both modes.
 
-The input VJP at ranks 16/32 uses 128-token by 32-channel tiles, trading
-channel width for token reuse. Ranks 48/64 retain 32-token by 64-channel tiles
-to limit live register state. Nonmultiple tails are masked. Compact shared-map
+Without RoVE, the input VJP at ranks 16/32 uses 128-token by 32-channel tiles;
+ranks 48/64 use 128-token by 16-channel tiles. RoVE uses 128-token by 16-channel
+tiles at all four ranks. Its three BF16 products reuse one FP32 accumulator.
+This reduces the register spills introduced by fused rotations, without changing
+the mathematical terms or their precision. RoVE's direct relation-gradient term
+is computed before loading the content
+and cross-adjoint operands. This shortens their overlapping live ranges: on
+SM80, r48/r64 token-VJP spill counts drop from 66/62 to 26/24 at 128 tokens,
+64 content channels and four warps. Remaining spills are measured rather than
+eliminated by indiscriminately increasing warp count. Nonmultiple tails are masked. Compact shared-map
 products fuse the subtraction of eta times state into their FP32 epilogue.
 The shared-map adjoint reduces the already-needed H across samples. Its
 [B,H,r,r] storage is temporary and reused for the Cholesky adjoint. The
 symmetric lower projection is fused with H's transformation; two compact
 products apply the saved inverse factor on either side. Gram/cross statistics,
 shared-core temporaries, and compact adjoints are released after their last
-use. Saved tensors required for repeated backward are never overwritten.
+use. The compact VJP reuses its fresh U buffer for the state and cross adjoints,
+and its fresh H buffer for both Gram-adjoint products. These GEMMs read each
+CTA's complete input region before storing: right-buffer reuse requires a square
+left map; left-buffer reuse is limited to the single-CTA square output. Neither
+saved inverse factors nor saved states/core tensors are overwritten.
+Autograd saved-tensor ownership is released with `maybe_clear_saved_tensors`,
+following PyTorch AOTAutograd; `retain_graph=True` keeps the saved tensors intact.
+Projection backward computes weight/bias gradients before allocating the input
+gradient, releasing the saved input after its last use. The mixer drops its
+local compact tape before allocating the token gradient. Repeated backward and
+input/parameter version counters are covered by contract tests.
+Inference releases the unused backward tape before allocating token readout;
+training retains it unchanged.
 The fused Cholesky adjoint accumulates its two products serially with 16-wide
 inner tiles, four warps and one stage. This shortens operand lifetimes; SM80
 resource checks at ranks 16/32/48/64 show no register spills in this kernel or
@@ -226,8 +282,11 @@ exception cleanup: NCCL graphs retain communicator references until released.
 functional collectives. `_CenteredShortConv(..., sequence_parallel=sp)` uses
 this halo before native Conv1d, masks before/after, and pads only the global
 ends. Full BERT Trainer entrypoints are not automatically sharded: callers
-must also provide global absolute position offsets, globally normalized losses,
-and the parallel context through their encoder. Operator and short-convolution
+must also provide globally normalized losses and the parallel context through
+their encoder. RoVE automatically uses global shard offsets; masked shards
+beyond the training window also require explicit global context lengths.
+An absolute-position encoder needs global position offsets at its embedding
+layer. Operator and short-convolution
 contracts are tested independently against an unsharded FP64 oracle.
 
 The core collective payload is O(BH(r²+rd)), independent of token count;
@@ -319,6 +378,28 @@ historical training source snapshots keep their own binaries and remain separate
   bounded tiles, independent CTA scheduling, selective local fusion and explicit
   product precision. The kernel organization is adapted to MemSolve's global
   statistics; its noncausal operator is not replaced by an FLA recurrence.
+- [Mamba SSD chunk-state](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/ssd_chunk_state.py):
+  informed the chunk-local K-loop for long-sequence statistics. The implementation
+  is independently written for MemSolve's Gram/cross/eta equations; it does not
+  import Mamba's decay, causality or low-precision state storage.
+  FLA-inspired separate relation/content VJPs and channel-tiled readout were also
+  tested. Their additional scheduling did not give a consistent full-operator
+  gain, so the fused VJP and readout remain. Narrower fused VJP channel tiles
+  improved wide ranks without adding a kernel.
+- [Inductor shared-A BMM](https://github.com/pytorch/pytorch/blob/main/torch/_inductor/kernel/templates/triton_bmm_shared_a.py.jinja):
+  packing several samples behind a shared core improved individual wide-rank
+  products but regressed r32. Full-operator gains were small, so this prototype
+  is not retained. Shared maps continue to be loaded without batch expansion.
+- [PyTorch AOTAutograd lifecycle](https://github.com/pytorch/pytorch/blob/main/torch/_functorch/_aot_autograd/runtime_wrappers.py)
+  and [autograd's conditional release](https://github.com/pytorch/pytorch/blob/main/torch/csrc/autograd/python_function.cpp):
+  release saved-tensor ownership during ordinary backward, while honoring
+  `retain_graph`. No unconditional clear-on-access or donated saved buffer is used.
+- Low-word-first and four-product BF16 compensation were compared against FP64.
+  The former gave negligible accuracy benefit and more spills; the latter reduced
+  internal FP32 error but slowed the token VJP with almost no change after BF16
+  output rounding. Neither replaces the existing three-product rotated dot.
+  Direct reciprocal-count normalization compiled to the same tested result;
+  no additional precision gain is claimed from that rewrite.
 - [Triton matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html):
   tiled Tensor Core products with FP32 accumulators and fused epilogues.
 - [Triton libdevice integration](https://triton-lang.org/main/getting-started/tutorials/07-extern-functions.html):
@@ -339,6 +420,39 @@ historical training source snapshots keep their own binaries and remain separate
   FP16 inverse-factor storage passed ordinary full-operator checks but failed
   the existing tighter compact-system oracle. FP32 storage is retained.
 
-Model equations, initialization, parameter counts and checkpoint contract 26
-are unchanged. Native ABI 17 requires rebuilding the extension. Measurements
-and register-resource checks for this update cover SM80/A800 only.
+The unrotated model retains its equations, initialization, parameter counts and
+checkpoint contract 26. RoVE adds explicit transport settings to that contract
+without changing the native ABI. Artifacts older than ABI 17 must be rebuilt.
+Measurements and register-resource checks cover SM80/A800 only.
+
+
+## Measured memory and resource changes
+
+On 2026-10-18, A800/SM80 tests used Torch 2.14.0+cu132 and Triton 3.8.0,
+BF16 inputs and FP32 parameters. The following are **incremental peak allocated
+memory for one full MemSolve module forward/backward**, including both
+projections, not whole-Transformer memory. B=512, N=128, width=768, heads=12;
+all rows use equilibrium. The comparison isolates the lifecycle/scratch-reuse
+pass after the projection and long-statistics optimizations were already present.
+
+| Rank | RoVE | Before | After |
+| ---: | --- | ---: | ---: |
+| 32 | off | 676 MiB | 604 MiB |
+| 32 | on | 772 MiB | 700 MiB |
+| 64 | off | 1062 MiB | 966 MiB |
+| 64 | on | 1158 MiB | 1062 MiB |
+
+Complement showed similar savings. Across 24 module cases, outputs were bitwise
+unchanged; unrotated gradients were also bitwise unchanged. With RoVE, maximum
+input/parameter-gradient relative L2 change was 0.0037%, within the existing
+FP64 oracle limits. Graph timing used 60 warmup replays and seven alternating
+20-replay rounds. RoVE cases reduced module training latency by roughly
+0.6–3.3%; these measurements are not whole-network throughput claims.
+The corresponding r48/r64 RoVE token-VJP spill counts fell from 66/62 to 26/24.
+
+The preceding long-statistics pass reduced Gram/cross partial buffers fourfold
+when the 512-token schedule applies. For B=8, N=4096, heads=12, rank=32 and
+64 content channels, those forward partials decreased from 36 to 9 MiB.
+Other stages can still determine the full-module peak. No storage dtype or
+compensation term was removed to obtain these savings. Detailed probes and
+raw training artifacts remain outside the repository.

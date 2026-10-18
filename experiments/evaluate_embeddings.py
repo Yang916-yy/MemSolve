@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from experiments.nlp import checkpoint_digest, digest, load_sentence_model, read_json, versions, write_json
+from experiments.nlp import checkpoint_digest, digest, load_sentence_model, position_capacity, read_json, versions, write_json
 
 
 LONGEMBED = ["LEMBSummScreenFDRetrieval", "LEMBQMSumRetrieval",
@@ -34,10 +34,11 @@ def evaluate(checkpoint, output, max_length=512, implementation="cuda", device="
     selected = [] if local_ir else list(select_tasks(suite, tasks))
     metadata = {"checkpoint_sha256": checkpoint_digest(checkpoint), "max_length": max_length,
                 "model_type": model[0].auto_model.config.model_type,
-                "position_capacity": model[0].auto_model.config.max_position_embeddings,
+                "position_capacity": position_capacity(model[0].auto_model.config),
+                "position_embedding_type": model[0].auto_model.config.position_embedding_type,
                 "precision": "bf16_amp" if bf16 else "fp32", "implementation": implementation,
                 "normalize_embeddings": True, "batch_size": batch_size,
-                "length_policy": "truncate_to_max_length; no position extension or chunking",
+                "length_policy": "truncate_to_max_length; checkpoint position policy; no chunking",
                 "suite": "local_ir" if local_ir else ("custom" if tasks else suite),
                 "tasks": [{"name": t.metadata.name, "dataset": t.metadata.dataset,
                            "eval_splits": t.metadata.eval_splits} for t in selected],

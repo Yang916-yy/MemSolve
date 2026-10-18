@@ -1,0 +1,22 @@
+{
+  "protocol": "LION Table 8 M2-BASE; single-seed validation",
+  "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+  "dataset": "nyu-mll/glue",
+  "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+  "max_length": 128,
+  "seed": 19,
+  "warmup_ratio": 0.06,
+  "betas": [0.9, 0.98],
+  "epsilon": 0.000001,
+  "train_order": "sequential",
+  "tasks": {
+    "mnli": {"lr": 0.00005, "weight_decay": 0.000005, "epochs": 3, "batch_size": 48, "eval_steps": 2300, "optimizer": "composer_adamw", "init": "mlm"},
+    "qnli": {"lr": 0.00005, "weight_decay": 0.00001, "epochs": 10, "batch_size": 16, "eval_steps": 1000, "optimizer": "composer_adamw", "init": "mlm"},
+    "qqp": {"lr": 0.00003, "weight_decay": 0.000003, "epochs": 5, "batch_size": 16, "eval_steps": 2000, "optimizer": "composer_adamw", "init": "mlm"},
+    "rte": {"lr": 0.00001, "weight_decay": 0.000001, "epochs": 3, "batch_size": 16, "eval_steps": 100, "optimizer": "composer_adamw", "init": "mnli"},
+    "sst2": {"lr": 0.00003, "weight_decay": 0.000003, "epochs": 3, "batch_size": 16, "eval_steps": 500, "optimizer": "composer_adamw", "init": "mlm"},
+    "mrpc": {"lr": 0.00008, "weight_decay": 0.00008, "epochs": 10, "batch_size": 32, "eval_steps": 100, "optimizer": "composer_adamw", "init": "mnli"},
+    "cola": {"lr": 0.00008, "weight_decay": 0.000005, "epochs": 10, "batch_size": 32, "eval_steps": 250, "optimizer": "composer_adamw", "init": "mlm"},
+    "stsb": {"lr": 0.00008, "weight_decay": 0.000003, "epochs": 10, "batch_size": 32, "eval_steps": 200, "optimizer": "adamw", "init": "mnli"}
+  }
+}

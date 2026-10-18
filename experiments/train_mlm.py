@@ -12,7 +12,7 @@ from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer, Traine
 from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
 from experiments.nlp import (MLMCollator, accumulation_steps, check_training_precision, checkpoint_digest, digest,
     load_prepared, load_mlm_data, masked_loss, masked_metrics, masked_statistics, read_json,
-    record_run, tokenizer_digest, versions, write_json, prepare_mlm_graph)
+    record_run, tokenizer_digest, versions, write_json, prepare_mlm_graph, position_capacity)
 
 
 def check_data(config, manifests, tokenizer, checkpoint=None):
@@ -21,7 +21,8 @@ def check_data(config, manifests, tokenizer, checkpoint=None):
         raise ValueError("Saved tokenizer does not match data preparation")
     if len(tokenizer) != config.vocab_size or tokenizer.pad_token_id != config.pad_token_id:
         raise ValueError("Tokenizer vocabulary/PAD id and model configuration differ")
-    if first["max_length"] > config.max_position_embeddings:
+    capacity = position_capacity(config)
+    if capacity is not None and first["max_length"] > capacity:
         raise ValueError("Prepared sequence length exceeds position capacity")
     if checkpoint is not None:
         saved_tokenizer = AutoTokenizer.from_pretrained(str(checkpoint))
@@ -36,7 +37,7 @@ def initialization_config(recipe, checkpoint=None):
     saved = AutoConfig.from_pretrained(str(checkpoint))
     if not isinstance(saved, MemSolveBertConfig):
         raise ValueError("Continued MLM requires a MemSolve-BERT checkpoint")
-    # Never load weights under an invented contract or resize positions silently.
+    # Continuation may change the backend while retaining the saved model geometry.
     for key in recipe["model"]:
         if key != "memsolve_implementation" and getattr(saved, key) != getattr(desired, key):
             raise ValueError(f"Initial checkpoint/model configuration differs: {key}")
@@ -73,7 +74,7 @@ def preflight(recipe, data_root, checkpoint=None, world_size=None, streaming_man
     rows = steps * recipe["global_batch_size"] if steps > 0 else None
     length = manifests["train"][0]["max_length"]
     return {"parameters": sum(p.numel() for p in model.parameters()),
-            "position_capacity": config.max_position_embeddings, "sequence_length": length,
+            "position_capacity": position_capacity(config), "sequence_length": length,
             "world_size": world_size, "gradient_accumulation_steps": accum,
             "global_batch_size": recipe["global_batch_size"], "max_steps": steps,
             "full_batch_sequence_presentations": rows,

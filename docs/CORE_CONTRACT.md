@@ -10,7 +10,8 @@ and their source snapshots retain their original contracts.
 
 For each head, n is the number of valid tokens. A packed projection produces
 relation B and content C. There is no independent query projection, Q/K
-convolution, internal positional rotation, output RMSNorm or channel gate.
+convolution, output RMSNorm or channel gate. Optional RoVE transports content
+between token-local coordinate systems; the relation frame is unchanged.
 
 ```text
 A = B / sqrt(n)
@@ -49,6 +50,56 @@ compact factorization and readout without storing token-sized P. Both modes
 mask padded rows and normalize by valid-token count. Completely masked samples
 return zero. At fixed head width and rank, sequence cost is linear; matrix
 factorization sizes depend on rank, not unbounded token length.
+
+## Optional rotary value encoding
+
+With `MemSolveConfig(rotary=True)`, each head uses a full-channel, adjacent-pair
+rotation O_i at token position p_i. Let M=F-eta I (F=0 for complement):
+
+```text
+C_rot[i] = O_i C[i]
+Z = P^T C_rot
+correction = P M Z
+Y[i] = eta C[i] + O_i^T correction[i]
+output = concat_heads(Y) Wo + bo
+```
+
+The inverse rotation precedes the output projection. It covers the entire
+global correction, including `-eta P P^T`, and leaves the direct content term
+as `eta C` without a numerical rotation round trip. Both modes use the same
+transport. No relation rotation, new learned parameter or independent query
+is introduced. Head width must be even.
+
+At a fixed relation frame, this is orthogonal conjugation of the complete
+token/content operator. It preserves that operator's singular values and
+spectrum; it does not bound the Jacobian of the input-dependent full network.
+Token interactions contain `O_i^T O_j = O(p_j-p_i)`. This relative-position
+property holds for a fixed frequency scale, including a common position shift.
+
+The default uses base 10000, a training window of 128, and frequency-only YaRN
+beyond that window (`rotary_scaling="yarn"`, beta_fast=32, beta_slow=1).
+Amplitude remains one. `rotary_scaling="none"` disables interpolation.
+Context length defaults to each sample's first-to-last valid-token span, or N
+without a mask; an all-masked sample uses one. Padding therefore does not change
+the frequencies of a sample. Explicit `rotary_context_length` accepts a positive
+integer or integer tensor `[B]` to select a common or per-sample window.
+Position IDs accept `[N]`, `[1,N]` or `[B,N]` and do not determine the scale.
+For masked sequence parallelism beyond the training window, supply global
+context lengths explicitly; the unmasked default is the global sequence length.
+Default positions include the shard offset. Within the training window (or with
+scaling disabled), frequencies are independent of context length, so the
+default shared position IDs need only one table for the batch.
+
+Phase/trigonometric arithmetic uses FP32 (FP64 in the oracle). CUDA fuses
+content transport into statistics and readout instead of materializing rotated
+BF16 content. Enabling RoVE adds its settings to the checkpoint contract;
+the unrotated contract and visual defaults retain their existing meaning.
+
+The transport follows [RoVE](https://arxiv.org/abs/2606.11275) and its
+[standard implementation](https://github.com/AGarciaCast/RoVE/blob/8e3eb84efb7c920289aba776fbdb189f93b79e01/model/pos_methods/rove.py).
+YaRN uses the upstream evaluation frequency ramp, without an attention
+temperature or amplitude multiplier. These settings define an implementation,
+not a demonstrated long-context accuracy claim for MemSolve.
 
 ## Ownership and model shells
 

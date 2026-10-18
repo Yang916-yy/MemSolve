@@ -92,6 +92,7 @@ def prepared(tmp_path, tokenizer):
         ["the red bird is in the blue sky", "a green tree and blue water"] * 16))
     args = argparse.Namespace(output=str(tmp_path / "prepared"), split="train", files=[str(source)],
              dataset="allenai/c4", dataset_config="en", revision="main", tokenizer=str(directory),
+             tokenizer_revision="main", document_policy="truncate",
              max_length=16, num_shards=1, shard_index=0, max_docs=24,
              eval_mask_probability=0.3, seed=17)
     output = prepare(args)
@@ -269,8 +270,9 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
     encoder = load_sentence_model(mlm / "final", 16, "reference", "cpu")
     vectors = encoder.encode(["red bird", "blue fish"], normalize_embeddings=True)
     np.testing.assert_allclose(np.linalg.norm(vectors, axis=-1), 1, atol=1e-5)
-    with pytest.raises(ValueError, match="position capacity"):
-        load_sentence_model(mlm / "final", 64, "reference", "cpu")
+    extended = load_sentence_model(mlm / "final", 64, "reference", "cpu")
+    assert extended.max_seq_length == 64
+    assert extended[0].auto_model.config.position_embedding_type == "rove"
 
     triplets = tmp_path / "triplets"
     Dataset.from_dict({"query": [f"red bird {'a ' * i}" for i in range(16)],
@@ -329,6 +331,26 @@ def test_stock_bert_baseline_evaluation(prepared, tokenizer, tmp_path):
     embedding = load_sentence_model(checkpoint, 16, "reference", "cpu")
     assert embedding[0].auto_model.config.model_type == "bert"
     assert not hasattr(embedding[0].auto_model.config, "memsolve_implementation")
+    with pytest.raises(ValueError, match="position capacity"):
+        load_sentence_model(checkpoint, 64, "reference", "cpu")
+
+
+@pytest.mark.parametrize("position_type", ["absolute", "rove", "none"])
+def test_prepared_length_check_respects_position_type(prepared, tokenizer, position_type):
+    from experiments.nlp import load_prepared, position_capacity
+    from experiments.train_mlm import check_data
+    from integrations.transformers import MemSolveBertConfig
+    _, manifests, _ = load_prepared(prepared)
+    config = MemSolveBertConfig(vocab_size=len(tokenizer[0]), hidden_size=32,
+        num_attention_heads=2, memsolve_rank=16, max_position_embeddings=8,
+        position_embedding_type=position_type)
+    if position_type == "absolute":
+        assert position_capacity(config) == 8
+        with pytest.raises(ValueError, match="position capacity"):
+            check_data(config, manifests, tokenizer[0])
+    else:
+        assert position_capacity(config) is None
+        check_data(config, manifests, tokenizer[0])
 
 
 @pytest.mark.cuda
@@ -347,10 +369,13 @@ def test_mlm_compile_graph_accumulation_eval_and_reload(tmp_path, compile_model)
     graph.load_state_dict(eager.state_dict())
     batches = []
     for index in range(2):
-        ids = torch.randint(5, 32, (2, 40), device="cuda")
-        mask = torch.ones_like(ids); mask[:, -(index + 2):] = 0
+        ids = torch.randint(5, 32, (2, 160), device="cuda")
+        lengths = torch.tensor([[71 + index], [141 + index]], device="cuda")
+        mask = (torch.arange(160, device="cuda")[None, :] < lengths).long()
+        positions = (torch.arange(160, device="cuda")[None, :] * (index + 1) + 31 * index).expand(2, -1).contiguous()
         labels = ids.clone(); labels[:, :10 * (index + 1)] = -100; labels[mask == 0] = -100
-        batches.append(dict(input_ids=ids, attention_mask=mask, token_type_ids=torch.zeros_like(ids), labels=labels))
+        batches.append(dict(input_ids=ids, attention_mask=mask, token_type_ids=torch.zeros_like(ids),
+                            labels=labels, position_ids=positions))
     rng = torch.cuda.get_rng_state().clone()
     prepare_mlm_graph(graph, batches[0], compile_model=compile_model)
     assert torch.equal(rng, torch.cuda.get_rng_state())

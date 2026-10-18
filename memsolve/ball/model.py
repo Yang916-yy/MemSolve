@@ -7,11 +7,14 @@ import torch.nn as nn
 
 from .config import CoreMode, MemSolveConfig
 from .reference import (
+    _compact_matmul,
     accretive_equilibrium_mix,
     accretive_generator,
     bounded_complement,
     compact_equilibrium_diagnostics,
     qr_soft_frame,
+    rotary_position_factors,
+    rotate_content,
     tensor_core_linear,
     tensor_core_matmul,
 )
@@ -32,8 +35,8 @@ class MemSolve(nn.Module):
     forms a learned per-head accretive generator, and
     evaluates its reflected-resolvent equilibrium directly.
 
-    Equilibrium and complement ownership share this one forward
-    path. Position features, if needed, belong to the surrounding encoder.
+    Equilibrium and complement share this forward path. Optional rotary value
+    transport supplies relative position without changing the compact core.
     """
 
     def __init__(self, config: MemSolveConfig) -> None:
@@ -83,6 +86,15 @@ class MemSolve(nn.Module):
             "bias": config.bias,
             **({"skew_coupling": False} if not config.skew_coupling else {}),
             **({"scalar_complement": False} if not config.scalar_complement else {}),
+            **({"rotary": {
+                "type": "value_transport",
+                "layout": "full_head_adjacent_pairs",
+                "base": config.rotary_base,
+                "train_length": config.rotary_train_length,
+                "scaling": config.rotary_scaling,
+                "yarn_beta": [32, 1],
+                "amplitude": 1.0,
+            }} if config.rotary else {}),
         }
 
     def get_extra_state(self) -> dict[str, object]:
@@ -162,8 +174,11 @@ class MemSolve(nn.Module):
         *,
         sequence_parallel=None,
         valid_counts: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        rotary_context_length: int | torch.Tensor | None = None,
+        rotary_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Run the explicit strict native implementation of the default operator."""
+        """Project tokens, apply the CUDA mixer, and project back to model width."""
 
         config = self.config
         if (
@@ -184,23 +199,12 @@ class MemSolve(nn.Module):
                 f"got {x.dtype}"
             )
 
-
         for name, parameter in self.named_parameters():
             if parameter.device != x.device:
                 raise RuntimeError(
                     f"implementation='cuda' requires {name} on {x.device}, "
                     f"got {parameter.device}"
                 )
-        for name, parameter in (
-            ("w_bc.weight", self.w_bc.weight),
-            ("w_bc.bias", self.w_bc.bias),
-            ("w_o.weight", self.w_o.weight),
-            ("w_o.bias", self.w_o.bias),
-            ("core_base_raw", self.core_base_raw),
-            ("eta_raw", self.eta_raw),
-        ):
-            if parameter is None:
-                continue
             if parameter.dtype != torch.float32:
                 raise TypeError(
                     f"implementation='cuda' requires {name} to use torch.float32, "
@@ -225,6 +229,10 @@ class MemSolve(nn.Module):
         )
         if sequence_parallel is not None:
             sequence_parallel.validate(length, config.rank)
+        rotary_cos, rotary_sin = rotary_factors if rotary_factors is not None else self._rotary_factors(
+            x, mask, position_ids, rotary_context_length,
+            sequence_parallel=sequence_parallel,
+        )
         if valid_counts is None:
             if sequence_parallel is not None:
                 valid_counts = sequence_parallel.valid_counts(mask, batch_size=batch, device=x.device)
@@ -236,20 +244,10 @@ class MemSolve(nn.Module):
             raise ValueError("valid_counts must be non-differentiable contiguous FP32 [batch] on the input device")
 
         # The native mixer consumes wide-range BF16 packed coordinates directly.
-        if all_valid:
-            safe_x = x
-        else:
-            assert mask is not None
-            safe_x = x.masked_fill(~mask[:, :, None], 0)
         projected = tensor_core_linear(
-            safe_x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16,
-            fuse_weight_bias_grad=True, output_mask=mask,
+            x, self.w_bc.weight, self.w_bc.bias, output_dtype=torch.bfloat16,
+            fuse_weight_bias_grad=True, output_mask=mask, input_mask=mask,
         )
-        if not projected.is_contiguous():
-            raise RuntimeError(
-                "implementation='cuda' requires w_bc to produce contiguous "
-                "projected coordinates"
-            )
         from . import cuda as cuda_backend
 
         mixed = cuda_backend.fast_mix(
@@ -257,7 +255,9 @@ class MemSolve(nn.Module):
             self.core_base_raw if self.core_base_raw is not None else self.eta_raw.new_empty((config.num_heads, config.rank, 0)),
             self.eta_raw,
             valid_counts,
-            **({"sequence_parallel": sequence_parallel} if sequence_parallel is not None else {}),
+            sequence_parallel=sequence_parallel,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
         )
         output = tensor_core_linear(
             mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype,
@@ -269,6 +269,9 @@ class MemSolve(nn.Module):
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor | None,
+        *,
+        rotary_cos: torch.Tensor | None = None,
+        rotary_sin: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -314,7 +317,6 @@ class MemSolve(nn.Module):
             batch, length, config.num_heads, config.head_dim
         ).transpose(1, 2)
         if not all_valid:
-            assert mask is not None
             active = mask[:, None, :, None]
             relation = torch.where(active, relation, torch.zeros_like(relation))
             content = torch.where(active, content, torch.zeros_like(content))
@@ -335,7 +337,14 @@ class MemSolve(nn.Module):
             )
             relation = relation / valid_count.sqrt().view(batch, 1, 1, 1)
             frame = qr_soft_frame(relation)
-            compact_state = tensor_core_matmul(frame.mT, content)
+            transported = (
+                content if rotary_cos is None
+                else rotate_content(content, rotary_cos, rotary_sin)
+            )
+            compact_state = (
+                tensor_core_matmul(frame.mT, transported) if rotary_cos is None
+                else _compact_matmul(frame.mT, transported)
+            )
             coordinates = (
                 None if self.core_base_raw is None
                 else self.core_base_raw.to(dtype=calc_dtype)
@@ -355,14 +364,21 @@ class MemSolve(nn.Module):
         valid_mask: torch.Tensor | None = None,
         *,
         adjoint_rhs: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        rotary_context_length: int | torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return per-sample, per-head certificates for the realized operator."""
 
         self._validate_input(x)
         if self.config.core_mode is CoreMode.COMPLEMENT:
             raise ValueError("compact diagnostics require equilibrium mode")
+        rotary_cos, rotary_sin = self._rotary_factors(
+            x, valid_mask, position_ids, rotary_context_length
+        )
         _projected, frame, compact_state, _content, generator, eta, _mask = (
-            self._reference_compact_problem(x, valid_mask)
+            self._reference_compact_problem(
+                x, valid_mask, rotary_cos=rotary_cos, rotary_sin=rotary_sin
+            )
         )
         assert generator is not None
         return compact_equilibrium_diagnostics(
@@ -379,17 +395,75 @@ class MemSolve(nn.Module):
             raise ValueError(
                 f"x must have shape [B, N, {config.dim}], got {tuple(x.shape)}"
             )
-        if not x.is_floating_point():
-            raise TypeError("x must be a floating-point tensor")
         if x.dtype not in _SUPPORTED_ACTIVATION_DTYPES:
             raise TypeError(
-                f"MemSolve does not support x with dtype {x.dtype}; use "
+                f"MemSolve does not support x with dtype {x.dtype}; use a floating-point tensor in "
                 "torch.float16, torch.bfloat16, torch.float32, or torch.float64"
             )
         if x.shape[0] == 0:
             raise ValueError("batch size must be positive")
         if x.shape[1] == 0:
             raise ValueError("sequence length must be positive")
+
+    def _rotary_factors(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        context_length: int | torch.Tensor | None,
+        *,
+        sequence_parallel=None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        config = self.config
+        if not config.rotary:
+            if position_ids is not None or context_length is not None:
+                raise ValueError("position_ids and rotary_context_length require rotary=True")
+            return None, None
+        batch, length, _ = x.shape
+        integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+        if position_ids is None:
+            offset = 0 if sequence_parallel is None else sequence_parallel.offset
+            position_ids = torch.arange(offset, offset + length, device=x.device)[None]
+        else:
+            if not isinstance(position_ids, torch.Tensor) or position_ids.dtype not in integer_dtypes:
+                raise TypeError("position_ids must be an integer tensor")
+            if position_ids.ndim == 1:
+                position_ids = position_ids[None]
+            if (position_ids.ndim != 2 or position_ids.shape[1] != length
+                    or position_ids.shape[0] not in (1, batch)):
+                raise ValueError("position_ids must have shape [N], [1,N], or [B,N]")
+            position_ids = position_ids.to(device=x.device)
+        if context_length is None:
+            physical_length = length if sequence_parallel is None else sequence_parallel.global_length
+            if (valid_mask is None or config.rotary_scaling == "none"
+                    or physical_length <= config.rotary_train_length):
+                # Every possible valid span has scale one within the training
+                # context; keep a shared table instead of expanding over B.
+                context_length = physical_length
+            elif sequence_parallel is not None:
+                raise ValueError("masked sequence parallel rotary requires explicit global rotary_context_length")
+            else:
+                mask = self._validate_mask(valid_mask, batch=batch, length=length, device=x.device)
+                index = torch.arange(length, device=x.device)[None]
+                first = torch.where(mask, index, length).amin(dim=-1)
+                last = torch.where(mask, index, -1).amax(dim=-1)
+                context_length = (last - first + 1).clamp_min(1)
+        if isinstance(context_length, torch.Tensor):
+            if context_length.dtype not in integer_dtypes or context_length.requires_grad:
+                raise TypeError("rotary_context_length must be a non-differentiable integer tensor")
+            if context_length.shape != (batch,):
+                raise ValueError("rotary_context_length tensor must have shape [B]")
+            context_length = context_length.to(device=x.device)
+            torch._assert_async((context_length > 0).all(), "rotary_context_length must be positive")
+        elif not isinstance(context_length, int) or isinstance(context_length, bool):
+            raise TypeError("rotary_context_length must be an integer or integer tensor [B]")
+        elif context_length <= 0:
+            raise ValueError("rotary_context_length must be positive")
+        return rotary_position_factors(
+            position_ids, head_dim=config.head_dim, base=config.rotary_base,
+            train_length=config.rotary_train_length, context_length=context_length,
+            scaling=config.rotary_scaling, dtype=x.dtype,
+        )
 
     def forward(
         self,
@@ -399,13 +473,22 @@ class MemSolve(nn.Module):
         implementation: str = "reference",
         sequence_parallel=None,
         valid_counts: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        rotary_context_length: int | torch.Tensor | None = None,
+        rotary_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         self._validate_input(x)
         config = self.config
+        if rotary_factors is not None and (not config.rotary or position_ids is not None or rotary_context_length is not None):
+            raise ValueError("precomputed rotary_factors require rotary=True and replace position/context inputs")
         batch, length, _dim = x.shape
 
         if implementation == "cuda":
-            return self._forward_cuda(x, valid_mask, sequence_parallel=sequence_parallel, valid_counts=valid_counts)
+            return self._forward_cuda(
+                x, valid_mask, sequence_parallel=sequence_parallel, valid_counts=valid_counts,
+                position_ids=position_ids, rotary_context_length=rotary_context_length,
+                rotary_factors=rotary_factors,
+            )
         if implementation != "reference":
             raise ValueError(
                 "implementation must be 'reference' or 'cuda', "
@@ -415,8 +498,13 @@ class MemSolve(nn.Module):
         if sequence_parallel is not None or valid_counts is not None:
             raise ValueError("sequence_parallel and precomputed valid_counts require implementation='cuda'")
 
+        rotary_cos, rotary_sin = rotary_factors if rotary_factors is not None else self._rotary_factors(
+            x, valid_mask, position_ids, rotary_context_length
+        )
         projected, frame, compact_state, content, generator, eta, mask = (
-            self._reference_compact_problem(x, valid_mask)
+            self._reference_compact_problem(
+                x, valid_mask, rotary_cos=rotary_cos, rotary_sin=rotary_sin
+            )
         )
         with torch.autocast(device_type=x.device.type, enabled=False):
             output = accretive_equilibrium_mix(
@@ -425,6 +513,8 @@ class MemSolve(nn.Module):
                 compact_state,
                 content,
                 eta,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
             )
 
         if x.dtype != torch.float64:
@@ -437,7 +527,6 @@ class MemSolve(nn.Module):
         )
         if mask is None:
             return output
-        assert mask is not None
         return torch.where(mask[:, :, None], output, torch.zeros_like(output))
 
     def extra_repr(self) -> str:
@@ -445,7 +534,7 @@ class MemSolve(nn.Module):
         return (
             f"dim={config.dim}, num_heads={config.num_heads}, rank={config.rank}, "
             f"core_mode={config.core_mode.value}, "
-            "eta=per-head-interior-tanh"
+            f"eta=per-head-interior-tanh, rotary={config.rotary}"
         )
 
 

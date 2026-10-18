@@ -18,36 +18,73 @@ def _calculation_dtype(value: torch.Tensor) -> torch.dtype:
 
 @lru_cache(maxsize=1)
 def _biased_gemm_kernel():
-    # CUDA PyTorch supplies Triton; keep CPU-only imports independent of it.
+    # Grouped GEMM/indexing adapted from PyTorch Inductor; see THIRD_PARTY_NOTICES.md.
     from triton import jit
     import triton.language as tl
 
     @jit
     def kernel(
         X, W, B, Y, MASK,
-        M, N, K: tl.constexpr,
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
         XM: tl.constexpr, XK: tl.constexpr,
         WK: tl.constexpr, WN: tl.constexpr, BS: tl.constexpr,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
         HAS_BIAS: tl.constexpr, HAS_MASK: tl.constexpr,
     ):
-        rows = tl.program_id(0) * BM + tl.arange(0, BM)
-        columns = tl.program_id(1) * BN + tl.arange(0, BN)
+        pid = tl.program_id(0)
+        grid_m, grid_n = tl.cdiv(M, BM), tl.cdiv(N, BN)
+        group_width = GROUP_M * grid_n
+        group = pid // group_width
+        group_size = tl.minimum(grid_m - group * GROUP_M, GROUP_M)
+        tile_m = group * GROUP_M + pid % group_size
+        tile_n = pid % group_width // group_size
+        tl.assume(tile_m >= 0)
+        tl.assume(tile_n >= 0)
+        rows = tile_m * BM + tl.arange(0, BM)
+        columns = tile_n * BN + tl.arange(0, BN)
         inner = tl.arange(0, BK)
+        if M >= BM and N >= BN:
+            # Wrap edge loads; only valid output lanes are stored.
+            if ((XM == 1 and XK == M) or (XM == K and XK == 1)) and K > 1:
+                load_rows = tl.max_contiguous(tl.multiple_of(rows % M, BM), BM)
+            else:
+                load_rows = rows % M
+            if ((WK == 1 and WN == K) or (WK == N and WN == 1)) and K > 1:
+                load_columns = tl.max_contiguous(tl.multiple_of(columns % N, BN), BN)
+            else:
+                load_columns = columns % N
+        else:
+            load_rows, load_columns = rows, columns
         accumulator = tl.full((BM, BN), 0, tl.float32)
         for start in range(tl.cdiv(K, BK)):
             indices = start * BK + inner
-            left = tl.load(
-                X + rows[:, None] * XM + indices[None, :] * XK,
-                (rows[:, None] < M) & (indices[None, :] < K), 0,
-            )
-            right = tl.load(
-                W + columns[None, :] * WN + indices[:, None] * WK,
-                (columns[None, :] < N) & (indices[:, None] < K), 0,
-            )
+            if M < BM or N < BN:
+                left = tl.load(
+                    X + load_rows[:, None] * XM + indices[None, :] * XK,
+                    (load_rows[:, None] < M) & (indices[None, :] < K), 0,
+                )
+                right = tl.load(
+                    W + load_columns[None, :] * WN + indices[:, None] * WK,
+                    (load_columns[None, :] < N) & (indices[:, None] < K), 0,
+                )
+            elif K % BK == 0:
+                left = tl.load(X + load_rows[:, None] * XM + indices[None, :] * XK)
+                right = tl.load(W + load_columns[None, :] * WN + indices[:, None] * WK)
+            else:
+                left = tl.load(
+                    X + load_rows[:, None] * XM + indices[None, :] * XK,
+                    indices[None, :] < K, 0,
+                )
+                right = tl.load(
+                    W + load_columns[None, :] * WN + indices[:, None] * WK,
+                    indices[:, None] < K, 0,
+                )
             accumulator = tl.dot(left, right, accumulator)
+        # Recompute store indices to shorten their live ranges across the loop.
+        rows = tile_m * BM + tl.arange(0, BM)
+        columns = tile_n * BN + tl.arange(0, BN)
         if HAS_BIAS:
-            bias = tl.load(B + columns * BS, columns < N, 0)
+            bias = tl.load(B + columns * BS, columns < N, 0).to(tl.float32)
             accumulator += bias[None, :]
         if HAS_MASK:
             valid = tl.load(MASK + rows, rows < M, 0)
@@ -65,21 +102,22 @@ def _biased_gemm(
     output_dtype: torch.dtype, output_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # AB + bias: FP32 accumulation/addition, then one output rounding.
-    # Blocked GEMM follows Triton's official matrix-multiplication tutorial:
-    # https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
     rows, inner = left.shape
     columns = right.shape[1]
     output = torch.empty((rows, columns), device=left.device, dtype=output_dtype)
     if rows == 0 or columns == 0:
         return output
-    # Wider tiles reuse operands across output columns (Triton matmul tutorial).
-    # Keep small projections compact; this changes only scheduling, not precision.
-    large = rows >= 128 and columns >= 128
-    bm, bn, bk, warps = (128, 128, 32, 8) if large else (64, 64, 32, 4)
-    _biased_gemm_kernel()[((rows + bm - 1) // bm, (columns + bn - 1) // bn)](
+    if rows >= 128 and columns >= 128:
+        bm, bn, warps, group = 128, 128, 4, 4
+        bk, stages = (64, 3) if inner >= 512 else (32, 4)
+    else:
+        bm, bn, bk, warps, stages, group = 64, 64, 32, 4, 3, 1
+    grid = ((rows + bm - 1) // bm) * ((columns + bn - 1) // bn)
+    _biased_gemm_kernel()[(grid,)](
         left, right, bias, output, output_mask, rows, columns, inner,
         *left.stride(), *right.stride(), 0 if bias is None else bias.stride(0),
-        bm, bn, bk, bias is not None, output_mask is not None, num_warps=warps,
+        bm, bn, bk, group, bias is not None, output_mask is not None,
+        num_warps=warps, num_stages=stages,
     )
     return output
 
@@ -101,7 +139,7 @@ def _wide_gemm(
                     return _biased_gemm(left, right, bias, output_dtype)
                 return torch.ops.aten.addmm.dtype(bias, left, right, torch.float32)
             operation = torch.bmm if left.ndim == 3 else torch.mm
-            if output_dtype == torch.bfloat16 and bias is None:
+            if output_dtype == torch.bfloat16:
                 return operation(left, right)
             return operation(left, right, out_dtype=torch.float32)
     finally:
@@ -178,6 +216,32 @@ class _TensorCoreBmm(torch.autograd.Function):
         return grad_left, grad_right
 
 
+@lru_cache(maxsize=1)
+def _masked_cast_kernel():
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def kernel(X, MASK, Y, SIZE: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        valid = tl.load(MASK + i // WIDTH, i < SIZE, 0)
+        value = tl.load(X + i, (i < SIZE) & valid, 0)
+        tl.store(Y + i, value, i < SIZE)
+    return kernel
+
+
+def _masked_cast(value, mask, dtype):
+    # Sanitize before GEMM: zero times NaN is still NaN in a weight gradient.
+    if mask is None:
+        return value.to(dtype)
+    source = value.contiguous()
+    output = torch.empty_like(source, dtype=dtype)
+    _masked_cast_kernel()[((source.numel() + 1023) // 1024,)](
+        source, mask, output, source.numel(), source.shape[-1], 1024,
+    )
+    return output
+
+
 class _TensorCoreLinear(torch.autograd.Function):
     """BF16 Tensor Core linear map with FP32 accumulation and dtype-aware stores."""
 
@@ -190,10 +254,11 @@ class _TensorCoreLinear(torch.autograd.Function):
         output_dtype: torch.dtype | None,
         fuse_weight_bias_grad: bool,
         output_mask: torch.Tensor | None,
+        input_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        value_bf16 = value.to(dtype=torch.bfloat16)
+        value_bf16 = _masked_cast(value, input_mask, torch.bfloat16)
         weight_bf16 = weight.to(dtype=torch.bfloat16)
-        ctx.save_for_backward(value_bf16, weight_bf16, output_mask)
+        ctx.save_for_backward(value_bf16, weight_bf16, output_mask, input_mask)
         ctx.value_shape = value.shape
         ctx.value_dtype = value.dtype
         ctx.weight_dtype = weight.dtype
@@ -222,26 +287,16 @@ class _TensorCoreLinear(torch.autograd.Function):
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None, None]:
-        value, weight, output_mask = ctx.saved_tensors
-        if output_mask is not None:
-            grad_output = grad_output.masked_fill(~output_mask[..., None], 0)
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None, None, None]:
+        value, weight, output_mask, input_mask = ctx.saved_tensors
+        # Match AOTAutograd: release ownership only when retain_graph is false.
+        ctx.maybe_clear_saved_tensors()
+        grad_output = _masked_cast(grad_output, output_mask, grad_output.dtype)
         flat_value = value.reshape(-1, value.shape[-1])
         flat_gradient = grad_output.to(dtype=torch.bfloat16).reshape(
             -1,
             weight.shape[0],
         )
-
-        grad_value = None
-        if ctx.needs_input_grad[0]:
-            grad_value = _wide_gemm(
-                flat_gradient,
-                weight,
-                output_dtype=(
-                    torch.bfloat16 if ctx.value_dtype == torch.bfloat16 else torch.float32
-                ),
-            ).reshape(ctx.value_shape)
-            grad_value = grad_value.to(dtype=ctx.value_dtype)
 
         grad_weight = grad_bias = None
         # Bias uses the original upstream gradient, not a BF16-rounded FP16/
@@ -272,7 +327,20 @@ class _TensorCoreLinear(torch.autograd.Function):
                 else grad_output.to(dtype=torch.float32)
             ).to(device=ctx.bias_device, dtype=ctx.bias_dtype)
 
-        return grad_value, grad_weight, grad_bias, None, None, None
+        del flat_value, value, grad_output
+        grad_value = None
+        if ctx.needs_input_grad[0]:
+            grad_value = _wide_gemm(
+                flat_gradient,
+                weight,
+                output_dtype=(
+                    torch.bfloat16 if ctx.value_dtype == torch.bfloat16 else torch.float32
+                ),
+                output_mask=input_mask,
+            ).reshape(ctx.value_shape)
+            grad_value = grad_value.to(dtype=ctx.value_dtype)
+
+        return grad_value, grad_weight, grad_bias, None, None, None, None
 
 
 @contextmanager
@@ -454,6 +522,7 @@ def tensor_core_linear(
     output_dtype: torch.dtype | None = None,
     fuse_weight_bias_grad: bool = False,
     output_mask: torch.Tensor | None = None,
+    input_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a BF16/FP32 projection, with FP32 accumulation/bias and an optional final cast.
 
@@ -480,6 +549,11 @@ def tensor_core_linear(
             f"[{weight.shape[0]}], got {tuple(bias.shape)}"
         )
 
+    if input_mask is not None:
+        if input_mask.dtype != torch.bool or input_mask.shape != value.shape[:-1] or input_mask.device != value.device:
+            raise ValueError("input_mask must be boolean with the input token shape and device")
+        input_mask = input_mask.contiguous()
+
     if output_mask is not None:
         if output_mask.dtype != torch.bool or output_mask.shape != value.shape[:-1] or output_mask.device != value.device:
             raise ValueError("output_mask must be boolean with the input's token shape and device")
@@ -490,34 +564,95 @@ def tensor_core_linear(
         and value.dtype != torch.float64
         and weight.dtype != torch.float64
     ):
-        # Flattening leading dimensions is exactly vec(X) W^T.  Unlike the
-        # broadcast BMM primitive, its weight VJP is one GEMM rather than a
-        # per-batch gradient tensor followed by a reduction.
+        # Flatten tokens so the weight gradient is one GEMM across all batches.
         needs_backward = torch.is_grad_enabled() and (
             value.requires_grad
             or weight.requires_grad
             or (bias is not None and bias.requires_grad)
         )
         if needs_backward:
-            return _TensorCoreLinear.apply(value, weight, bias, output_dtype, fuse_weight_bias_grad, output_mask)
-        # Low-precision biased outputs fuse the FP32 bias and final cast;
-        # other outputs retain the established GEMM conversion boundary.
+            return _TensorCoreLinear.apply(value, weight, bias, output_dtype, fuse_weight_bias_grad, output_mask, input_mask)
+        # Fuse FP32 bias addition with the low-precision output cast.
         direct_dtype = (
             output_dtype
             if output_dtype in (torch.float16, torch.bfloat16)
             and (bias is not None or output_dtype == torch.bfloat16)
             else None
         )
-        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype, fuse_weight_bias_grad, output_mask)
+        output = _TensorCoreLinear.apply(value, weight, bias, direct_dtype, fuse_weight_bias_grad, output_mask, input_mask)
         bias = None
         output_mask = None
     else:
+        if input_mask is not None:
+            value = value.masked_fill(~input_mask[..., None], 0)
         output = tensor_core_matmul(value, weight.mT)
     if bias is not None:
         output = output + bias.to(device=output.device, dtype=output.dtype)
     if output_mask is not None:
         output = output.masked_fill(~output_mask[..., None], 0)
     return output if output_dtype is None else output.to(dtype=output_dtype)
+
+
+def rotary_position_factors(
+    position_ids: torch.Tensor,
+    *,
+    head_dim: int,
+    base: float,
+    train_length: int,
+    context_length: int | torch.Tensor,
+    scaling: str,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-head adjacent-pair RoVE phases, with unit-amplitude YaRN scaling.
+
+    YaRN interpolates slow frequencies and preserves fast frequencies. Its
+    beta=32/1 transition follows the original correction-range index ramp;
+    attention-temperature rescaling is not part of this orthogonal transport.
+    ``context_length`` may contain one physical span per sample, independently
+    of the absolute position offset. FP64 is reserved for the reference oracle.
+    """
+    calc_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    with torch.autocast(device_type=position_ids.device.type, enabled=False):
+        pair = torch.arange(head_dim // 2, device=position_ids.device, dtype=calc_dtype)
+        frequency = base ** (-2.0 * pair / head_dim)
+        if scaling == "yarn":
+            if isinstance(context_length, torch.Tensor):
+                scale = (context_length.to(device=position_ids.device, dtype=calc_dtype)
+                         / train_length).clamp_min(1.0).reshape(-1, 1)
+            else:
+                scale = max(1.0, context_length / train_length)
+            low = max(0, math.floor(
+                head_dim * math.log(train_length / (2 * math.pi * 32)) / (2 * math.log(base))
+            ))
+            high = min(head_dim // 2 - 1, math.ceil(
+                head_dim * math.log(train_length / (2 * math.pi)) / (2 * math.log(base))
+            ))
+            ramp = ((pair - low) / max(high - low, 1e-4)).clamp(0, 1)
+            frequency = frequency * (1.0 - ramp + ramp / scale)
+        elif scaling != "none":
+            raise ValueError("rotary scaling must be 'none' or 'yarn'")
+        if frequency.ndim == 1:
+            frequency = frequency.unsqueeze(0)
+        angle = position_ids.to(dtype=calc_dtype).unsqueeze(-1) * frequency.unsqueeze(1)
+        return angle.cos().contiguous(), angle.sin().contiguous()
+
+
+def rotate_content(
+    content: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply shared-per-head planar rotations to [B,H,N,D] content."""
+    with torch.autocast(device_type=content.device.type, enabled=False):
+        value = content.to(dtype=_calculation_dtype(content))
+        cosine, sine = cos[:, None], sin[:, None]
+        if inverse:
+            sine = -sine
+        even, odd = value[..., 0::2], value[..., 1::2]
+        return torch.stack((even * cosine - odd * sine,
+                            even * sine + odd * cosine), dim=-1).flatten(-2)
 
 
 def qr_soft_frame(relation: torch.Tensor) -> torch.Tensor:
@@ -630,6 +765,9 @@ def accretive_equilibrium_mix(
     compact_state: torch.Tensor,
     content: torch.Tensor,
     eta: torch.Tensor,
+    *,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""Apply the complement or accretive-equilibrium compact token mix.
 
@@ -642,7 +780,10 @@ def accretive_equilibrium_mix(
     (I + K)^-1 (I - K) = 2 (I + K)^-1 - I. The two frame
     products are fused as P (correction - eta Z). Shared K is solved
     once per head, with gradients retained and no cross-forward cache.
-    Z = P^T C; generator=None means zero correction, equivalent to K=I.
+    Z = P^T C; generator=None means a zero learned-core map, equivalent to K=I.
+    The negative complement correction -eta P Z is still present.
+    With value transport, Z = P^T rot(C) and the entire compact correction
+    is inverse-rotated before adding the unchanged local term eta C.
 
     For P=A R^-1 and R^T R=I+A^T A, the complement can be evaluated
     as eta*(C-A H), H=solve(I+A^T A, A^T C). Its derivative follows
@@ -699,8 +840,7 @@ def accretive_equilibrium_mix(
         else:
             raise ValueError("generator must have shape [H, R, R] or [B, H, R, R]")
 
-        # Keep the small-system products in FP32, like the solve itself.
-        # Avoid adding a BF16 operand-rounding boundary to the correction.
+        # Use FP32 for both the compact correction products and the solve.
         with torch.autocast(device_type=content.device.type, enabled=False):
             fp32_cuda = generator.device.type == "cuda" and generator.dtype == torch.float32
             if not fp32_cuda:
@@ -721,7 +861,17 @@ def accretive_equilibrium_mix(
                     correction = torch.linalg.solve(system, deviation @ compact_state)
             compact = correction - eta_batch * compact_state
 
-    return eta_batch * content + tensor_core_matmul(frame, compact)
+    if (rotary_cos is None) != (rotary_sin is None):
+        raise ValueError("rotary_cos and rotary_sin must be supplied together")
+    token_correction = (
+        tensor_core_matmul(frame, compact) if rotary_cos is None
+        else _compact_matmul(frame, compact)
+    )
+    if rotary_cos is not None:
+        token_correction = rotate_content(
+            token_correction, rotary_cos, rotary_sin, inverse=True
+        )
+    return eta_batch * content + token_correction
 
 
 def compact_equilibrium_diagnostics(
@@ -846,6 +996,8 @@ __all__ = [
     "bounded_complement",
     "compact_equilibrium_diagnostics",
     "qr_soft_frame",
+    "rotary_position_factors",
+    "rotate_content",
     "tensor_core_linear",
     "tensor_core_matmul",
 ]

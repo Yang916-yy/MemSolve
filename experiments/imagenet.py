@@ -1,9 +1,7 @@
 """Distributed ImageNet-1K training with RoPE-ViT, ViT³ and DeiT III recipes.
 
-The model itself intentionally lives outside this entrypoint.  The runner calls
-``integrations.timm.create_memsolve_vit`` so classification, detection, and
-segmentation share one backbone implementation rather than recreating model
-math in every experiment.
+Builds the shared ``integrations.timm`` backbone and handles data, distributed
+training, evaluation, and checkpoints.
 """
 
 from __future__ import annotations
@@ -1313,13 +1311,10 @@ def _decode_webdataset_sample(
         raise ValueError("WebDataset sample is missing a valid class id under 'cls'") from error
     if not 0 <= target < num_classes:
         raise ValueError(f"WebDataset class id {target} is outside [0, {num_classes})")
-    try:
-        from PIL import Image
+    from PIL import Image
 
-        with Image.open(io.BytesIO(bytes(image_bytes))) as image:
-            tensor = transform(image.convert("RGB"))
-    except Exception as error:
-        raise ValueError("failed to decode or transform a WebDataset JPEG sample") from error
+    with Image.open(io.BytesIO(bytes(image_bytes))) as image:
+        tensor = transform(image.convert("RGB"))
     if not isinstance(tensor, torch.Tensor):
         raise TypeError("ImageNet transform must return a torch.Tensor")
     return tensor, target
@@ -1352,7 +1347,7 @@ class _ImageNetIndexedDataset(Dataset[tuple[torch.Tensor, int]]):
         self._shared_epoch.fill_(epoch)
 
     def __getstate__(self) -> dict[str, Any]:
-        # Spawned workers own their mmap handles; never serialize an open cache.
+        # Each spawned worker opens its own mmap cache.
         return {**self.__dict__, "_reader": None, "_seeded_epoch": None}
 
     def _get_reader(self) -> Any:
@@ -1364,9 +1359,8 @@ class _ImageNetIndexedDataset(Dataset[tuple[torch.Tensor, int]]):
             import resource
             import warnings
 
-            # Uniform random sampling visits all local shards. Keep their small
-            # mmap indexes, avoiding repeated tar-header scans. Only this loader
-            # process raises its soft limit; no server-wide setting is changed.
+            # Cache all shard indexes to avoid repeated tar-header scans.
+            # Reserve enough file descriptors in this loader process.
             required = 3 * len(self.split.paths) + 256
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             if soft < required:
@@ -1874,7 +1868,7 @@ def prepare_operator_backend(run: ImageNetRun, device: torch.device) -> None:
 
 
 def build_model(run: ImageNetRun) -> nn.Module:
-    """Call the shared restored MemSolve backbone factory owned by integrations."""
+    """Build the visual backbone using the shared integration factory."""
 
     try:
         from integrations.timm import create_memsolve_vit
@@ -1986,9 +1980,7 @@ def _no_weight_decay(model: nn.Module) -> set[str]:
     parameter_names = {name for name, _ in model.named_parameters()}
     candidate = getattr(model, "no_weight_decay", None)
     if candidate is None:
-        # The shared wrapper delegates to timm's ViT encoder, so retain the
-        # published no-decay treatment without teaching the experiment about
-        # any other model parameters.
+        # Standard ViT embeddings are excluded from weight decay.
         return {
             name
             for name in parameter_names
@@ -2176,13 +2168,10 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
         import torch._dynamo.config as dynamo_config
         import torch._functorch.config as functorch_config
 
-        # Forward uses BF16 autocast; backward runs outside it, as recommended
-        # by PyTorch AMP. AOTAutograd must specialize for that same context.
+        # Match AOTAutograd to the training loop's backward autocast context.
         functorch_config.backward_pass_autocast = "off"
 
-        # timm's blocks share Python code but specialize on their per-layer
-        # DropPath probabilities. Reserve train/eval variants for each block
-        # instead of hitting Dynamo's default eight-variant eager fallback.
+        # Reserve train/eval specializations for each block's DropPath rate.
         mixer_count = sum(isinstance(module, MemSolve) for module in model.modules())
         dynamo_config.recompile_limit = max(
             dynamo_config.recompile_limit, 2 * mixer_count + 4
@@ -2190,11 +2179,8 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
         for module in model.modules():
             if isinstance(module, MemSolve):
                 module.forward = torch.compiler.disable(module.forward)
-                # Preserve the restored native equilibrium forward/backward boundary.
-        # One outer graph captures all compiled segments and CUDA MemSolve calls.
-        # Disable Inductor's own graphs so graph pools and RNG have one owner.
-        # Preserve eager BF16 rounding between fused pointwise operations.
-        # This retains the numerical contract while removing intermediate IO.
+        # The outer CUDA Graph captures compiled blocks and native mixer calls.
+        # emulate_precision_casts keeps BF16 rounding between fused operations.
         model.compile(backend="inductor", fullgraph=False, dynamic=False,
                       options={"triton.cudagraphs": False, "emulate_precision_casts": True})
     if state.enabled:
@@ -2216,8 +2202,8 @@ class ImageNetGraphStep:
     """Capture a complete fixed-shape accumulated update, including DDP sync.
 
     Optimizer, clipping, data augmentation and scheduling remain outside. Warmup
-    never updates weights and restores RNG/buffers before the first real replay.
-    This owner persists across epochs; checkpoint loading must happen before it.
+    restores RNG/buffers before the first replay. Load checkpoints before capture;
+    reuse this graph across epochs.
     """
 
     def __init__(self, model: nn.Module, criterion: nn.Module, *, grad_accum: int = 1):
@@ -2972,8 +2958,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             if state.is_main:
                 if save_last or is_best or is_best_ema:
                     try:
-                        if rng_state is None:
-                            raise RuntimeError("checkpoint RNG state was not collected")
                         checkpoint = _checkpoint(
                             epoch=epoch,
                             model=model,

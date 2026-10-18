@@ -1,7 +1,6 @@
 """Assembly101 data audit, stage-1 MemSolve training and LTContext evaluation.
 
-The external LTContext checkout owns data alignment and metric definitions.
-No upstream code or operator mathematics is copied into this module.
+Uses LTContext's data alignment and evaluation metrics.
 """
 from __future__ import annotations
 
@@ -131,15 +130,14 @@ class _GraphModule(torch.nn.Module):
 
 
 def _training_forward(module, eager, compiled, *args, **kwargs):
-    # Validation uses original lengths and must not compile every distinct one.
+    # Run variable-length validation eagerly to avoid per-length compilations.
     return (compiled if module.training else eager)(*args, **kwargs)
 
 
 class BucketExecution:
     """Independent graph pools for shuffled lengths; eager loss on real frames.
 
-    Warmup/capture never update weights and restore RNG state. Graphs are rebuilt
-    on resume; model/optimizer state dictionaries retain their original names.
+    Capture restores RNG state; resume rebuilds the graphs from model weights.
     """
 
     def __init__(self, model, backend, buckets):
@@ -470,7 +468,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, metrics, best_scor
 
 
 def check_resume_identity(previous, current, upgrade_execution=False):
-    """Allow an explicit execution-only migration, never data/model changes."""
+    """Compare run identity, optionally allowing an execution-backend change."""
     if previous == current:
         return
     if upgrade_execution:
@@ -502,7 +500,7 @@ def train(args):
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     audit = check_audit(args)
     cfg = training_config(args)
-    execution_backend = getattr(args, 'execution_backend', 'eager')
+    execution_backend = args.execution_backend
     torch.set_num_threads(args.threads)
     # Avoid cuDNN convolution nondeterminism when comparing ranks or resuming.
     torch.backends.cudnn.deterministic = True
@@ -516,18 +514,17 @@ def train(args):
     root = Path(__file__).resolve().parents[1]
     cuda_backend.load(device=torch.device('cuda', torch.cuda.current_device()))
     model = replace_stage1(LTC(cfg.MODEL), args.rank).cuda()
-    attention_backend = getattr(args, 'attention_backend', 'sdpa')
+    attention_backend = args.attention_backend
     if attention_backend == 'sdpa':
         enable_sdpa(model)
     optimizer = construct_optimizer(model, cfg)
     scheduler = construct_lr_scheduler(cfg, optimizer)
     loss_func = get_loss_func(cfg)
     if execution_backend == 'graph-compile':
-        # Call the upstream loss on sliced real frames, fusing its pointwise
-        # operations without introducing a second mathematical implementation.
+        # Fuse the upstream loss's pointwise operations on real-frame slices.
         loss_func = torch.compile(loss_func, dynamic=True, fullgraph=True,
             options={'triton.cudagraphs': False, 'fallback_random': True})
-    graph_buckets = tuple(getattr(args, 'graph_buckets', (2048, 4096, 6144, 8192, 12288, 16384, 24576, 49152)))
+    graph_buckets = tuple(args.graph_buckets)
     if execution_backend != 'eager' and attention_backend != 'sdpa':
         raise ValueError('Graph execution requires SDPA attention')
     # Rank changes parameter initialization draws, but must not change data order.
@@ -593,7 +590,7 @@ def train(args):
     if args.resume:
         checkpoint = args.output / 'last.pt'
         state = torch.load(checkpoint, map_location='cpu', weights_only=False)
-        check_resume_identity(state['identity'], identity, getattr(args, 'upgrade_execution', False))
+        check_resume_identity(state['identity'], identity, args.upgrade_execution)
         if state['identity'] != identity:
             transition = {'checkpoint_sha256': sha256(checkpoint), 'completed_epoch': state['epoch']+1,
                           'previous_identity': state['identity'], 'current_identity': identity,

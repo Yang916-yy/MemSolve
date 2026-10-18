@@ -26,21 +26,28 @@ Masked pooling averages only valid patches. timm's post-pooling fc_norm is
 Identity, so normalization happens before the mean, not after it.
 
 Default stochastic depth increases linearly by depth. S retains the historical
-MLP width1584 (ratio4.125), width384, 12 blocks, 6 heads and rank32.
+MLP width 1584 (ratio 4.125), width 384, 12 blocks, 6 heads and rank 32.
 With a 1,000-class head it has 19,876,336 parameters. This shell differs from
 historical LSSO Small by removing CLS and LayerScale; results must retain their
 original architecture and recipe. No RankRotary, RoPE, Q/K short convolution,
-readout gate or operator RMSNorm is present. The CPE implementation uses a fixed
-configured grid; construct the intended resolution for resolution fine-tuning.
+readout gate or operator RMSNorm is present in the visual configuration.
+Classification uses its configured patch grid; dense prediction supplies an
+explicit rectangular grid through `VisionTokenLayout`. ViT-Adapter adds spatial
+features around the same pretrained blocks; see the
+[dense prediction protocol](DOWNSTREAM_PROTOCOLS.md).
 
 ## Text
 
 MemSolve-BERT keeps its existing BERT embeddings, Post-LN residual wrapper,
 SwiGLU FFNs and tied MLM head. Each mixer receives a centered residual depthwise
 convolution (kernel 3), with padding masked before and after it. The default
-14-layer, width-768, rank-32 model has 111,517,154 parameters including its tied
-MLM head and 512 learned positions. This is approximately parameter-matched to
+14-layer, width-768, rank-32 model uses full-head RoVE content transport and has
+111,123,938 parameters including its tied MLM head, without a learned position
+table. It uses base 10000 and frequency-only YaRN beyond its 128-token training
+window, with unit amplitude. This is approximately parameter-matched to
 12-layer BERT-base; it is not a depth-controlled operator comparison.
 The [NLP guide](BERT_MLM.md) separates training, resume, continued pretraining,
-checkpoint selection and evaluation. ImageNet results do not validate this
-text architecture; formal MLM training has not yet been run.
+checkpoint selection and evaluation. Completed MLM/GLUE experiments used the
+explicit absolute-position configuration (111,517,154 parameters, 512 learned
+positions). Those results do not validate the new RoVE configuration; it still
+needs a training comparison.

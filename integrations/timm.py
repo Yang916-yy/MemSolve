@@ -18,7 +18,7 @@ _Implementation = Literal["reference", "cuda"]
 
 @dataclass(frozen=True)
 class VisionSpec:
-    """Geometry and stochastic depth for one restored visual scale."""
+    """Geometry and stochastic depth for one visual model scale."""
 
     embed_dim: int
     depth: int
@@ -45,10 +45,11 @@ class VisionTokenLayout:
     """Token validity for the vision mixer."""
 
     valid_mask: torch.Tensor | None
+    grid_size: tuple[int, int] | None = None
 
 
 def vision_spec(variant: str) -> VisionSpec:
-    """Return the restored visual geometry."""
+    """Return the geometry of a visual model scale."""
 
     try:
         return _VISION_SPECS[variant]
@@ -60,7 +61,7 @@ def vision_spec(variant: str) -> VisionSpec:
 
 
 def vision_default_rank(variant: str) -> int:
-    """Return the agreed CUDA-fast MemSolve rank for a DeiT III scale."""
+    """Return the default operator rank for a visual model scale."""
 
     vision_spec(variant)
     return _VISION_DEFAULT_RANKS[variant]
@@ -148,18 +149,13 @@ class _TimmMemSolveMixer(nn.Module):
             raise ValueError(
                 "the vision adapter accepts only unmasked bidirectional input"
             )
-        if attn_mask is None:
-            layout = None
-        elif isinstance(attn_mask, VisionTokenLayout):
-            layout = attn_mask
-        else:
+        if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
             raise ValueError(
                 "the vision adapter accepts only its token validity layout, "
                 "not a generic attention mask"
             )
-        valid_mask = None if layout is None else layout.valid_mask
-        # Both backends receive the same activation dtype under AMP; otherwise
-        # FP32 residuals change the reference input and output rounding boundary.
+        valid_mask = None if attn_mask is None else attn_mask.valid_mask
+        # Match the activation rounding of both backends under AMP.
         if x.is_cuda and torch.is_autocast_enabled("cuda"):
             x = x.to(torch.get_autocast_dtype("cuda"))
         return self.mixer(
@@ -195,8 +191,6 @@ def _create_vision_encoder(
 
     if position_encoding not in {"learned", "cpe"}:
         raise ValueError("position_encoding must be learned or cpe")
-    if position_encoding == "cpe" and (dynamic_img_size or dynamic_img_pad):
-        raise ValueError("CPE currently requires the configured fixed image grid")
     if drop_path_schedule not in {"constant", "linear"}:
         raise ValueError("drop_path_schedule must be constant or linear")
     if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
@@ -237,23 +231,23 @@ def _create_vision_encoder(
     block_type = ConstantDropPathBlock if drop_path_schedule == "constant" else Block
 
     class CPEBlock(block_type):
-        # ViT³ / CPVT residual CPE, using PyTorch's cuDNN depthwise convolution.
-        # Keep this spatial operation outside the MemSolve mixer.
+        # ViT³ / CPVT residual CPE via cuDNN depthwise convolution.
         def __init__(self, dim: int, *args: Any, **kwargs: Any) -> None:
             super().__init__(dim, *args, **kwargs)
             self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
 
         def forward(self, x, attn_mask=None, is_causal=False):
-            side = image_size // patch_size
-            if x.shape[1] != side * side:
-                raise ValueError("CPE requires the configured patch grid")
             if attn_mask is not None and not isinstance(attn_mask, VisionTokenLayout):
                 raise ValueError("CPE accepts only the vision token validity layout")
+            grid = None if attn_mask is None else attn_mask.grid_size
+            height, width = grid or (image_size // patch_size, image_size // patch_size)
+            if x.shape[1] != height * width:
+                raise ValueError("CPE token count must match the spatial grid")
             valid = None if attn_mask is None else attn_mask.valid_mask
             patches = x
             if valid is not None:
                 patches = torch.where(valid[..., None], patches, 0)
-            spatial = patches.reshape(x.shape[0], side, side, x.shape[2]).permute(0, 3, 1, 2)
+            spatial = patches.reshape(x.shape[0], height, width, x.shape[2]).permute(0, 3, 1, 2)
             # NHWC tokens give a channels-last convolution view; cuDNN owns dispatch.
             local = self.cpe(spatial).flatten(2).transpose(1, 2)
             patches = patches + local
@@ -288,7 +282,7 @@ def _create_vision_encoder(
 
 
 class MemSolveViT(nn.Module):
-    """Restored ViT3-derived encoder with CPE, GELU and token-LN mean pooling."""
+    """ViT3-derived encoder with CPE, GELU and token-LN mean pooling."""
 
     def __init__(
         self,
@@ -372,10 +366,8 @@ class MemSolveViT(nn.Module):
         *,
         valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        layout = (
-            None
-            if valid_mask is None
-            else VisionTokenLayout(valid_mask)
+        layout = VisionTokenLayout(
+            valid_mask, self.encoder.patch_embed.dynamic_feat_size(x.shape[-2:])
         )
         features = self.encoder.forward_features(x, attn_mask=layout)
         if valid_mask is None:
@@ -393,12 +385,10 @@ class MemSolveViT(nn.Module):
         valid_mask: torch.Tensor | None = None,
         norm: bool = False,
     ) -> list[torch.Tensor]:
-        layout = (
-            None
-            if valid_mask is None
-            else VisionTokenLayout(valid_mask)
+        layout = VisionTokenLayout(
+            valid_mask, self.encoder.patch_embed.dynamic_feat_size(x.shape[-2:])
         )
-        result = self.encoder.forward_intermediates(
+        return self.encoder.forward_intermediates(
             x,
             indices=indices,
             intermediates_only=True,
@@ -406,9 +396,6 @@ class MemSolveViT(nn.Module):
             output_fmt="NCHW",
             attn_mask=layout,
         )
-        if not isinstance(result, list):
-            raise RuntimeError("timm did not return intermediate feature maps")
-        return result
 
 
 def create_memsolve_vit(
@@ -466,7 +453,7 @@ def create_memsolve_vit_variant(
     dynamic_img_size: bool = False,
     dynamic_img_pad: bool = False,
 ) -> MemSolveViT:
-    """Build a restored MemSolve-ViT scale."""
+    """Build a MemSolve-ViT model at the requested scale."""
 
     spec = vision_spec(variant)
     return create_memsolve_vit(

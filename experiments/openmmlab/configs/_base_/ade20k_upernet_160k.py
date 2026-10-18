@@ -1,10 +1,4 @@
-"""ADE20K UperNet 160k downstream protocol.
-
-This is the current MMSegmentation 1.x expression of the DeiT III paper and
-public XCiT UperNet downstream recipe.  The MemSolve leaf configs only choose the
-DeiT III scale, rank, and decoder width.
-"""
-
+"""ADE20K UPerNet 160k: ViG recipe, Vision-RWKV adapter details."""
 default_scope = "mmseg"
 
 data_root = "data/ade/ADEChallengeData2016"
@@ -59,7 +53,7 @@ model = dict(
         ),
     ),
     train_cfg=dict(),
-    test_cfg=dict(mode="whole"),
+    test_cfg=dict(mode="slide", crop_size=crop_size, stride=(341, 341)),
 )
 
 train_pipeline = [
@@ -80,12 +74,13 @@ train_pipeline = [
 test_pipeline = [
     dict(type="LoadImageFromFile"),
     dict(type="Resize", scale=(2048, 512), keep_ratio=True),
+    dict(type="ResizeToMultiple", size_divisor=32),
     dict(type="LoadAnnotations", reduce_zero_label=True),
     dict(type="PackSegInputs"),
 ]
 
 train_dataloader = dict(
-    batch_size=2,
+    batch_size=8,
     num_workers=4,
     persistent_workers=True,
     sampler=dict(type="InfiniteSampler", shuffle=True),
@@ -122,19 +117,16 @@ test_evaluator = val_evaluator
 
 optim_wrapper = dict(
     type="AmpOptimWrapper",
+    dtype="bfloat16",
+    loss_scale=dict(enabled=False),
+    constructor="MemSolveLayerDecayConstructor",
     optimizer=dict(
         type="AdamW",
         lr=6e-5,
         betas=(0.9, 0.999),
         weight_decay=0.01,
     ),
-    paramwise_cfg=dict(
-        custom_keys={
-            "pos_embed": dict(decay_mult=0.0),
-            "cls_token": dict(decay_mult=0.0),
-            "norm": dict(decay_mult=0.0),
-        },
-    ),
+    paramwise_cfg=dict(num_layers=12, layer_decay_rate=0.85),
 )
 
 param_scheduler = [
@@ -173,7 +165,7 @@ default_hooks = dict(
 
 env_cfg = dict(
     cudnn_benchmark=False,
-    mp_cfg=dict(mp_start_method="fork", opencv_num_threads=0),
+    mp_cfg=dict(mp_start_method="spawn", opencv_num_threads=0),
     dist_cfg=dict(backend="nccl"),
 )
 vis_backends = [dict(type="LocalVisBackend")]

@@ -21,8 +21,10 @@ Y = eta C + P [2 S - (1 + eta) Z]
 
 The compact core map is solved once per head and reused across the batch.
 `complement` removes the learned compact readout, retaining `eta (C - P P^T C)`. The scalar complement eta is learned
-per head. There is no independent query, Q/K convolution, internal positional
-rotation, output RMSNorm or output gate.
+per head. There is no independent query, Q/K convolution, output RMSNorm or
+output gate. Optional RoVE rotates content before global aggregation and
+inversely rotates its correction before the output projection; the relation
+frame and compact solve are unchanged.
 
 The reference uses QR; the native path evaluates an equivalent compact form
 without materializing token-size P. See [the equations](docs/CORE_CONTRACT.md),
@@ -41,6 +43,9 @@ python -m pip install -e '.[vision]'
 
 Use `.[nlp]` for the BERT workflows or `.[sequence]` for genomic/LRA training.
 Framework integrations and experiment entrypoints run from the source checkout.
+Optional [ViG-style dense vision recipes](docs/DOWNSTREAM_PROTOCOLS.md) attach
+ViT-Adapter to pretrained MemSolve-ViT for Mask R-CNN and UPerNet; install
+`.[vision,openmmlab]` plus compiled MMCV for these tasks.
 The native backend requires the matching extension: Torch
 `2.14.0+cu132`, CUDA 13.2, MathDx 26.06.1 and CMake >=3.25. For an A800/SM80,
 activate the intended Python environment and build from the checkout:
@@ -73,7 +78,11 @@ y_reference = layer(x, implementation="reference")
 CUDA supports ranks **16 / 32 / 48 / 64** and boolean validity masks.
 Parameters remain FP32. The native implementation uses BF16 packed
 projections with FP32 compact statistics/solves; public outputs follow the input
-dtype. See the CUDA guide for exact precision and supported boundaries.
+dtype. Both modes share the optimized statistics/readout/VJP path, with
+chunked long-sequence statistics and reuse of temporary backward buffers.
+Saved tensors remain intact for repeated backward. See the CUDA guide for
+[measured memory and resource changes](docs/CUDA_CONTRACT.md#measured-memory-and-resource-changes)
+and the exact precision contract.
 
 Exact sequence sharding is available from the source checkout through
 `integrations.distributed.SequenceParallel`, including unequal shards and
@@ -149,12 +158,17 @@ specified. No pretrained weights for this model contract are published yet.
 ## Text model
 
 **MemSolve-BERT** retains BERT's embeddings, Post-LayerNorm residuals and tied
-MLM head, with MemSolve mixers and SwiGLU FFNs. It uses learned absolute positions
-and a centered residual depthwise convolution (kernel 3) before each mixer.
+MLM head, with MemSolve mixers and SwiGLU FFNs. New configurations use full-head
+RoVE (base 10000, unit amplitude, frequency-only YaRN beyond 128 tokens) and a
+centered residual depthwise convolution (kernel 3) before each mixer.
 The default Base geometry is width 768, 14 layers, 12 heads and rank 32:
-**111,517,154** parameters including the tied MLM head, approximately matching
+**111,123,938** parameters including the tied MLM head, approximately matching
 the parameter budget of 12-layer BERT-base. Set `memsolve_short_conv_kernel=0`
 explicitly for the no-convolution ablation.
+
+RoVE is optional: set `position_embedding_type="none"` to disable it with no
+position table, or `"absolute"` to use BERT's learned positions. The standalone
+operator uses `MemSolveConfig(rotary=True/False)`.
 
 ```python
 from integrations.transformers import MemSolveBertConfig, MemSolveBertForMaskedLM
@@ -165,16 +179,18 @@ model = MemSolveBertForMaskedLM(MemSolveBertConfig(
 ```
 
 Importing the adapter registers `memsolve_bert` with Hugging Face `AutoConfig`,
-`AutoModel` and `AutoModelForMaskedLM`. [Text workflows](docs/BERT_MLM.md) cover
-C4 MLM, Sentence Transformers retrieval fine-tuning and MTEB/LongEmbed
+`AutoModel`, `AutoModelForMaskedLM` and `AutoModelForSequenceClassification`. [Text workflows](docs/BERT_MLM.md) cover
+C4 MLM, LION M2-BASE GLUE fine-tuning, Sentence Transformers retrieval and MTEB/LongEmbed
 evaluation. They include CPU preflight, independent fixed-mask MLM evaluation,
 best-validation export, local full-corpus C4 streaming, and continued pretraining
 from a checkpoint. The full
 default is 70,000 updates at sequence length 128 and global batch 4096,
 with Inductor fusion and CUDA Graph forward/backward capture; measure runtime
-before launch. DDP communication and optimization remain in HF Trainer. LongEmbed currently truncates to 512 and does
-not establish full long-document context capability. Both modalities call
-the same MemSolve operator and CUDA path.
+before launch. DDP communication and optimization remain in HF Trainer.
+Completed MLM/GLUE runs used learned absolute positions; their saved configs
+retain that architecture. RoVE removes the learned position-table limit, but
+long-window quality still requires measurement. Both modalities call the same
+MemSolve operator and CUDA path.
 
 ## Documentation
 
@@ -185,7 +201,7 @@ the same MemSolve operator and CUDA path.
 | Code ownership | [Architecture](docs/ARCHITECTURE.md) |
 | ImageNet, ViT³-derived training recipe | [ViT³-derived protocol](docs/IMAGENET_VIT3.md) |
 | ImageNet, RoPE-ViT 400e (Base: +20e), optional DeiT III | [LAMB training protocols](docs/IMAGENET_DEIT3.md) |
-| BERT, C4 MLM, retrieval fine-tuning and MTEB/LongEmbed | [NLP launch guide](docs/BERT_MLM.md) |
+| BERT, C4 MLM, GLUE, retrieval and MTEB/LongEmbed | [NLP launch guide](docs/BERT_MLM.md) |
 | GenomicBenchmarks and Long Range Arena | [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) |
 | Assembly101 integration | [Assembly101](docs/ASSEMBLY101.md) |
 | Food-101 training | [Food-101](docs/FOOD101.md) |
@@ -217,5 +233,7 @@ prior foundations in Intention. The current operator is not an exact
 bidirectional expansion of DeltaNet's ordered recurrence.
 
 Code is licensed under [Apache-2.0](LICENSE). Upstream and historical
-attribution notices remain in [NOTICE](NOTICE).
+attribution notices remain in [NOTICE](NOTICE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); redistributed license texts
+are included in source and wheel distributions.
 The CUDA guide records the upstream sources and reuse boundaries.

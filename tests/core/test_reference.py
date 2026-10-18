@@ -12,12 +12,116 @@ from memsolve.ball.reference import (
     bounded_complement,
     compact_equilibrium_diagnostics,
     qr_soft_frame,
+    rotary_position_factors,
+    rotate_content,
     tensor_core_linear,
     tensor_core_matmul,
 )
 
 
 pytestmark = pytest.mark.core
+
+
+def test_rotary_yarn_uses_frequency_ramp_and_unit_amplitude() -> None:
+    position = torch.arange(9)[None]
+    cos, sin = rotary_position_factors(
+        position, head_dim=64, base=10000., train_length=128,
+        context_length=torch.tensor([128, 512]), scaling="yarn", dtype=torch.float64,
+    )
+    # beta=32 and beta=1 give transition indices [0,11] at D=64,N_train=128.
+    pair = torch.arange(32, dtype=torch.float64)
+    ramp = (pair / 11).clamp(0, 1)
+    frequency = 10000. ** (-pair / 32)
+    expected = position[..., None] * torch.stack((frequency, frequency * (1-ramp+ramp/4)))[:, None]
+    torch.testing.assert_close(cos, expected.cos(), rtol=1e-14, atol=1e-14)
+    torch.testing.assert_close(sin, expected.sin(), rtol=1e-14, atol=1e-14)
+    torch.testing.assert_close(cos.square() + sin.square(), torch.ones_like(cos))
+    assert cos.is_contiguous() and sin.is_contiguous()
+    assert not cos.requires_grad and not sin.requires_grad
+    low_precision = rotary_position_factors(
+        position, head_dim=64, base=10000., train_length=128,
+        context_length=512, scaling="yarn", dtype=torch.bfloat16,
+    )
+    assert all(table.dtype == torch.float32 for table in low_precision)
+
+
+@pytest.mark.parametrize("equilibrium", [False, True])
+@pytest.mark.parametrize(("length", "rank"), [(1, 16), (5, 32), (7, 48), (3, 64)])
+def test_rotary_mix_matches_dense_orthogonal_conjugation_and_gradients(
+    equilibrium: bool, length: int, rank: int,
+) -> None:
+    torch.manual_seed(501 + rank)
+    batch, heads, width = 2, 2, 4
+    relation = torch.randn(batch, heads, length, rank, dtype=torch.float64, requires_grad=True)
+    content = torch.randn(batch, heads, length, width, dtype=torch.float64, requires_grad=True)
+    raw = (0.15 * torch.randn(heads, rank, rank, dtype=torch.float64)).requires_grad_()
+    eta = torch.tensor([.7, -.4], dtype=torch.float64, requires_grad=True)
+    frame = qr_soft_frame(relation)
+    generator = accretive_generator(raw) if equilibrium else None
+    positions = torch.arange(length)[None] + torch.tensor([[0], [37]])
+    cos, sin = rotary_position_factors(
+        positions, head_dim=width, base=10000., train_length=4,
+        context_length=torch.tensor([length, length * 2]), scaling="yarn", dtype=torch.float64,
+    )
+    state = frame.mT @ rotate_content(content, cos, sin)
+    actual = accretive_equilibrium_mix(
+        frame, generator, state, content, eta, rotary_cos=cos, rotary_sin=sin,
+    )
+    identity = torch.eye(rank, dtype=torch.float64)
+    reflected = torch.linalg.solve(identity + generator, identity - generator) if equilibrium else torch.zeros_like(raw)
+    token_map = eta[:, None, None] * torch.eye(length, dtype=torch.float64) + frame @ (
+        reflected - eta[:, None, None] * identity
+    ) @ frame.mT
+    dense_rows = []
+    for b in range(batch):
+        rotations = []
+        for n in range(length):
+            blocks = [torch.stack((torch.stack((cos[b,n,p], -sin[b,n,p])),
+                                   torch.stack((sin[b,n,p], cos[b,n,p]))))
+                      for p in range(width//2)]
+            rotations.append(torch.block_diag(*blocks))
+        rotation = torch.block_diag(*rotations)
+        dense_heads = []
+        for h in range(heads):
+            dense_map = rotation.mT @ torch.kron(token_map[b,h].contiguous(), torch.eye(width, dtype=torch.float64)) @ rotation
+            dense_heads.append((dense_map @ content[b,h].flatten()).reshape(length, width))
+            torch.testing.assert_close(torch.linalg.matrix_norm(dense_map, ord=2),
+                                       torch.linalg.matrix_norm(token_map[b,h], ord=2))
+            assert torch.linalg.matrix_norm(dense_map, ord=2) <= 1 + 1e-12
+        dense_rows.append(torch.stack(dense_heads))
+    expected = torch.stack(dense_rows)
+    torch.testing.assert_close(actual, expected, rtol=2e-12, atol=2e-12)
+    inputs = (relation, content, eta, raw) if equilibrium else (relation, content, eta)
+    cotangent = torch.randn_like(actual)
+    actual_grad = torch.autograd.grad((actual * cotangent).sum(), inputs, retain_graph=True)
+    expected_grad = torch.autograd.grad((expected * cotangent).sum(), inputs)
+    for actual_value, expected_value in zip(actual_grad, expected_grad):
+        torch.testing.assert_close(actual_value, expected_value, rtol=2e-11, atol=2e-11)
+
+
+@pytest.mark.parametrize("equilibrium", [False, True])
+def test_rotary_zero_angles_and_local_content_are_unchanged(equilibrium: bool) -> None:
+    torch.manual_seed(509)
+    frame = qr_soft_frame(torch.randn(1, 2, 5, 3, dtype=torch.float64))
+    content = torch.randn(1, 2, 5, 4, dtype=torch.float64)
+    eta = torch.tensor([.8, -.5], dtype=torch.float64)
+    generator = accretive_generator(torch.randn(2, 3, 3, dtype=torch.float64)) if equilibrium else None
+    cos, sin = rotary_position_factors(
+        torch.zeros(1, 5, dtype=torch.long), head_dim=4, base=10000.,
+        train_length=4, context_length=5, scaling="yarn", dtype=torch.float64,
+    )
+    state = frame.mT @ content
+    actual = accretive_equilibrium_mix(frame, generator, state, content, eta,
+                                      rotary_cos=cos, rotary_sin=sin)
+    expected = accretive_equilibrium_mix(frame, generator, state, content, eta)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    cos, sin = rotary_position_factors(
+        torch.arange(5)[None], head_dim=4, base=10000.,
+        train_length=4, context_length=5, scaling="yarn", dtype=torch.float64,
+    )
+    local_only = accretive_equilibrium_mix(torch.zeros_like(frame), generator,
+        torch.zeros_like(state), content, eta, rotary_cos=cos, rotary_sin=sin)
+    torch.testing.assert_close(local_only, eta[None, :, None, None] * content, rtol=0, atol=0)
 
 
 def test_qr_soft_frame_preserves_gram_identity() -> None:

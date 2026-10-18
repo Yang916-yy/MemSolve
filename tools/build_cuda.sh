@@ -67,9 +67,7 @@ for architecture in "${architecture_list[@]}"; do
     artifact_build_dir="${build_dir}/sm${architecture}"
     artifact_library="${build_dir}/lib/memsolve_equilibrium_sm${architecture}.so"
 
-    # Torch_DIR and the imported libtorch targets are cached by CMake. Each
-    # strict artifact must therefore start from a fresh build directory when
-    # PYTHON selects a different PyTorch installation.
+    # Clear cached Torch_DIR/libtorch targets when switching Python environments.
     cmake -E rm -rf "${artifact_build_dir}"
     cmake -E rm -f "${artifact_library}"
 

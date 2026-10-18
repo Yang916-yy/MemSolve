@@ -1,8 +1,7 @@
 """Shared PyTorch sequence runner for GenomicBenchmarks and Long Range Arena.
 
-The runner intentionally owns no MemSolve mathematics.  It uses the public
-``MemSolve`` module for the current operator and a matched PyTorch MHA block for
-baselines, while data/tokenization contracts live in ``sequence_data.py``.
+Trains MemSolve and attention baselines with data/tokenization from
+``sequence_data.py``.
 """
 
 from __future__ import annotations
@@ -1292,9 +1291,7 @@ def _runtime_metadata(device: torch.device, *, cuda_enabled: bool) -> dict[str, 
 
 
 def _config_digest(payload: dict[str, Any]) -> str:
-    # ``--resume`` changes how a run is entered, not the run it represents.
-    # Keep it in the on-disk manifest for auditability, but exclude it from the
-    # checkpoint identity so an explicit continuation can match its own run.
+    # Exclude the resume path so a continuation keeps the same run identity.
     identity = dict(payload)
     resolved_arguments = identity.get("resolved_arguments")
     if isinstance(resolved_arguments, dict):

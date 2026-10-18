@@ -180,7 +180,7 @@ def load(
     *,
     device: torch.device | int | None = None,
 ) -> None:
-    """Load one explicitly built strict CUDA extension."""
+    """Load the CUDA extension for the requested device and check its ABI."""
 
     global _LOADED_ARCHITECTURE
     requested_architecture = _device_architecture(device)
@@ -225,12 +225,43 @@ def _no_frame_kernels():
 
     @jit
     def _mixed_dot(a, b):
-        # The token operand is already BF16. Preserve the compact FP32
-        # coefficient with two BF16 words (Henry et al., arXiv:1904.06376).
-        # One BF16 rounding fails the scale-64 forward/gradient envelope.
+        # Two BF16 terms retain the compact FP32 coefficient's low bits
+        # (Henry et al., arXiv:1904.06376); the token operand is already BF16.
         hi = b.to(tl.bfloat16)
         lo = (b - hi.to(tl.float32)).to(tl.bfloat16)
         return tl.dot(a, hi) + tl.dot(a, lo)
+
+    @jit
+    def _wide_dot(a, b):
+        # Three BF16 products retain both rotated FP32 operands' low bits.
+        # The omitted low-low product is second order (Henry et al. 2019).
+        ah, bh = a.to(tl.bfloat16), b.to(tl.bfloat16)
+        al = (a - ah.to(tl.float32)).to(tl.bfloat16)
+        bl = (b - bh.to(tl.float32)).to(tl.bfloat16)
+        # Reuse one accumulator instead of keeping three result tiles live.
+        result = tl.dot(ah, bh)
+        result = tl.dot(ah, bl, result)
+        return tl.dot(al, bh, result)
+
+    @jit
+    def _rotate(value, COS, SIN, batch, tokens, channel_start,
+                N: tl.constexpr, D: tl.constexpr,
+                ROTARY_BATCHED: tl.constexpr, INVERSE: tl.constexpr = False):
+        # Adjacent-pair split/join follows FlashAttention (BSD-3-Clause):
+        # https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/ops/triton/rotary.py
+        # Keep the rotation and inverse rotation in FP32 until the final store.
+        pairs = channel_start // 2 + tl.arange(0, value.shape[1] // 2)
+        table_batch = batch if ROTARY_BATCHED else 0
+        offset = ((table_batch * N + tokens[:, None]) * (D // 2) + pairs[None, :])
+        mask = (tokens[:, None] < N) & (pairs[None, :] < D // 2)
+        cosine = tl.load(COS + offset, mask, 1.0)
+        sine = tl.load(SIN + offset, mask, 0.0)
+        if INVERSE:
+            sine = -sine
+        even, odd = tl.split(tl.reshape(value.to(tl.float32),
+                                       (value.shape[0], value.shape[1] // 2, 2)))
+        return tl.reshape(tl.join(even * cosine - odd * sine,
+                                  even * sine + odd * cosine), value.shape)
 
     @jit
     def _statistics(
@@ -240,6 +271,8 @@ def _no_frame_kernels():
         G,
         Q,
         DE,
+        COS,
+        SIN,
         N: tl.constexpr,
         H: tl.constexpr,
         R: tl.constexpr,
@@ -247,6 +280,8 @@ def _no_frame_kernels():
         T: tl.constexpr,
         GRAD: tl.constexpr,
         HAS_COUNT: tl.constexpr,
+        HAS_ROTARY: tl.constexpr,
+        ROTARY_BATCHED: tl.constexpr,
         BR: tl.constexpr,
         BD: tl.constexpr,
         BT: tl.constexpr,
@@ -282,10 +317,18 @@ def _no_frame_kernels():
                     E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
                     (n[:, None] < N) & (d[None, :] < D), 0,
                 )
-                q = tl.dot(tl.trans(a), e).to(tl.float32) / tl.sqrt(count)
+                if HAS_ROTARY:
+                    rotated = _rotate(e, COS, SIN, b, n, channel_tile * BD, N, D, ROTARY_BATCHED)
+                    q = _mixed_dot(tl.trans(a), rotated) / tl.sqrt(count)
+                else:
+                    q = tl.dot(tl.trans(a), e).to(tl.float32) / tl.sqrt(count)
                 de += tl.sum(tl.sum(e.to(tl.float32) * c.to(tl.float32), 0), 0)
             else:
-                q = tl.dot(tl.trans(a), c).to(tl.float32) / tl.sqrt(count)
+                if HAS_ROTARY:
+                    rotated = _rotate(c, COS, SIN, b, n, channel_tile * BD, N, D, ROTARY_BATCHED)
+                    q = _mixed_dot(tl.trans(a), rotated) / tl.sqrt(count)
+                else:
+                    q = tl.dot(tl.trans(a), c).to(tl.float32) / tl.sqrt(count)
             tl.store(
                 Q + ((s * T + tile) * R + r[:, None]) * D + d[None, :],
                 q, (r[:, None] < R) & (d[None, :] < D),
@@ -300,11 +343,15 @@ def _no_frame_kernels():
         ETA,
         COUNT,
         Y,
+        COS,
+        SIN,
         N: tl.constexpr,
         H: tl.constexpr,
         R: tl.constexpr,
         D: tl.constexpr,
         HAS_COUNT: tl.constexpr,
+        HAS_ROTARY: tl.constexpr,
+        ROTARY_BATCHED: tl.constexpr,
         BR: tl.constexpr,
         BD: tl.constexpr,
         BT: tl.constexpr,
@@ -339,6 +386,9 @@ def _no_frame_kernels():
             correction = _mixed_dot(a, v)
             if UNSCALED_COMPLEMENT:
                 correction = -eta * correction
+            if HAS_ROTARY:
+                correction = _rotate(correction, COS, SIN, b, n, channel_tile * BD,
+                                     N, D, ROTARY_BATCHED, True)
             y = eta * c + correction / tl.sqrt(count)
             tl.store(
                 Y + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
@@ -356,11 +406,15 @@ def _no_frame_kernels():
         ETA,
         COUNT,
         DX,
+        COS,
+        SIN,
         N: tl.constexpr,
         H: tl.constexpr,
         R: tl.constexpr,
         D: tl.constexpr,
         HAS_COUNT: tl.constexpr,
+        HAS_ROTARY: tl.constexpr,
+        ROTARY_BATCHED: tl.constexpr,
         BR: tl.constexpr,
         BD: tl.constexpr,
         BT: tl.constexpr,
@@ -390,11 +444,6 @@ def _no_frame_kernels():
         da = _mixed_dot(a, g) * (inv * inv)
         for channel_tile in range(tl.cdiv(D, BD)):
             d = channel_tile * BD + tl.arange(0, BD)
-            c = tl.load(
-                X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
-                (n[:, None] < N) & (d[None, :] < D),
-                0,
-            )
             e = tl.load(
                 E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
                 (n[:, None] < N) & (d[None, :] < D),
@@ -405,16 +454,43 @@ def _no_frame_kernels():
                 (r[:, None] < R) & (d[None, :] < D),
                 0,
             ).to(tl.float32)
-            dq = tl.load(
-                DQ + (s * R + r[:, None]) * D + d[None, :],
-                (r[:, None] < R) & (d[None, :] < D),
-                0,
-            ).to(tl.float32)
-            if UNSCALED_COMPLEMENT:
-                da += (-eta * _mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
+            # Finish E/V before loading C/DQ to limit live rotated operands.
+            if HAS_ROTARY:
+                rotated_e = _rotate(e, COS, SIN, b, n, channel_tile * BD, N, D, ROTARY_BATCHED)
+                direct = _wide_dot(rotated_e, tl.trans(v))
+                if UNSCALED_COMPLEMENT:
+                    direct = -eta * direct
+                c = tl.load(
+                    X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                    (n[:, None] < N) & (d[None, :] < D),
+                    0,
+                )
+                dq = tl.load(
+                    DQ + (s * R + r[:, None]) * D + d[None, :],
+                    (r[:, None] < R) & (d[None, :] < D),
+                    0,
+                ).to(tl.float32)
+                rotated_c = _rotate(c, COS, SIN, b, n, channel_tile * BD, N, D, ROTARY_BATCHED)
+                da += (direct + _wide_dot(rotated_c, tl.trans(dq))) * inv
+                correction = _rotate(_mixed_dot(a, dq), COS, SIN, b, n, channel_tile * BD,
+                                     N, D, ROTARY_BATCHED, True)
+                dc = eta * e.to(tl.float32) + correction * inv
             else:
-                da += (_mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
-            dc = eta * e.to(tl.float32) + _mixed_dot(a, dq) * inv
+                c = tl.load(
+                    X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                    (n[:, None] < N) & (d[None, :] < D),
+                    0,
+                )
+                dq = tl.load(
+                    DQ + (s * R + r[:, None]) * D + d[None, :],
+                    (r[:, None] < R) & (d[None, :] < D),
+                    0,
+                ).to(tl.float32)
+                if UNSCALED_COMPLEMENT:
+                    da += (-eta * _mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
+                else:
+                    da += (_mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
+                dc = eta * e.to(tl.float32) + _mixed_dot(a, dq) * inv
             tl.store(
                 DX + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
                 dc, (n[:, None] < N) & (d[None, :] < D),
@@ -424,19 +500,95 @@ def _no_frame_kernels():
             da, (n[:, None] < N) & (r[None, :] < R),
         )
 
-    return _statistics, _readout, _token_backward
+    @jit
+    def _chunk_statistics(
+        X, E, COUNT, G, Q, DE, COS, SIN,
+        N: tl.constexpr, H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
+        T: tl.constexpr, GRAD: tl.constexpr, HAS_COUNT: tl.constexpr,
+        HAS_ROTARY: tl.constexpr, ROTARY_BATCHED: tl.constexpr,
+        BR: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr,
+    ):
+        # SSD-style chunk accumulation reduces partial-state traffic without
+        # holding a full token chunk in registers. Statistics remain FP32.
+        BK: tl.constexpr = 64
+        s, tile = tl.program_id(0), tl.program_id(1)
+        b, h = s // H, s % H
+        count = tl.load(COUNT + b) if HAS_COUNT else float(N)
+        r = tl.arange(0, BR)
+        gram = tl.zeros((BR, BR), tl.float32)
+        de = tl.full((), 0.0, tl.float32)
+        for channel_tile in range(tl.cdiv(D, BD)):
+            d = channel_tile * BD + tl.arange(0, BD)
+            q_hi = tl.zeros((BR, BD), tl.float32)
+            q_lo = tl.zeros((BR, BD), tl.float32)
+            for step in range(tl.cdiv(BT, BK)):
+                n = tile * BT + step * BK + tl.arange(0, BK)
+                a = tl.load(
+                    X + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
+                    (n[:, None] < N) & (r[None, :] < R), 0,
+                )
+                if not GRAD and channel_tile == 0:
+                    gram = tl.dot(tl.trans(a), a, gram)
+                c = tl.load(
+                    X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
+                    (n[:, None] < N) & (d[None, :] < D), 0,
+                )
+                if GRAD:
+                    value = tl.load(
+                        E + (b * N + n[:, None]) * (H * D) + h * D + d[None, :],
+                        (n[:, None] < N) & (d[None, :] < D), 0,
+                    )
+                    de += tl.sum(tl.sum(value.to(tl.float32) * c.to(tl.float32), 0), 0)
+                else:
+                    value = c
+                if HAS_ROTARY:
+                    rotated = _rotate(value, COS, SIN, b, n, channel_tile * BD,
+                                      N, D, ROTARY_BATCHED)
+                    hi = rotated.to(tl.bfloat16)
+                    lo = (rotated - hi.to(tl.float32)).to(tl.bfloat16)
+                    # Keep the low-word sum separate from the high-word sum.
+                    q_hi = tl.dot(tl.trans(a), hi, q_hi)
+                    q_lo = tl.dot(tl.trans(a), lo, q_lo)
+                else:
+                    q_hi = tl.dot(tl.trans(a), value, q_hi)
+            tl.store(
+                Q + ((s * T + tile) * R + r[:, None]) * D + d[None, :],
+                (q_hi + q_lo) / tl.sqrt(count),
+                (r[:, None] < R) & (d[None, :] < D),
+            )
+        if not GRAD:
+            tl.store(
+                G + ((s * T + tile) * R + r[:, None]) * R + r[None, :],
+                gram / count, (r[:, None] < R) & (r[None, :] < R),
+            )
+        if GRAD:
+            tl.store(DE + s * T + tile, de)
+
+    return _statistics, _readout, _token_backward, _chunk_statistics
 
 
 def _no_frame_block_size(size: int) -> int:
     return max(16, 1 << (size - 1).bit_length())
 
 
-def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None):
+def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None,
+                         rotary_cos=None, rotary_sin=None):
     batch, length, width = projected.shape
     head_dim = (width - heads * rank) // heads
     # Fuse short statistics without a partial reduction. Wide-rank gradient
     # tiles need eight warps to avoid register spills; channel tiles stay <=64.
     token_tile = _no_frame_block_size(length) if length <= 256 else 128
+    # Rotated FP32 content needs more live registers than the BF16-only path.
+    if rotary_cos is not None:
+        token_tile = min(token_tile, 128)
+    kernel = _no_frame_kernels()[0]
+    # Use larger partials only when their grid still supplies two CTAs per SM.
+    if length >= 512:
+        chunk_tiles = (length + 511) // 512
+        multiprocessors = torch.cuda.get_device_properties(projected.device).multi_processor_count
+        if batch * heads * chunk_tiles >= 2 * multiprocessors:
+            token_tile = 512
+            kernel = _no_frame_kernels()[3]
     tiles = (length + token_tile - 1) // token_tile
     options = dict(device=projected.device, dtype=torch.float32)
     cross = torch.empty((batch * heads, tiles, rank, head_dim), **options)
@@ -446,13 +598,15 @@ def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None):
     else:
         gram = cross
         eta_gradient = torch.empty((batch * heads, tiles), **options)
-    _no_frame_kernels()[0][(batch * heads, tiles)](
+    kernel[(batch * heads, tiles)](
         projected,
         gradient,
         counts,
         gram,
         cross,
         eta_gradient,
+        rotary_cos,
+        rotary_sin,
         length,
         heads,
         rank,
@@ -460,6 +614,8 @@ def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None):
         tiles,
         gradient is not None,
         counts is not None,
+        rotary_cos is not None,
+        rotary_cos is not None and rotary_cos.shape[0] > 1,
         _no_frame_block_size(rank),
         min(64, _no_frame_block_size(head_dim)),
         token_tile,
@@ -635,22 +791,24 @@ def _compact_product_kernel():
 
 
 def _compact_product(left, right, *, subtract_eta=None, negative=False,
-                     symmetrize=False, subtract_from=None):
-    # FLA also exposes TF32x3 for FP32 compact products. Keep all storage FP32;
-    # no materialized batch expansion of the shared head map is required.
+                     symmetrize=False, subtract_from=None, out=None):
+    # out is unsaved scratch: right aliasing needs a square left map; left
+    # aliasing needs one full output tile per system. Each CTA reads before storing.
+    # TF32x3 compact products, as in FLA; broadcast the shared head map in-kernel.
     batch_shape = torch.broadcast_shapes(left.shape[:-2], right.shape[:-2])
     shape = (*batch_shape, left.shape[-2], right.shape[-1])
-    if subtract_from is None:
+    if out is not None:
+        output = out
+    elif subtract_from is None:
         output = torch.empty(shape, device=left.device, dtype=torch.float32)
     else:
-        # Only a fresh, unsaved compact adjoint is updated in place.
+        # Subtract the product in place from the fresh compact adjoint.
         if tuple(subtract_from.shape) != shape or not subtract_from.is_contiguous():
             raise ValueError("compact product accumulator must match its contiguous output")
         output = subtract_from
     heads = batch_shape[-1]
     systems = output.numel() // (left.shape[-2] * right.shape[-1])
-    # An odd multiple of 16 uses exact 16-wide inner tiles (not padding
-    # r16/r48 to 32/64). This is the same GEMM algorithm for both modes.
+    # Use 16-wide inner tiles for r16/r48 to avoid padding the rank dimension.
     columns = min(64, _no_frame_block_size(right.shape[-1]))
     if symmetrize and (left.shape[-2] != right.shape[-1] or columns < right.shape[-1]):
         raise ValueError("symmetric compact epilogue requires one complete square tile")
@@ -692,9 +850,7 @@ def _compact_adjoint_kernels():
                             (i[:, None] < R) & (i[None, :] < R), 0)
             product = eta * (value + tl.trans(value))
         else:
-            # Accumulate the two products serially in 16-wide inner tiles.
-            # Keeping both operand pairs and two dot outputs live caused
-            # register spills at r48/r64; no model or precision change.
+            # Accumulate products serially to reduce register pressure at r48/r64.
             k = tl.arange(0, 16)
             product = tl.full((BR, BR), 0, tl.float32)
             for start in range(tl.cdiv(R, 16)):
@@ -720,8 +876,7 @@ def _compact_adjoint_kernels():
 
 
 def _no_frame_compact(gram, cross, base, raw, mode):
-    # reference.py owns the equations. Both modes use T=chol(I+G)^-1
-    # once, then FP32 tensor-core products. No token-sized frame is formed.
+    # Factor I+G once; apply the soft frame through compact products.
     inverse = torch.ops.memsolve_equilibrium.compact_inverse(gram)
     state = _compact_product(inverse, cross)
     eta, eta_derivative = _compact_complement(raw)
@@ -752,40 +907,42 @@ def _no_frame_compact_backward(coefficient, eta, tape, gradient, eta_gradient, m
     kernels[0][(heads,)](map_gradient, eta_gradient, eta_derivative, raw_gradient,
                         rank, _no_frame_block_size(rank), num_warps=4)
     base_gradient = None
+    # u and product are fresh scratch; saved inverse/state/core stay read-only.
     if mode == 2:
-        state_gradient = -eta[None, :, None, None] * u
+        state_gradient = u.mul_(-eta[None, :, None, None])
     else:
         adjoint = _compact_getrs(lu, pivots, map_gradient, transpose=True)
         identity = torch.eye(rank, device=state.device, dtype=torch.float32)
         generator_gradient = -(adjoint @ (mapping + identity).mT)
         del adjoint, identity
-        state_gradient = _compact_product(mapping.mT, u, subtract_eta=eta)
+        state_gradient = _compact_product(mapping.mT, u, subtract_eta=eta, out=u)
         core_gradient = (generator_gradient + generator_gradient.mT) @ core_factor
         base_gradient, _ = _compact_matrix(core_gradient, coordinates, generator_gradient, op=2)
         del core_gradient, generator_gradient
     del u, map_gradient
-    cross_gradient = _compact_product(inverse.mT, state_gradient)
+    cross_gradient = _compact_product(inverse.mT, state_gradient, out=state_gradient)
     del state_gradient
     kernels[1][(batch*heads,)](mapping, product, eta, heads, rank,
                               _no_frame_block_size(rank), mode == 2, num_warps=4, num_stages=1)
-    intermediate = _compact_product(inverse.mT, product)
+    intermediate = _compact_product(inverse.mT, product, out=product)
     del product
-    gram_gradient = _compact_product(intermediate, inverse)
+    gram_gradient = _compact_product(intermediate, inverse, out=intermediate)
     return gram_gradient, cross_gradient, base_gradient, raw_gradient
 
 
-def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel=None):
+def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel=None,
+                      rotary_cos=None, rotary_sin=None):
     from .reference import _ieee_fp32_matmul
 
     heads, rank = base.shape[:2]
     batch, length, width = projected.shape
     head_dim = (width - heads * rank) // heads
     mode = 2 if base.numel() == 0 else 1
-    gram, cross = _no_frame_statistics(projected, heads, rank, counts=counts)
+    gram, cross = _no_frame_statistics(projected, heads, rank, counts=counts,
+                                       rotary_cos=rotary_cos, rotary_sin=rotary_sin)
     if sequence_parallel is not None:
         gram, cross = sequence_parallel.sum_tensors(gram, cross)
-    # All compact operations remain FP32 regardless of the caller's AMP/TF32
-    # policy. No process-wide precision setting is left changed.
+    # Use FP32 compact arithmetic within this autocast/TF32 scope.
     with (
         torch.no_grad(),
         torch.autocast(device_type="cuda", enabled=False),
@@ -795,6 +952,8 @@ def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel
             gram, cross, base, raw, mode
         )
     del gram, cross
+    if not record:
+        tape = ()
     output = torch.empty(
         (batch, length, heads * head_dim),
         device=projected.device,
@@ -806,11 +965,15 @@ def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel
         eta,
         counts,
         output,
+        rotary_cos,
+        rotary_sin,
         length,
         heads,
         rank,
         head_dim,
         counts is not None,
+        rotary_cos is not None,
+        rotary_cos is not None and rotary_cos.shape[0] > 1,
         _no_frame_block_size(rank),
         min(128, _no_frame_block_size(head_dim)),
         128,
@@ -823,12 +986,13 @@ def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel
 
 class _NoFrameMix(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, projected, base, raw, counts, sequence_parallel):
+    def forward(ctx, projected, base, raw, counts, sequence_parallel, rotary_cos, rotary_sin):
         ctx.sequence_parallel = sequence_parallel
         output, saved = _no_frame_forward(
-            projected, base, raw, counts, record=True, sequence_parallel=sequence_parallel
+            projected, base, raw, counts, record=True, sequence_parallel=sequence_parallel,
+            rotary_cos=rotary_cos, rotary_sin=rotary_sin,
         )
-        ctx.save_for_backward(projected, counts, *saved)
+        ctx.save_for_backward(projected, counts, rotary_cos, rotary_sin, *saved)
         ctx.heads, ctx.rank = base.shape[:2]
         return output
 
@@ -837,7 +1001,9 @@ class _NoFrameMix(torch.autograd.Function):
     def backward(ctx, gradient):
         from .reference import _ieee_fp32_matmul
 
-        projected, counts, coefficient, eta, *tape = ctx.saved_tensors
+        projected, counts, rotary_cos, rotary_sin, coefficient, eta, *tape = ctx.saved_tensors
+        # Keep retained graphs intact; otherwise compact tape can die before dX.
+        ctx.maybe_clear_saved_tensors()
         heads, rank = ctx.heads, ctx.rank
         batch, length, width = projected.shape
         head_dim = (width - heads * rank) // heads
@@ -848,6 +1014,8 @@ class _NoFrameMix(torch.autograd.Function):
             rank,
             gradient,
             counts,
+            rotary_cos,
+            rotary_sin,
         )
         sequence_parallel = ctx.sequence_parallel
         if sequence_parallel is not None:
@@ -867,11 +1035,12 @@ class _NoFrameMix(torch.autograd.Function):
             raw_gradient.div_(sequence_parallel.world_size)
             if base_gradient is not None:
                 base_gradient.div_(sequence_parallel.world_size)
-        del coefficient_gradient, eta_gradient
+        del coefficient_gradient, eta_gradient, tape
         projected_gradient = torch.empty_like(projected)
-        # Trade channel width for token reuse at small rank. Wide ranks keep
-        # short token tiles to bound live FP32 adjoints and avoid spills.
-        token_tile, channel_tile = (128, 32) if rank <= 32 else (32, 64)
+        # Narrow channel tiles bound the live FP32 rotation/adjoint operands.
+        token_tile, channel_tile = 128, 32 if rank <= 32 else 16
+        if rotary_cos is not None:
+            token_tile, channel_tile = 128, 16
         _no_frame_kernels()[2][(batch * heads, (length + token_tile - 1) // token_tile)](
             projected,
             gradient,
@@ -881,11 +1050,15 @@ class _NoFrameMix(torch.autograd.Function):
             eta,
             counts,
             projected_gradient,
+            rotary_cos,
+            rotary_sin,
             length,
             heads,
             rank,
             head_dim,
             counts is not None,
+            rotary_cos is not None,
+            rotary_cos is not None and rotary_cos.shape[0] > 1,
             _no_frame_block_size(rank),
             min(channel_tile, _no_frame_block_size(head_dim)),
             token_tile,
@@ -893,17 +1066,17 @@ class _NoFrameMix(torch.autograd.Function):
             num_warps=4,
             num_stages=1,
         )
-        return projected_gradient, base_gradient, raw_gradient, None, None
+        return projected_gradient, base_gradient, raw_gradient, None, None, None, None
 
 
-def _short_no_frame_forward(projected, base, raw, counts):
+def _short_no_frame_forward(projected, base, raw, counts, rotary_cos=None, rotary_sin=None):
     """Use the smaller token system for the cancellation-sensitive base term.
 
     When N <= r, C-A(I+A^T A)^-1 A^T C = (I+A A^T)^-1 C.
     The latter avoids subtracting nearly equal values for a strong relation.
     Only at most r-by-r systems are formed; no explicit soft frame is needed.
     """
-    from .reference import accretive_generator, bounded_complement, _ieee_fp32_matmul
+    from .reference import accretive_generator, bounded_complement, _ieee_fp32_matmul, rotate_content
 
     batch, length, width = projected.shape
     heads, rank = base.shape[:2]
@@ -928,6 +1101,8 @@ def _short_no_frame_forward(projected, base, raw, counts):
         relation = relation.reshape(batch, length, heads, rank).transpose(1, 2)
         relation = relation / normalization.sqrt().view(batch, 1, 1, 1)
         content = content.reshape(batch, length, heads, head_dim).transpose(1, 2)
+        if rotary_cos is not None:
+            content = rotate_content(content, rotary_cos, rotary_sin)
         identity_token = torch.eye(length, device=projected.device, dtype=torch.float32)
         factor_token, _info = torch.linalg.cholesky_ex(
             identity_token + relation @ relation.mT, check_errors=False
@@ -953,6 +1128,8 @@ def _short_no_frame_forward(projected, base, raw, counts):
                 factor.mT, correction, upper=True
             )
             result = result + relation @ coefficient
+        if rotary_cos is not None:
+            result = rotate_content(result, rotary_cos, rotary_sin, inverse=True)
         return (
             result.transpose(1, 2)
             .reshape(batch, length, heads * head_dim)
@@ -962,13 +1139,13 @@ def _short_no_frame_forward(projected, base, raw, counts):
 
 class _ShortNoFrameMix(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, projected, base, raw, counts):
+    def forward(ctx, projected, base, raw, counts, rotary_cos, rotary_sin):
         with torch.enable_grad():
             leaves = [
                 value.detach().requires_grad_(True)
                 for value in (projected, base, raw)
             ]
-            result = _short_no_frame_forward(*leaves, counts)
+            result = _short_no_frame_forward(*leaves, counts, rotary_cos, rotary_sin)
         ctx.save_for_backward(result, *leaves)
         return result.detach()
 
@@ -986,7 +1163,7 @@ class _ShortNoFrameMix(torch.autograd.Function):
             gradients = torch.autograd.grad(
                 result, leaves, gradient, allow_unused=True, retain_graph=True
             )
-        return (*gradients, None)
+        return (*gradients, None, None, None)
 
 
 def _validate_no_frame_inputs(projected, base, raw, counts):
@@ -1041,13 +1218,11 @@ def fast_mix(
     core_base_raw: torch.Tensor,
     eta_raw: torch.Tensor,
     valid_counts: torch.Tensor | None = None,
-    *, sequence_parallel=None,
+    *, sequence_parallel=None, rotary_cos=None, rotary_sin=None,
 ) -> torch.Tensor:
-    """Apply the common no-frame operator; never dispatch to a materialized P.
+    """Apply either mode through compact products without materializing P.
 
-    The only dimension choice is the primal/dual identity for the base term:
-    solve an N-by-N token system when N <= r, otherwise an r-by-r system.
-    Rank, core mode and batch size do not select a different CUDA algorithm.
+    Solve the base term in token space when N <= r, otherwise in rank space.
     """
     if valid_counts is not None and valid_counts.requires_grad:
         raise ValueError("the MemSolve CUDA fast path does not support gradients for valid_counts")
@@ -1055,6 +1230,22 @@ def fast_mix(
     _validate_no_frame_inputs(
         projected, core_base_raw, eta_raw, valid_counts
     )
+    if (rotary_cos is None) != (rotary_sin is None):
+        raise ValueError("rotary_cos and rotary_sin must be supplied together")
+    if rotary_cos is not None:
+        batch, length, width = projected.shape
+        heads, rank = core_base_raw.shape[:2]
+        head_dim = (width - heads * rank) // heads
+        if head_dim % 2:
+            raise ValueError("rotary content requires an even head dimension")
+        for name, table in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
+            if (table.device != projected.device or table.dtype != torch.float32
+                    or not table.is_contiguous() or table.requires_grad):
+                raise ValueError(f"{name} must be non-differentiable contiguous FP32 on the input device")
+            if table.shape not in ((1, length, head_dim // 2), (batch, length, head_dim // 2)):
+                raise ValueError(f"{name} must have shape [1 or B,N,Dhead/2]")
+        if rotary_cos.shape != rotary_sin.shape:
+            raise ValueError("rotary_cos and rotary_sin must share their shape")
     record = torch.is_grad_enabled() and any(
         value.requires_grad
         for value in (projected, core_base_raw, eta_raw)
@@ -1065,7 +1256,9 @@ def fast_mix(
         if valid_counts is None:
             raise ValueError("sequence parallelism requires global valid_counts")
     if sequence_parallel is None and projected.shape[1] <= core_base_raw.shape[1]:
-        return _ShortNoFrameMix.apply(*arguments) if record else _short_no_frame_forward(*arguments)
+        return (_ShortNoFrameMix.apply(*arguments, rotary_cos, rotary_sin) if record
+                else _short_no_frame_forward(*arguments, rotary_cos, rotary_sin))
     if record:
-        return _NoFrameMix.apply(*arguments, sequence_parallel)
-    return _no_frame_forward(*arguments, record=False, sequence_parallel=sequence_parallel)[0]
+        return _NoFrameMix.apply(*arguments, sequence_parallel, rotary_cos, rotary_sin)
+    return _no_frame_forward(*arguments, record=False, sequence_parallel=sequence_parallel,
+                             rotary_cos=rotary_cos, rotary_sin=rotary_sin)[0]

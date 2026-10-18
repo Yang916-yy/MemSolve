@@ -2,7 +2,8 @@
 
 **MemSolve** names the operator, **MemSolve-ViT** the visual family, and
 **MemSolve-BERT** the text model. Python follows the framework's class naming:
-`MemSolveBertConfig`, `MemSolveBertModel` and `MemSolveBertForMaskedLM`.
+`MemSolveBertConfig`, `MemSolveBertModel`, `MemSolveBertForMaskedLM` and
+`MemSolveBertForSequenceClassification`.
 Saved HF configurations use `model_type="memsolve_bert"` and the corresponding
 class name in `architectures`; the MLM and retrieval launchers use
 `experiments/configs/memsolve_bert_{mlm,retrieval}.json`.
@@ -26,7 +27,8 @@ relation frame and token operator remain input-dependent. BERT's attention
 output dense layer becomes an identity, avoiding a duplicate Wo; its residual,
 dropout and LayerNorm remain. `memsolve_core_mode` selects equilibrium (default)
 or complement and is persisted in the HF configuration. There is no Q/K short
-convolution, output RMSNorm or output gate. BERT supplies absolute positions.
+convolution, output RMSNorm or output gate. New models use RoVE-style value
+rotations; `position_embedding_type="absolute"` retains BERT learned positions.
 The default `memsolve_short_conv_kernel=3` adds a centered, depthwise residual
 Conv1d on the mixer input, before the
 relation/content projection: `x_local = x + DWConv1d(x)`. It uses native PyTorch
@@ -35,7 +37,7 @@ with `groups=hidden_size`, stride 1 and padding 1, without an activation.
 Padding is zeroed before and after the convolution; the outer BERT residual
 still uses the original input. The convolution weights and bias initialize to
 zero, making the local transformation an identity at initialization. It preserves
-BERT absolute positions and uses bidirectional rather than causal context.
+the selected position mechanism and uses bidirectional rather than causal context.
 Set `memsolve_short_conv_kernel=0` explicitly for the no-convolution ablation.
 The option and its weights persist in HF checkpoints.
 
@@ -55,14 +57,15 @@ prediction transform (GELU); the encoder FFN is always SwiGLU.
 | Encoder depth / width / heads | 14 / 768 / 12 |
 | MemSolve rank | 32 (initial NLP configuration, not a tuned choice) |
 | FFN | SwiGLU, 2048 per branch, 4096 packed gate/up |
-| Position embedding | BERT learned absolute, 512 positions |
+| Position mechanism | RoVE: full value-head rotation and inverse output rotation |
+| Rotary base / training length / scaling | 10000 / 128 / frequency-only YaRN |
 | Local context | Centered residual depthwise Conv1d, kernel 3, every layer |
 | Vocabulary / token types | 30522 / 2 |
 | Embedding and residual dropout | 0.1 |
 | Attention probability dropout | 0; this operator does not materialize probabilities |
 | BERT LayerNorm epsilon | 1e-12 |
-| Parameters, including tied MLM head | 111,517,154 |
-| Encoder parameters, no MLM head or CLS pooler | 110,894,504 |
+| Parameters, including tied MLM head | 111,123,938 |
+| Encoder parameters, no MLM head or CLS pooler | 110,501,288 |
 
 HF's normal initialization (std 0.02, zero linear biases) applies to the BERT
 scaffold and MemSolve B/C/output projections. After child linear initialization,
@@ -73,19 +76,70 @@ base encoder.
 
 The depth increase approximately matches the BERT-base parameter budget. A
 12-layer MHA encoder with the same SwiGLU width and tied MLM head has 109,526,586
-parameters; this model has 1.82% more. Stock 12-layer BERT with GELU and a tied MLM
+parameters; this model has 1.46% more. Stock 12-layer BERT with GELU and a tied MLM
 head has 109,514,298 parameters. These counts exclude a CLS pooler and NSP head.
 This is a parameter-budget comparison, not an equal-depth operator comparison.
 The 12-layer short convolution pilot used 99,043,530 / 99,080,394 parameters
 without / with convolution; it does not establish the 14-layer model's result.
-The 512-position table does not imply trained long-context ability. The planned
-MLM stage uses length 128, and retrieval fine-tuning uses up to 512 positions.
+The completed formal MLM checkpoint uses learned absolute positions and has
+111,517,154 parameters (110,894,504 without its MLM head). Loading that checkpoint
+retains its saved `position_embedding_type="absolute"`; it does not become a
+RoVE model. The new recipe keeps the same 14 layers, SwiGLU, centered kernel-3
+convolution and training budget, removing only the learned position table.
+
+### Rotary positions and length extension
+
+RoVE is a configuration-time option. Use `position_embedding_type="rove"` to
+enable it, `"none"` to disable it without adding a position table, or
+`"absolute"` for the learned BERT position table used by completed MLM/GLUE
+experiments. The `rove`/`none` pair has identical parameter counts; centered
+short convolution is controlled independently. At the standalone operator
+boundary the switch is `MemSolveConfig(rotary=True/False)`.
+`memsolve_rotary_scaling="none"` only disables YaRN interpolation, not RoVE.
+The selected mode is saved in the checkpoint; changing it is an explicit
+architecture ablation, not a per-batch inference toggle.
+
+`position_embedding_type="rove"` uses the full per-head content dimension.
+It rotates values before compact aggregation and inversely rotates the complete
+global correction before the output projection. The local content term is
+unchanged. The shared relation frame and compact core are not rotated.
+This follows the value/output pathway in [RoVE, Eq. 3](https://arxiv.org/html/2606.11275v1#S3)
+and its [official implementation](https://github.com/AGarciaCast/RoVE/blob/8e3eb84efb7c920289aba776fbdb189f93b79e01/model/pos_methods/rove.py#L25);
+it is an adaptation to MemSolve, not a claim that RoVE validated this operator.
+
+The HF configuration exposes `memsolve_rotary_base=10000.0`,
+`memsolve_rotary_train_length=128`, and `memsolve_rotary_scaling="yarn"`
+(`"none"` disables scaling). Frequency-only YaRN uses the official evaluator's
+`beta_fast=32`, `beta_slow=1`: high frequencies stay fixed and low frequencies
+are interpolated, with a blend between them. MemSolve has no softmax and applies
+no softmax temperature or amplitude multiplier. See the
+[upstream evaluation helper](https://github.com/AGarciaCast/RoVE/blob/8e3eb84efb7c920289aba776fbdb189f93b79e01/eval/_eval_utils.py#L30).
+
+Scaling uses each example's span from its first valid token to its last valid
+token, relative to the configured training length, not the largest position ID.
+With no padding mask, the span is the sequence length. Explicit `position_ids`
+produce one pair of cos/sin tables per BERT forward. The tables, padding mask,
+and CUDA valid counts are passed through every layer and gradient-checkpoint
+replay, following [HF Llama's shared position-embedding organization](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py).
+They are not cached across forward calls or optimizer steps; shifting all
+positions by a constant leaves relative rotations unchanged. Padding remains
+excluded from the operator and does not change another example's frequency
+scale. Use matched truncation and position policies in comparisons.
+For a fixed scale across a chosen longer window, the standalone core API accepts
+an explicit `rotary_context_length`; the BERT wrapper uses the automatic mask span.
+
+RoVE models have no learned position table or fixed-length position/token-type
+buffers. `max_position_embeddings` remains an HF configuration field but is not
+a capacity limit for this mode. Experiment manifests report `position_capacity`
+as `null`; requested lengths are still bounded by available resources and are
+truncated explicitly by the evaluation pipeline. The 128-token MLM recipe and
+frequency interpolation alone do not establish long-context task performance.
 
 ## Implementation provenance
 
 | Component | Implementation and adaptation |
 | --- | --- |
-| Tokenizer and embeddings | HF BERT WordPiece tokenizer and `BertEmbeddings`; learned absolute/token-type embeddings |
+| Tokenizer and embeddings | HF BERT WordPiece and `BertEmbeddings`; token/token-type embeddings, with learned positions only in explicit absolute mode |
 | Residuals, dropout and LayerNorm | HF BERT output modules and PyTorch LayerNorm, including BERT's epsilon; mixer output dense is removed because MemSolve owns its output projection |
 | Centered local convolution | Native PyTorch `nn.Conv1d(groups=hidden_size)`; our residual wiring, zero initialization and padding masks |
 | SwiGLU | Thin packed `nn.Linear` + `F.silu` wrapper following the Phi3 layout; HF BERT owns the down projection and residual; no dedicated fused SwiGLU kernel |
@@ -336,7 +390,8 @@ reproduction: sequence length is set by prepared data (128 in the C4 command),
 global batch 4096, 70,000 optimizer updates, seed 17, training mask probability
 30%, peak LR 8e-4, 6% warmup and a linear decay to 2% of peak LR. The official
 [LION recipe](https://github.com/LIONS-EPFL/LION/blob/32a0136431dea54a634394df756365919635fe9d/Masked_Language_Modeling/yamls/pretrain/lion-lit-base.yaml)
-motivates these settings. The measured two-A800 configuration uses microbatch 512 per GPU and four
+motivates these settings. The completed absolute-position run's measured
+two-A800 configuration uses microbatch 512 per GPU and four
 accumulation steps, with eight persistent loader workers per rank and prefetch
 factor two. Change microbatch and accumulation together to preserve global 4096. HF Trainer handles DDP, BF16 AMP, fused AdamW, scheduling and resume.
 Parameters stay FP32, including evaluation. The entrypoint uses `compile-graph` for model/loss forward and backward,
@@ -346,7 +401,8 @@ The full schedule targets 286,720,000 sequence presentations, or 36.70 billion
 tensor token slots at length 128. These are not unique documents or non-padding
 tokens. The complete 70,000-step recipe is retained; measure real-data step time,
 validation cost, peak memory and I/O before starting it. A CPU preflight is not a
-CUDA throughput measurement. No formal C4 pretraining result is available yet.
+CUDA throughput measurement. The completed formal run used absolute positions;
+no formal C4 pretraining result is available for the new RoVE recipe yet.
 
 ### Compiled CUDA Graph execution
 
@@ -375,7 +431,10 @@ resume and checkpoint weights are loaded in place; graph objects are not saved
 in HF checkpoints.
 
 Training IDs, masks, token types and labels must retain the captured CUDA int64
-shape. A partial training microbatch is rejected rather than silently padded,
+shape. Explicit `position_ids` can also be captured as a `[batch, length]`
+int64 tensor; their values and the per-example masks may change between replays.
+The usual C4 pipeline omits them and generates consecutive positions in the graph.
+A partial training microbatch is rejected rather than silently padded,
 dropped or switched to eager. The full local C4 source exceeds this run's sample
 budget. Do not combine this execution mode with Trainer's separate
 `torch_compile`, gradient checkpointing, full-parameter BF16 casts or changes to
@@ -439,11 +498,12 @@ Different tokenizers do not produce comparable token-level NLL on these labels.
 `--init-checkpoint` loads MLM weights into a new stage with a fresh optimizer and
 schedule. It differs from exact-run `--resume`; changing the stage also requires
 its original initialization path when later resuming that stage. Model geometry
-must match. For 128-to-512 training the existing 512-position table suffices, but
-prepare the new sequence length explicitly and set that stage's own budget and
-microbatch. No position interpolation or unapproved continuation budget is
-inserted. Retrieval fine-tuning at length 512 can also train those positions;
-neither route establishes extrapolation beyond the learned table.
+must match, including the position mechanism. For the completed absolute-position
+checkpoint, its 512-position table permits 128-to-512 continuation without
+resizing. A RoVE checkpoint instead follows its saved frequency-scaling policy.
+Prepare the new sequence length explicitly and set that stage's own budget and
+microbatch; neither path inserts a continuation stage automatically. Loading an
+absolute checkpoint with the new RoVE recipe is rejected as a geometry mismatch.
 
 LION/Hydra checkpoints using their original model classes or Composer containers
 are not directly HF-loadable. Their original loaders or a separately verified
@@ -509,13 +569,13 @@ LongEmbed selects SummScreenFD, QMSum, WikimQA and NarrativeQA retrieval. It doe
 not include the synthetic passkey/needle tasks. Dataset revisions and actual
 evaluation splits are saved, including SummScreenFD's validation split.
 
-The current 512-position model evaluates long documents **with truncation to
-512**, not with native full-document context. Larger requested lengths fail
-unless the loaded checkpoint already has the position capacity. Position
-extension and longer-sequence training remain separate model/experiment work;
-the script neither resizes positions nor hides chunking. A model trained only
-at 128 tokens has not established competence at 512 or longer simply because
-the position table exists. Compare baselines with matched length policies.
+The completed absolute-position checkpoint evaluates long documents **with
+truncation to 512**; larger requested lengths fail against its learned table.
+RoVE checkpoints can request longer input lengths and apply their saved scaling
+policy, without resizing a table. Both modes truncate to the requested
+`--max-length` and do not add chunking. A model trained only at 128 tokens has
+not established competence at 512 or longer simply because the forward is
+defined. Compare baselines with matched length and padding policies.
 Ettin's long-context benchmark is **MLDR**, not LongEmbed; the latter is our
 separate evaluation choice. The two scores are not interchangeable.
 
@@ -532,3 +592,80 @@ Sentence Transformers retrieval scoring. For CPU fixtures pass
 OMP_NUM_THREADS=2 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
   /cywang/ridgon-nlp-venv/bin/python -m pytest -q tests/experiments/test_nlp.py
 ```
+
+## GLUE: LION M2-BASE fine-tuning
+
+`MemSolveBertForSequenceClassification` reuses the Hugging Face BERT CLS pooler
+(dense + tanh), dropout and classifier. It uses cross-entropy for classification
+and MSE for STS-B. All encoder weights transfer from MLM; the absent pooler and
+label head are initialized with BERT's initializer. For MNLI transfer, the trained
+pooler is retained and the task classifier is reset.
+
+The recipe in `experiments/configs/memsolve_bert_glue.json` follows
+[LION Appendix C.5, Table 8, M2-BASE](https://arxiv.org/html/2502.16249v2#S0.T8).
+Batch sizes, evaluation intervals, sequential sampling, no dropped final batch,
+optimizer betas `(0.9, 0.98)` and epsilon `1e-6` follow the
+[public GLUE jobs](https://github.com/LIONS-EPFL/LION/blob/32a0136431dea54a634394df756365919635fe9d/Masked_Language_Modeling/src/glue/finetuning_jobs.py).
+The current upstream YAML selects a different recipe; this config deliberately
+implements the paper's M2-BASE column. All tasks use length 128, 6% step warmup,
+linear decay to zero, BF16 autocast with FP32 parameters, and no gradient clipping.
+
+| Task | Initial weights | Epochs | Batch | Peak LR | Published WD | WD convention |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| MNLI | MLM | 3 | 48 | 5e-5 | 5e-6 | Composer |
+| QNLI | MLM | 10 | 16 | 5e-5 | 1e-5 | Composer |
+| QQP | MLM | 5 | 16 | 3e-5 | 3e-6 | Composer |
+| RTE | MNLI final | 3 | 16 | 1e-5 | 1e-6 | Composer |
+| SST-2 | MLM | 3 | 16 | 3e-5 | 3e-6 | Composer |
+| MRPC | MNLI final | 10 | 32 | 8e-5 | 8e-5 | Composer |
+| CoLA | MLM | 10 | 32 | 8e-5 | 5e-6 | Composer |
+| STS-B | MNLI final | 10 | 32 | 8e-5 | 3e-6 | PyTorch |
+
+[Composer DecoupledAdamW](https://github.com/mosaicml/composer/blob/v0.17.2/composer/optim/decoupled_weight_decay.py)
+multiplies parameters by `1 - wd * lr_t / peak_lr`. PyTorch AdamW uses
+`1 - wd * lr_t`; therefore the runner divides Composer WD by peak LR and uses
+fused PyTorch AdamW. STS-B's plain AdamW WD is unchanged. All parameters receive
+weight decay, matching upstream `create_param_groups(None, model)`. The optimizer
+port has equivalent decay algebra; it does not promise bitwise Composer results.
+Trainer owns scheduling, evaluation, saving and resuming.
+
+Prepare the pinned `nyu-mll/glue` Parquet train/dev splits using the checkpoint's
+own tokenizer. Test labels are hidden and are not downloaded or used:
+
+```bash
+python -m experiments.train_glue --prepare-only \
+  --checkpoint /path/to/mlm/final --data /path/to/glue-128
+CUDA_VISIBLE_DEVICES=0 python -m experiments.train_glue --task mnli \
+  --checkpoint /path/to/mlm/final --data /path/to/glue-128 \
+  --output /path/to/glue/mnli
+CUDA_VISIBLE_DEVICES=1 python -m experiments.train_glue --task sst2 \
+  --checkpoint /path/to/mlm/final --data /path/to/glue-128 \
+  --output /path/to/glue/sst2
+# After MNLI completes:
+CUDA_VISIBLE_DEVICES=0 python -m experiments.train_glue --task rte \
+  --checkpoint /path/to/glue/mnli/final --data /path/to/glue-128 \
+  --output /path/to/glue/rte
+```
+
+Use one process/GPU/task. The default runs the native CUDA mixer with an eager
+BERT scaffold. Optional `--compile` uses Inductor's reduce-overhead mode on the
+BERT scaffold and retains the native MemSolve mixer. Partial final batches are
+kept and may require an additional compiled shape. This is not the fixed-shape,
+whole-forward/backward graph used by the MLM launcher. On a fixed pretrained
+MNLI batch with dropout disabled, compilation changed representative gradients
+by 1.36–4.28% relative L2 (loss difference 0.00049). This is not a demonstrated
+accuracy regression, but the initial GLUE suite leaves compilation disabled
+to avoid adding that numerical variable. `--max-steps` is only a
+smoke-test override and is recorded in `results.json`; formal runs omit it.
+Resume with `--resume /path/to/glue/task/checkpoint-N` using the same recipe,
+source and output directory. Persistent loaders default to two workers.
+
+The runner exports the final checkpoint and final validation scores, as upstream
+GLUE jobs do, rather than selecting a different checkpoint for each metric.
+MNLI matched/mismatched accuracies are separate; MRPC/QQP include accuracy and
+binary F1; STS-B includes Pearson and Spearman; CoLA uses Matthews correlation.
+Scores are fractions. Metrics use scikit-learn/SciPy, the same definitions used
+by the HF GLUE metric. LION's source reports MRPC F1 and STS-B Spearman, so do not
+replace them with accuracy/Pearson when comparing its table. The first run is
+seed 19 only: compare per-task validation results provisionally and report seed
+count explicitly; it is not a multi-seed mean or an official GLUE test submission.

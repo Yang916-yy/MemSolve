@@ -1,8 +1,7 @@
 """Data contracts shared by the GenomicBenchmarks and LRA runners.
 
-This module owns tokenization, immutable source metadata, deterministic
-validation partitions, and variable-length collation.  It deliberately does
-not contain model mathematics or training policy.
+Tokenization, source metadata, deterministic validation splits, and
+variable-length collation.
 """
 
 from __future__ import annotations

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 
 
 class CoreMode(str, Enum):
@@ -22,12 +23,17 @@ class MemSolveConfig:
     bias: bool = False
     skew_coupling: bool = True
     scalar_complement: bool = True
+    rotary: bool = False
+    rotary_base: float = 10000.0
+    rotary_train_length: int = 128
+    rotary_scaling: str = "yarn"
 
     def __post_init__(self) -> None:
         for name, value in (
             ("dim", self.dim),
             ("num_heads", self.num_heads),
             ("rank", self.rank),
+            ("rotary_train_length", self.rotary_train_length),
         ):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(
@@ -46,7 +52,7 @@ class MemSolveConfig:
         if not isinstance(self.bias, bool):
             raise TypeError(f"bias must be a bool, got {type(self.bias).__name__}")
 
-        for name in ("skew_coupling", "scalar_complement"):
+        for name in ("skew_coupling", "scalar_complement", "rotary"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
 
@@ -56,6 +62,17 @@ class MemSolveConfig:
             raise ValueError(
                 f"dim={self.dim} must be divisible by num_heads={self.num_heads}"
             )
+        if self.rotary_train_length <= 0:
+            raise ValueError("rotary_train_length must be positive")
+        if (not isinstance(self.rotary_base, (int, float))
+                or isinstance(self.rotary_base, bool)):
+            raise TypeError("rotary_base must be a real number")
+        if not math.isfinite(self.rotary_base) or self.rotary_base <= 1:
+            raise ValueError("rotary_base must be finite and greater than one")
+        if self.rotary_scaling not in ("none", "yarn"):
+            raise ValueError("rotary_scaling must be 'none' or 'yarn'")
+        if self.rotary and self.head_dim % 2:
+            raise ValueError("rotary requires an even head_dim")
 
     @property
     def head_dim(self) -> int:

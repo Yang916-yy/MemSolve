@@ -34,6 +34,7 @@ def _reference_fast_mix(
     core_base_raw: torch.Tensor,
     eta_raw: torch.Tensor,
     valid_counts: torch.Tensor | None = None,
+    *, rotary_cos: torch.Tensor | None = None, rotary_sin: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compose the FP64 reference oracle for the strict CUDA ABI."""
 
@@ -60,7 +61,12 @@ def _reference_fast_mix(
     content = content.view(batch, length, heads, head_dim).transpose(1, 2)
     relation = relation / counts.sqrt().view(batch, 1, 1, 1)
     frame = qr_soft_frame(relation)
-    compact_state = frame.mT @ content
+    if rotary_cos is None:
+        compact_state = frame.mT @ content
+    else:
+        from memsolve.ball.reference import rotate_content
+        rotary_cos, rotary_sin = rotary_cos.double(), rotary_sin.double()
+        compact_state = frame.mT @ rotate_content(content, rotary_cos, rotary_sin)
     if core_base_raw.numel() == 0:
         generator = None
     else:
@@ -71,6 +77,7 @@ def _reference_fast_mix(
         compact_state,
         content,
         bounded_complement(eta_raw),
+        **({"rotary_cos": rotary_cos, "rotary_sin": rotary_sin} if rotary_cos is not None else {}),
     ).transpose(1, 2).contiguous().view(batch, length, dim)
 
 
@@ -429,7 +436,10 @@ def test_cuda_dispatch_passes_the_strict_fast_path_abi(
         core_base_raw: torch.Tensor,
         eta_raw: torch.Tensor,
         valid_counts: torch.Tensor | None,
+        *, sequence_parallel=None, rotary_cos=None, rotary_sin=None,
     ) -> torch.Tensor:
+        assert sequence_parallel is None
+        assert rotary_cos is rotary_sin is None
         captured["projected"] = projected
         captured["core_base_raw"] = core_base_raw
         captured["eta_raw"] = eta_raw
@@ -481,7 +491,10 @@ def test_cuda_dispatch_packs_masked_batch_specific_inputs(
         core_base_raw: torch.Tensor,
         eta_raw: torch.Tensor,
         valid_counts: torch.Tensor | None,
+        *, sequence_parallel=None, rotary_cos=None, rotary_sin=None,
     ) -> torch.Tensor:
+        assert sequence_parallel is None
+        assert rotary_cos is rotary_sin is None
         del core_base_raw, eta_raw
         captured["projected"] = projected
         captured["valid_counts"] = valid_counts
@@ -1656,3 +1669,294 @@ def test_projection_mask_epilogue_matches_unfused_forward_and_vjp(dtype, bias):
         _assert_mixed_close(actual, expected, limit=5e-3)
     assert torch.count_nonzero(records[1][0][~mask]) == 0
     assert torch.count_nonzero(records[1][1][~mask]) == 0
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("length", [7, 129])
+def test_rove_fast_mix_matches_fp64_forward_and_gradients(mode, rank, length):
+    """Both core modes share a rotary write/read path, including short tokens."""
+    _require_native_cuda()
+    torch.manual_seed(277 + rank + length)
+    batch, heads, head_dim = 2, 2, 64
+    valid = torch.rand(batch, length, device="cuda") > .2
+    valid[1] = False
+    projected = (torch.randn(batch, length, heads * (rank + head_dim), device="cuda",
+                            dtype=torch.bfloat16) * valid[..., None]).requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.COMPLEMENT else rank,
+                        device="cuda") * .1).requires_grad_()
+    raw = torch.tensor([.8, 1.4], device="cuda", requires_grad=True)
+    counts = valid.sum(-1, dtype=torch.float32).clamp_min_(1)
+    positions = torch.arange(length, device="cuda")[None] + torch.tensor([[0], [321]], device="cuda")
+    frequencies = 10000. ** (-torch.arange(0, head_dim, 2, device="cuda") / head_dim)
+    phases = positions[..., None] * frequencies
+    cosine, sine = phases.cos().contiguous(), phases.sin().contiguous()
+    actual = cuda.fast_mix(projected, base, raw, counts, rotary_cos=cosine, rotary_sin=sine)
+    oracle_inputs = tuple(t.detach().double().requires_grad_() for t in (projected, base, raw))
+    expected = _reference_fast_mix(*oracle_inputs, counts, rotary_cos=cosine, rotary_sin=sine)
+    upstream = torch.randn_like(actual) * valid[..., None]
+    gradients = torch.autograd.grad(actual, (projected, base, raw), upstream, allow_unused=True)
+    expected_gradients = torch.autograd.grad(expected, oracle_inputs, upstream.double(), allow_unused=True)
+    _assert_mixed_close(actual, expected, limit=5e-3)
+    for index, (got, want) in enumerate(zip(gradients, expected_gradients)):
+        if want is not None:
+            _assert_mixed_close(got, want, limit=5e-3 if index == 0 else 5e-4)
+    assert torch.count_nonzero(actual[~valid]) == 0
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rank,head_dim", [(16, 18), (48, 70)])
+def test_rove_channel_tile_tails_match_fp64(mode, rank, head_dim):
+    _require_native_cuda()
+    torch.manual_seed(312)
+    heads, length = 2, 197
+    projected = torch.randn(1, length, heads * (rank + head_dim), device="cuda",
+                            dtype=torch.bfloat16).requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.COMPLEMENT else rank,
+                        device="cuda") * .1).requires_grad_()
+    raw = torch.ones(heads, device="cuda", requires_grad=True)
+    phase = torch.arange(length, device="cuda")[:, None] * 10000. ** (
+        -torch.arange(0, head_dim, 2, device="cuda") / head_dim)
+    cosine, sine = phase.cos()[None].contiguous(), phase.sin()[None].contiguous()
+    inputs = (projected, base, raw)
+    oracle = tuple(t.detach().double().requires_grad_() for t in inputs)
+    actual = cuda.fast_mix(*inputs, rotary_cos=cosine, rotary_sin=sine)
+    expected = _reference_fast_mix(*oracle, rotary_cos=cosine, rotary_sin=sine)
+    upstream = torch.randn_like(actual)
+    grads = torch.autograd.grad(actual, inputs, upstream, allow_unused=True)
+    expected_grads = torch.autograd.grad(expected, oracle, upstream.double(), allow_unused=True)
+    _assert_mixed_close(actual, expected, limit=5e-3)
+    for got, want in zip(grads, expected_grads):
+        if want is not None:
+            _assert_mixed_close(got, want, limit=5e-3)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("scale", [8., 32.])
+def test_rove_short_strong_relation_keeps_stable_residual(mode, scale):
+    _require_native_cuda()
+    torch.manual_seed(509)
+    batch, length, heads, rank, head_dim = 2, 7, 2, 32, 32
+    projected = torch.randn(batch, length, heads * (rank + head_dim), device="cuda", dtype=torch.bfloat16)
+    projected[..., :heads * rank] *= scale
+    projected.requires_grad_()
+    base = torch.zeros(heads, rank, 0 if mode is CoreMode.COMPLEMENT else rank, device="cuda", requires_grad=True)
+    raw = torch.ones(heads, device="cuda", requires_grad=True)
+    phase = torch.arange(length, device="cuda")[:, None] * torch.linspace(.01, 1., head_dim // 2, device="cuda")
+    cosine, sine = phase.cos()[None].contiguous(), phase.sin()[None].contiguous()
+    inputs = (projected, base, raw)
+    actual = cuda.fast_mix(*inputs, rotary_cos=cosine, rotary_sin=sine)
+    oracle_inputs = tuple(t.detach().double().requires_grad_() for t in inputs)
+    expected = _reference_fast_mix(*oracle_inputs, rotary_cos=cosine, rotary_sin=sine)
+    upstream = torch.randn_like(actual)
+    gradients = torch.autograd.grad(actual, inputs, upstream, allow_unused=True)
+    expected_gradients = torch.autograd.grad(expected, oracle_inputs, upstream.double(), allow_unused=True)
+    _assert_mixed_close(actual, expected, limit=5e-3)
+    for got, want in zip(gradients, expected_gradients):
+        if want is not None:
+            _assert_mixed_close(got, want, limit=5e-3)
+
+
+@pytest.mark.parametrize("mode,length", [(CoreMode.EQUILIBRIUM, 129), (CoreMode.COMPLEMENT, 7)])
+def test_rove_cuda_graph_replays_updated_tables_and_inputs(mode, length):
+    _require_native_cuda()
+    torch.manual_seed(731)
+    heads, rank, head_dim = 2, 32, 32
+    projected = torch.randn(2, length, heads * (rank + head_dim), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.COMPLEMENT else rank, device="cuda") * .1).requires_grad_()
+    raw = torch.ones(heads, device="cuda", requires_grad=True)
+    phase = torch.arange(length, device="cuda")[:, None] * torch.linspace(.01, 1., head_dim // 2, device="cuda")
+    cosine, sine = phase.cos()[None].contiguous(), phase.sin()[None].contiguous()
+    arguments = (projected, base, raw)
+    upstream = torch.randn(2, length, heads * head_dim, device="cuda", dtype=torch.bfloat16)
+    def step():
+        output = cuda.fast_mix(*arguments, rotary_cos=cosine, rotary_sin=sine)
+        gradients = torch.autograd.grad(output, arguments, upstream, allow_unused=True)
+        return output, gradients
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual, gradients = step()
+        with torch.no_grad():
+            projected.add_(.01)
+            cosine.copy_((phase + .37).cos()[None])
+            sine.copy_((phase + .37).sin()[None])
+        expected, expected_gradients = step()
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for got, want in zip(gradients, expected_gradients):
+            if want is not None:
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+def test_rove_cuda_table_boundary_is_explicit():
+    _require_native_cuda()
+    projected = torch.randn(2, 17, 2 * (16 + 32), device="cuda", dtype=torch.bfloat16)
+    base, raw = torch.zeros(2, 16, 16, device="cuda"), torch.ones(2, device="cuda")
+    cosine = torch.ones(1, 17, 16, device="cuda")
+    sine = torch.zeros_like(cosine)
+    with pytest.raises(ValueError, match="supplied together"):
+        cuda.fast_mix(projected, base, raw, rotary_cos=cosine)
+    with pytest.raises(ValueError, match="FP32"):
+        cuda.fast_mix(projected, base, raw, rotary_cos=cosine.bfloat16(), rotary_sin=sine.bfloat16())
+    with pytest.raises(ValueError, match="non-differentiable"):
+        cuda.fast_mix(projected, base, raw, rotary_cos=cosine.requires_grad_(), rotary_sin=sine)
+    with pytest.raises(ValueError, match="shape"):
+        cuda.fast_mix(projected, base, raw, rotary_cos=cosine.detach()[:, :-1], rotary_sin=sine[:, :-1])
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("length", [7, 129])
+def test_rove_zero_angles_reproduce_native_output_and_gradients(mode, length):
+    _require_native_cuda()
+    torch.manual_seed(913)
+    heads, rank, head_dim = 2, 32, 32
+    projected = torch.randn(2, length, heads * (rank + head_dim), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.COMPLEMENT else rank, device="cuda") * .1).requires_grad_()
+    raw = torch.ones(heads, device="cuda", requires_grad=True)
+    cosine = torch.ones(1, length, head_dim // 2, device="cuda")
+    sine = torch.zeros_like(cosine)
+    inputs = (projected, base, raw)
+    expected = cuda.fast_mix(*inputs)
+    actual = cuda.fast_mix(*inputs, rotary_cos=cosine, rotary_sin=sine)
+    upstream = torch.randn_like(actual)
+    gradients = torch.autograd.grad(actual, inputs, upstream, allow_unused=True)
+    expected_gradients = torch.autograd.grad(expected, inputs, upstream, allow_unused=True)
+    # The fused FP32 pair arithmetic can cross a BF16 rounding boundary;
+    # identity tables must remain much closer than the ordinary 0.5% contract.
+    _assert_mixed_close(actual, expected, limit=5e-5)
+    for index, (got, want) in enumerate(zip(gradients, expected_gradients)):
+        if want is not None:
+            _assert_mixed_close(got, want, limit=1e-4 if index == 0 else 5e-6)
+    with torch.no_grad():
+        inference = cuda.fast_mix(*inputs, rotary_cos=cosine, rotary_sin=sine)
+    torch.testing.assert_close(inference, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_projection_masks_sanitize_nan_and_preserve_gradient_dtypes(dtype):
+    from memsolve.ball.reference import tensor_core_linear
+    _require_native_cuda()
+    torch.manual_seed(811)
+    mask = torch.tensor([[True, False, True], [False, True, True]], device="cuda")
+    value = torch.randn(2, 3, 17, device="cuda", dtype=dtype)
+    value[~mask] = float("nan")
+    weight = torch.randn(19, 17, device="cuda")
+    bias = torch.randn(19, device="cuda")
+    gradient = torch.randn(2, 3, 19, device="cuda", dtype=dtype)
+    gradient[~mask] = float("nan")
+    results = []
+    for fused_mask in (False, True):
+        x, w, b = [t.detach().clone().requires_grad_() for t in (value, weight, bias)]
+        projected = tensor_core_linear(
+            x if fused_mask else x.masked_fill(~mask[..., None], 0), w, b,
+            output_dtype=dtype, output_mask=mask,
+            input_mask=mask if fused_mask else None, fuse_weight_bias_grad=True,
+        )
+        gradients = torch.autograd.grad(projected, (x, w, b), gradient)
+        assert torch.isfinite(projected).all()
+        assert all(torch.isfinite(g).all() for g in gradients)
+        assert torch.count_nonzero(projected[~mask]) == 0
+        assert torch.count_nonzero(gradients[0][~mask]) == 0
+        assert gradients[0].dtype == dtype
+        assert gradients[1].dtype == gradients[2].dtype == torch.float32
+        results.append((projected, *gradients))
+    for fused, separate in zip(results[1], results[0]):
+        torch.testing.assert_close(fused, separate, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rank,head_dim", [(16, 18), (32, 64), (48, 70), (64, 64)])
+@pytest.mark.parametrize("rotary", [False, True])
+def test_long_chunk_statistics_match_fp64_forward_and_gradients(mode, rank, head_dim, rotary):
+    """Chunk tails, sparse masks and batched RoVE preserve the operator VJP."""
+    _require_native_cuda()
+    torch.manual_seed(391 + rank)
+    heads, length = 2, 1025
+    multiprocessors = torch.cuda.get_device_properties("cuda").multi_processor_count
+    batch = (2 * multiprocessors + 3 * heads - 1) // (3 * heads)
+    valid = torch.rand(batch, length, device="cuda") > .2
+    valid[0] = False
+    valid[1] = torch.arange(length, device="cuda") % 31 == 0
+    projected = (torch.randn(batch, length, heads * (rank + head_dim), device="cuda",
+                            dtype=torch.bfloat16) * valid[..., None]).requires_grad_()
+    base = (torch.randn(heads, rank, 0 if mode is CoreMode.COMPLEMENT else rank,
+                        device="cuda") * .1).requires_grad_()
+    raw = torch.tensor([.8, 1.4], device="cuda", requires_grad=True)
+    counts = valid.sum(-1, dtype=torch.float32).clamp_min_(1)
+    positions = torch.arange(length, device="cuda")[None] + 321 * torch.arange(batch, device="cuda")[:, None]
+    frequencies = 10000. ** (-torch.arange(0, head_dim, 2, device="cuda") / head_dim)
+    phases = positions[..., None] * frequencies
+    factors = dict(rotary_cos=phases.cos().contiguous(), rotary_sin=phases.sin().contiguous()) if rotary else {}
+    inputs = projected, base, raw
+    actual = cuda.fast_mix(*inputs, counts, **factors)
+    oracle = tuple(t.detach().double().requires_grad_() for t in inputs)
+    expected = _reference_fast_mix(*oracle, counts, **factors)
+    upstream = torch.randn_like(actual) * valid[..., None]
+    gradients = torch.autograd.grad(actual, inputs, upstream, allow_unused=True)
+    expected_gradients = torch.autograd.grad(expected, oracle, upstream.double(), allow_unused=True)
+    _assert_mixed_close(actual, expected, limit=5e-3)
+    for index, (got, want) in enumerate(zip(gradients, expected_gradients)):
+        if want is not None:
+            _assert_mixed_close(got, want, limit=5e-3 if index == 0 else 5e-4)
+    assert torch.count_nonzero(actual[~valid]) == 0
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("columns", [17, 65, 129])
+def test_compact_product_reuses_only_owned_scratch(rank, columns):
+    _require_native_cuda()
+    torch.manual_seed(472 + rank + columns)
+    left = torch.randn(2, rank, rank, device="cuda") * .1
+    right = torch.randn(3, 2, rank, columns, device="cuda")
+    eta = torch.randn(2, device="cuda")
+    expected = cuda._compact_product(left.mT, right, subtract_eta=eta)
+    saved_left = left.clone()
+    scratch = right.clone()
+    actual = cuda._compact_product(left.mT, scratch, subtract_eta=eta, out=scratch)
+    assert actual.data_ptr() == scratch.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(left, saved_left, rtol=0, atol=0)
+    # A square output has one CTA per system, so the left scratch can be reused.
+    inverse = torch.randn(3, 2, rank, rank, device="cuda") * .1
+    intermediate = torch.randn_like(inverse)
+    expected = cuda._compact_product(intermediate, inverse)
+    actual = cuda._compact_product(intermediate, inverse, out=intermediate)
+    assert actual.data_ptr() == intermediate.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rotary", [False, True])
+def test_cuda_lifetimes_preserve_repeated_backward_and_parameters(mode, rotary):
+    _require_native_cuda()
+    torch.manual_seed(483)
+    model = MemSolve(MemSolveConfig(140, 2, rank=48, bias=True,
+                                   core_mode=mode, rotary=rotary)).cuda()
+    if model.core_base_raw is not None:
+        with torch.no_grad():
+            model.core_base_raw.normal_(std=.1)
+    value = torch.randn(3, 197, 140, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mask = torch.rand(3, 197, device="cuda") > .2
+    mask[1] = False
+    output = model(value, mask, implementation="cuda")
+    upstream = torch.randn_like(output)
+    inputs = (value, *model.parameters())
+    snapshots = [v.detach().clone() for v in inputs]
+    versions = [v._version for v in inputs]
+    first = torch.autograd.grad(output, inputs, upstream, retain_graph=True)
+    second = torch.autograd.grad(output, inputs, upstream, retain_graph=True)
+    final = torch.autograd.grad(output, inputs, upstream)
+    for a, b, c in zip(first, second, final):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        torch.testing.assert_close(a, c, rtol=0, atol=0)
+    for value, snapshot, version in zip(inputs, snapshots, versions):
+        assert value._version == version
+        torch.testing.assert_close(value, snapshot, rtol=0, atol=0)

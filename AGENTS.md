@@ -19,6 +19,9 @@ informed.
   explicitly requires it.
 - Prefer the simplest implementation that is mathematically equivalent to the
   contract and measurably better for the intended workload.
+- Validate external inputs at their boundary; reuse those guarantees internally.
+  Comments should explain the operation or a non-obvious reason, not repeat
+  checks or recount past fixes. Keep numerical and upstream references where useful.
 - "Stable" means finite, correct, and trainable throughout the normal training
   envelope: supported dtype, rank, sequence length, optimizer settings, and
   realistically reachable parameter scales.

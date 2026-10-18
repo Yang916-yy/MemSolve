@@ -1,10 +1,4 @@
-"""COCO 2017 Mask R-CNN + FPN 3x downstream protocol.
-
-This is the current MMDetection 3.x expression of the public XCiT
-downstream recipe.  The MemSolve-specific leaf configs supply the plain-ViT
-backbone geometry and its four feature levels.
-"""
-
+"""COCO Mask R-CNN 1x: ViG recipe, Vision-RWKV adapter details."""
 default_scope = "mmdet"
 
 data_root = "data/coco/"
@@ -29,7 +23,7 @@ model = dict(
         num_outs=5,
     ),
     rpn_head=dict(
-        type="RPNHead",
+        type="MemSolveRPNHead",
         in_channels=256,
         feat_channels=256,
         anchor_generator=dict(
@@ -53,13 +47,13 @@ model = dict(
     roi_head=dict(
         type="StandardRoIHead",
         bbox_roi_extractor=dict(
-            type="SingleRoIExtractor",
+            type="MemSolveRoIExtractor",
             roi_layer=dict(type="RoIAlign", output_size=7, sampling_ratio=0),
             out_channels=256,
             featmap_strides=[4, 8, 16, 32],
         ),
         bbox_head=dict(
-            type="Shared2FCBBoxHead",
+            type="MemSolveBBoxHead",
             in_channels=256,
             fc_out_channels=1024,
             roi_feat_size=7,
@@ -78,7 +72,7 @@ model = dict(
             loss_bbox=dict(type="L1Loss", loss_weight=1.0),
         ),
         mask_roi_extractor=dict(
-            type="SingleRoIExtractor",
+            type="MemSolveRoIExtractor",
             roi_layer=dict(type="RoIAlign", output_size=14, sampling_ratio=0),
             out_channels=256,
             featmap_strides=[4, 8, 16, 32],
@@ -163,61 +157,8 @@ model = dict(
 train_pipeline = [
     dict(type="LoadImageFromFile", backend_args=backend_args),
     dict(type="LoadAnnotations", with_bbox=True, with_mask=True),
+    dict(type="Resize", scale=(1333, 800), keep_ratio=True),
     dict(type="RandomFlip", prob=0.5),
-    dict(
-        type="RandomChoice",
-        transforms=[
-            [
-                dict(
-                    type="RandomChoiceResize",
-                    scales=[
-                        (1333, 480),
-                        (1333, 512),
-                        (1333, 544),
-                        (1333, 576),
-                        (1333, 608),
-                        (1333, 640),
-                        (1333, 672),
-                        (1333, 704),
-                        (1333, 736),
-                        (1333, 768),
-                        (1333, 800),
-                    ],
-                    keep_ratio=True,
-                ),
-            ],
-            [
-                dict(
-                    type="RandomChoiceResize",
-                    scales=[(1333, 400), (1333, 500), (1333, 600)],
-                    keep_ratio=True,
-                ),
-                dict(
-                    type="RandomCrop",
-                    crop_type="absolute_range",
-                    crop_size=(384, 600),
-                    allow_negative_crop=True,
-                ),
-                dict(
-                    type="RandomChoiceResize",
-                    scales=[
-                        (1333, 480),
-                        (1333, 512),
-                        (1333, 544),
-                        (1333, 576),
-                        (1333, 608),
-                        (1333, 640),
-                        (1333, 672),
-                        (1333, 704),
-                        (1333, 736),
-                        (1333, 768),
-                        (1333, 800),
-                    ],
-                    keep_ratio=True,
-                ),
-            ],
-        ],
-    ),
     dict(type="PackDetInputs"),
 ]
 
@@ -238,8 +179,8 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
+    batch_size=8,
+    num_workers=4,
     persistent_workers=True,
     sampler=dict(type="DefaultSampler", shuffle=True),
     batch_sampler=dict(type="AspectRatioBatchSampler"),
@@ -256,7 +197,7 @@ train_dataloader = dict(
 
 val_dataloader = dict(
     batch_size=1,
-    num_workers=2,
+    num_workers=4,
     persistent_workers=True,
     drop_last=False,
     sampler=dict(type="DefaultSampler", shuffle=False),
@@ -281,36 +222,33 @@ val_evaluator = dict(
 )
 test_evaluator = val_evaluator
 
-max_epochs = 36
+max_epochs = 12
 train_cfg = dict(type="EpochBasedTrainLoop", max_epochs=max_epochs, val_interval=1)
 val_cfg = dict(type="ValLoop")
 test_cfg = dict(type="TestLoop")
 
 optim_wrapper = dict(
     type="AmpOptimWrapper",
+    dtype="bfloat16",
+    loss_scale=dict(enabled=False),
+    constructor="MemSolveLayerDecayConstructor",
     optimizer=dict(
         type="AdamW",
         lr=1e-4,
         betas=(0.9, 0.999),
         weight_decay=0.05,
     ),
-    paramwise_cfg=dict(
-        custom_keys={
-            "pos_embed": dict(decay_mult=0.0),
-            "cls_token": dict(decay_mult=0.0),
-            "norm": dict(decay_mult=0.0),
-        },
-    ),
+    paramwise_cfg=dict(num_layers=12, layer_decay_rate=0.85),
 )
 
 param_scheduler = [
-    dict(type="LinearLR", start_factor=0.001, by_epoch=False, begin=0, end=1000),
+    dict(type="LinearLR", start_factor=0.001, by_epoch=False, begin=0, end=500),
     dict(
         type="MultiStepLR",
         begin=0,
         end=max_epochs,
         by_epoch=True,
-        milestones=[27, 33],
+        milestones=[8, 11],
         gamma=0.1,
     ),
 ]
@@ -334,7 +272,7 @@ default_hooks = dict(
 
 env_cfg = dict(
     cudnn_benchmark=False,
-    mp_cfg=dict(mp_start_method="fork", opencv_num_threads=0),
+    mp_cfg=dict(mp_start_method="spawn", opencv_num_threads=0),
     dist_cfg=dict(backend="nccl"),
 )
 vis_backends = [dict(type="LocalVisBackend")]

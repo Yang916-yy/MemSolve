@@ -27,12 +27,15 @@ def _worker(rank, rendezvous):
     graph = None
     try:
         cuda.load()
-        for operator_rank, lengths in [(16,(97,100)), (32,(19,22)), (48,(97,100)), (64,(97,100))]:
+        cases = [(16,(97,100),False), (32,(19,22),False),
+                 (48,(97,100),False), (64,(97,100),False), (32,(97,100),True)]
+        for operator_rank, lengths, rotary in cases:
             context = SequenceParallel.create(lengths[rank])
             for mode in CoreMode:
                 for masked in (False, True, "remote"):
                     torch.manual_seed(913+operator_rank)
-                    model = MemSolve(MemSolveConfig(128,2,rank=operator_rank,bias=True,core_mode=mode)).cuda()
+                    model = MemSolve(MemSolveConfig(128,2,rank=operator_rank,bias=True,
+                                                   core_mode=mode,rotary=rotary)).cuda()
                     if model.core_base_raw is not None:
                         with torch.no_grad(): model.core_base_raw.normal_(std=.1)
                     # Generate common inputs on CPU; separate GPU RNG state is irrelevant.
@@ -47,7 +50,14 @@ def _worker(rank, rendezvous):
                     x = full[:,selection].clone().requires_grad_()
                     local_mask = mask[:,selection] if masked and not (masked == "remote" and rank == 0) else None
                     counts = context.valid_counts(local_mask,batch_size=2,device=x.device)
-                    output = model(x,local_mask,implementation="cuda",sequence_parallel=context,valid_counts=counts)
+                    rotary_kwargs = {}
+                    if rotary and masked:
+                        indices = torch.arange(sum(lengths),device=x.device)[None]
+                        first = torch.where(mask,indices,sum(lengths)).amin(dim=-1)
+                        last = torch.where(mask,indices,-1).amax(dim=-1)
+                        rotary_kwargs["rotary_context_length"] = (last-first+1).clamp_min(1)
+                    output = model(x,local_mask,implementation="cuda",sequence_parallel=context,
+                                   valid_counts=counts,**rotary_kwargs)
                     (output.float()*upstream[:,selection].float()).sum().backward()
                     context.reduce_gradients_(model)
                     reference = copy.deepcopy(model).double()
@@ -68,7 +78,7 @@ def _worker(rank, rendezvous):
         # to isolate capture/reduction; independent FP64 oracles are above.
         context=SequenceParallel.create(65)
         torch.manual_seed(417)
-        model=MemSolve(MemSolveConfig(64,1,rank=32,bias=True)).cuda()
+        model=MemSolve(MemSolveConfig(64,1,rank=32,bias=True,rotary=True)).cuda()
         full=torch.randn(1,130,64,dtype=torch.bfloat16).cuda()
         upstream=torch.randn(full.shape,dtype=torch.bfloat16).cuda()*.01
         selection=slice(context.offset,context.offset+65)

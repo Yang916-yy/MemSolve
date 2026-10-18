@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +14,8 @@ from memsolve.ball.reference import (
     accretive_generator,
     bounded_complement,
     qr_soft_frame,
+    rotary_position_factors,
+    rotate_content,
 )
 
 
@@ -73,6 +78,176 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
         torch.linalg.vector_norm(actual64 - expected64)
         / torch.linalg.vector_norm(expected64).clamp_min(1e-12)
     )
+
+
+@pytest.mark.parametrize(("keyword", "value", "error"), [
+    ("rotary", 1, TypeError), ("rotary_train_length", 0, ValueError),
+    ("rotary_train_length", 128., TypeError), ("rotary_base", True, TypeError),
+    ("rotary_base", float("inf"), ValueError), ("rotary_base", 1., ValueError),
+    ("rotary_scaling", "linear", ValueError),
+])
+def test_rotary_config_validates_external_settings(keyword, value, error) -> None:
+    with pytest.raises(error, match="rotary"):
+        MemSolveConfig(8, 2, **{keyword: value})
+
+
+def test_rotary_contract_is_explicit_json_safe_and_does_not_add_parameters() -> None:
+    plain = MemSolve(MemSolveConfig(8, 2, rank=4))
+    rotary = MemSolve(MemSolveConfig(8, 2, rank=4, rotary=True))
+    assert "rotary" not in plain.get_extra_state()
+    assert plain.get_extra_state() == MemSolve(MemSolveConfig(8, 2, rank=4, rotary_base=1000.)).get_extra_state()
+    assert set(dict(plain.named_parameters())) == set(dict(rotary.named_parameters()))
+    rotary.set_extra_state(json.loads(json.dumps(rotary.get_extra_state())))
+    for config in (plain.config, replace(rotary.config, rotary_base=1000.),
+                   replace(rotary.config, rotary_train_length=64),
+                   replace(rotary.config, rotary_scaling="none")):
+        with pytest.raises(RuntimeError, match="checkpoint contract"):
+            MemSolve(config).load_state_dict(rotary.state_dict())
+    MemSolve(MemSolveConfig(6, 2))
+    with pytest.raises(ValueError, match="even head_dim"):
+        MemSolveConfig(6, 2, rotary=True)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+def test_rotary_forward_matches_zero_phase_and_is_shift_invariant(mode: CoreMode) -> None:
+    torch.manual_seed(602)
+    layer = MemSolve(MemSolveConfig(8, 2, rank=4, core_mode=mode,
+                                   rotary=True, rotary_train_length=4, bias=True)).double()
+    if layer.core_base_raw is not None:
+        with torch.no_grad():
+            layer.core_base_raw.normal_(std=.3)
+    x = torch.randn(2, 9, 8, dtype=torch.float64, requires_grad=True)
+    plain = copy.deepcopy(layer)
+    plain.config = replace(plain.config, rotary=False)
+    zero_positions = torch.zeros(9, dtype=torch.long)
+    torch.testing.assert_close(layer(x, position_ids=zero_positions), plain(x), rtol=0, atol=0)
+    ids = torch.arange(9)
+    context_length = torch.tensor([12, 18])
+    expected = layer(x, position_ids=ids, rotary_context_length=context_length)
+    shifted = layer(x, position_ids=ids[None] + torch.tensor([[4096], [12345]]),
+                    rotary_context_length=context_length)
+    torch.testing.assert_close(shifted, expected, rtol=2e-11, atol=2e-11)
+    expected_grad = torch.autograd.grad(expected.square().sum(), (x, *layer.parameters()), retain_graph=True)
+    shifted_grad = torch.autograd.grad(shifted.square().sum(), (x, *layer.parameters()))
+    for left, right in zip(expected_grad, shifted_grad):
+        torch.testing.assert_close(left, right, rtol=2e-10, atol=2e-10)
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("length", [1, 7])
+def test_rotary_padding_does_not_change_frequency_or_readout(mode: CoreMode, length: int) -> None:
+    torch.manual_seed(603)
+    layer = MemSolve(MemSolveConfig(8, 2, rank=16, core_mode=mode, rotary=True,
+                                   rotary_train_length=4, bias=True)).double()
+    x = torch.randn(1, length, 8, dtype=torch.float64)
+    expected = layer(x)
+    padded = torch.full((2, length + 9, 8), float("nan"), dtype=torch.float64)
+    mask = torch.zeros(2, length + 9, dtype=torch.bool)
+    padded[0, 3:3+length] = x[0]
+    mask[0, 3:3+length] = True
+    padded.requires_grad_()
+    actual = layer(padded, mask)
+    torch.testing.assert_close(actual[0, 3:3+length], expected[0], rtol=2e-12, atol=2e-12)
+    assert torch.count_nonzero(actual[~mask]) == 0
+    actual.square().sum().backward()
+    assert torch.isfinite(padded.grad).all()
+    assert torch.count_nonzero(padded.grad[~mask]) == 0
+    assert all(torch.isfinite(parameter.grad).all() for parameter in layer.parameters())
+
+
+def test_rotary_context_uses_mask_span_and_sequence_parallel_global_coordinates() -> None:
+    layer = MemSolve(MemSolveConfig(8, 2, rank=4, rotary=True, rotary_train_length=2))
+    x = torch.randn(2, 8, 8, dtype=torch.float64)
+    mask = torch.tensor([[False, True, False, False, True, False, False, False], [False]*8])
+    actual = layer._rotary_factors(x, mask, None, None)
+    expected = rotary_position_factors(torch.arange(8)[None], head_dim=4, base=10000.,
+        train_length=2, context_length=torch.tensor([4, 1]), scaling="yarn", dtype=torch.float64)
+    for left, right in zip(actual, expected):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    context = SimpleNamespace(offset=16, global_length=64)
+    actual = layer._rotary_factors(x, None, None, None, sequence_parallel=context)
+    expected = rotary_position_factors(torch.arange(16, 24)[None], head_dim=4, base=10000.,
+        train_length=2, context_length=64, scaling="yarn", dtype=torch.float64)
+    for left, right in zip(actual, expected):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="global rotary_context_length"):
+        layer._rotary_factors(x, mask, None, None, sequence_parallel=context)
+    explicit = layer._rotary_factors(x, mask, None, torch.tensor([4, 1]), sequence_parallel=context)
+    assert explicit[0].shape == (2, 8, 2)
+    layer.config = replace(layer.config, rotary_train_length=64)
+    shared = layer._rotary_factors(x, mask, None, None, sequence_parallel=context)
+    assert shared[0].shape == (1, 8, 2)
+    layer.config = replace(layer.config, rotary_train_length=2, rotary_scaling="none")
+    unscaled = layer._rotary_factors(x, mask, None, None, sequence_parallel=context)
+    assert unscaled[0].shape == (1, 8, 2)
+
+
+@pytest.mark.parametrize(("kwargs", "error", "message"), [
+    ({"position_ids": torch.ones(4)}, TypeError, "integer tensor"),
+    ({"position_ids": torch.ones(4, dtype=torch.bool)}, TypeError, "integer tensor"),
+    ({"position_ids": torch.ones(2, 3, dtype=torch.long)}, ValueError, "shape"),
+    ({"rotary_context_length": 0}, ValueError, "positive"),
+    ({"rotary_context_length": 4.}, TypeError, "integer"),
+    ({"rotary_context_length": torch.ones(2)}, TypeError, "integer tensor"),
+    ({"rotary_context_length": torch.tensor([4])}, ValueError, "shape"),
+    ({"rotary_context_length": torch.tensor([4, 0])}, RuntimeError, "positive"),
+])
+def test_rotary_forward_validates_position_inputs(kwargs, error, message) -> None:
+    layer = MemSolve(MemSolveConfig(8, 2, rank=4, rotary=True))
+    with pytest.raises(error, match=message):
+        layer(torch.randn(2, 4, 8), **kwargs)
+
+
+def test_rotary_disabled_rejects_position_arguments() -> None:
+    layer = MemSolve(MemSolveConfig(8, 2, rank=4))
+    with pytest.raises(ValueError, match="rotary=True"):
+        layer(torch.randn(1, 4, 8), position_ids=torch.arange(4))
+
+
+def test_rotary_diagnostics_uses_transported_compact_state() -> None:
+    torch.manual_seed(604)
+    layer = MemSolve(MemSolveConfig(8, 2, rank=4, rotary=True, rotary_train_length=4)).double()
+    x = torch.randn(2, 9, 8, dtype=torch.float64)
+    rhs = torch.randn(2, 2, 4, 4, dtype=torch.float64)
+    actual = layer.diagnostics(x, adjoint_rhs=rhs, position_ids=torch.arange(9))
+    shifted = layer.diagnostics(x, adjoint_rhs=rhs, position_ids=torch.arange(9)+4096)
+    for key in ("q", "contraction_slack", "mu", "state_ratio", "state_bound_usage"):
+        torch.testing.assert_close(actual[key], shifted[key], rtol=2e-12, atol=2e-12)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode", list(CoreMode))
+def test_rotary_cuda_reference_keeps_rotated_products_in_fp32(mode: CoreMode) -> None:
+    torch.manual_seed(605)
+    layer = MemSolve(MemSolveConfig(128, 2, rank=16, core_mode=mode, rotary=True,
+                                   rotary_train_length=16)).cuda()
+    if layer.core_base_raw is not None:
+        with torch.no_grad():
+            layer.core_base_raw.normal_(std=.2)
+    x = torch.randn(2, 37, 128, device="cuda", dtype=torch.bfloat16)
+    cos, sin = layer._rotary_factors(x, None, None, torch.tensor([37, 74], device="cuda"))
+    _, frame, state, content, generator, eta, _ = layer._reference_compact_problem(
+        x, None, rotary_cos=cos, rotary_sin=sin,
+    )
+    actual = accretive_equilibrium_mix(frame, generator, state, content, eta,
+                                      rotary_cos=cos, rotary_sin=sin)
+    # Compare the same packed projections and phase tables; projection rounding
+    # is outside this check of the two rotary-content matrix products.
+    frame64 = frame.detach().double()
+    content64 = content.detach().double().requires_grad_()
+    state64 = frame64.mT @ rotate_content(content64, cos.double(), sin.double())
+    expected = accretive_equilibrium_mix(
+        frame64, None if generator is None else generator.detach().double(),
+        state64, content64, eta.detach().double(),
+        rotary_cos=cos.double(), rotary_sin=sin.double(),
+    )
+    assert _relative_l2(state, state64) < 3e-6
+    assert _relative_l2(actual, expected) < 3e-6
+    cotangent = torch.randn_like(actual)
+    gradient = torch.autograd.grad((actual * cotangent).sum(), content)[0]
+    gradient64 = torch.autograd.grad((expected * cotangent.double()).sum(), content64)[0]
+    assert _relative_l2(gradient, gradient64) < 3e-6
 
 
 @pytest.mark.parametrize("core_mode", list(CoreMode))
@@ -301,8 +476,6 @@ def test_removed_configuration_knobs_are_not_accepted() -> None:
         MemSolveConfig(8, 2, eta=0.9)
     with pytest.raises(TypeError):
         MemSolveConfig(8, 2, learn_eta=False)
-    with pytest.raises(TypeError):
-        MemSolveConfig(8, 2, rotary_base=1000.0)
 
 
 def test_configuration_requires_boolean_switches() -> None:

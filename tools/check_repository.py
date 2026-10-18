@@ -37,7 +37,6 @@ def main() -> None:
         "core_controller",
         "static_core",
         "learn_eta",
-        "rotary_base",
         "rotary_scale",
     )
     for path in (ROOT / "memsolve").rglob("*.py"):

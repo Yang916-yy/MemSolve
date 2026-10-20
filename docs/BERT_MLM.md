@@ -666,6 +666,18 @@ MNLI matched/mismatched accuracies are separate; MRPC/QQP include accuracy and
 binary F1; STS-B includes Pearson and Spearman; CoLA uses Matthews correlation.
 Scores are fractions. Metrics use scikit-learn/SciPy, the same definitions used
 by the HF GLUE metric. LION's source reports MRPC F1 and STS-B Spearman, so do not
-replace them with accuracy/Pearson when comparing its table. The first run is
-seed 19 only: compare per-task validation results provisionally and report seed
-count explicitly; it is not a multi-seed mean or an official GLUE test submission.
+replace them with accuracy/Pearson when comparing its table.
+
+The completed suite averages **81.9** across the eight LION-style task metrics.
+MNLI, QQP, and QNLI use seed 19; SST-2 uses three seeds, CoLA four, and
+RTE/MRPC/STS-B five. All runs share the seed-17 MLM checkpoint, and
+MNLI-transfer tasks share the seed-19 MNLI parent. The paper appendix reports
+per-task means and sample standard deviations. These are development-set
+results; the unequal seed counts do not define a suite-level standard deviation.
+
+## Document-level relation extraction
+
+[Re-DocRED fine-tuning](RE_DOCRED.md) reuses the MLM encoder with the ATLOP
+no-LOP relation head. The shared BERT/MemSolve entrypoint includes full-coverage
+document windows, adaptive-threshold loss, development-based checkpoint
+selection, and official relation F1 / annotated-train Ign F1.

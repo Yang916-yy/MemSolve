@@ -52,7 +52,8 @@ def source_digest():
               and p.suffix in (".cpp", ".cu", ".cuh", ".h", ".txt")]
     files += [root / "integrations/transformers.py", root / "integrations/distributed.py", root / "pyproject.toml"]
     files += [root / "experiments" / name for name in
-              ("nlp.py", "prepare_c4.py", "train_mlm.py", "train_glue.py", "train_retrieval.py", "evaluate_embeddings.py")]
+              ("nlp.py", "prepare_c4.py", "train_mlm.py", "train_glue.py", "train_retrieval.py", "evaluate_embeddings.py",
+               "redocred.py", "train_redocred.py")]
     return digest({p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted(files)})
 

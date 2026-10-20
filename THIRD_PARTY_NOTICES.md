@@ -1,5 +1,28 @@
 # Third-party notices
 
+## Re-DocRED relation extraction
+
+`experiments/redocred.py` adapts the adaptive-threshold loss and grouped
+bilinear classifier from [DREEAM](https://github.com/YoumiMa/dreeam), commit
+`476a7004521d5f9b7bb3be66fc6678495b3cf291`, Copyright (c) 2023 YoumiMa,
+under MIT (`licenses/DREEAM-MIT.txt`). Changes: the published ATLOP no-LOP
+variant, FP32 loss/pooling, non-mutating labels, pair padding/accumulation,
+and chunked pair classification.
+
+Relation F1 and annotated-train Ign F1 follow the evaluator in
+[Re-DocRED](https://github.com/tonytan48/Re-DocRED), commit
+`ccfb54f5ddf5836027c87badda10f6dfc56efaac`, Copyright (c) 2023 tonytan48,
+under MIT (`licenses/Re-DocRED-MIT.txt`). The implementation retains the
+official ignored-precision denominator and unchanged recall, deduplicates
+predictions, and handles empty distance subsets. It does not report evidence
+F1 or the separate distant-training-fact metric. Data are downloaded outside
+the repository; their upstream revision and local file hashes are recorded.
+
+Entity markers and logsumexp mention aggregation follow
+[ATLOP](https://arxiv.org/abs/2010.11304). Long documents use full-coverage
+overlapping BERT windows with averaged hidden states, rather than the
+upstream first/last-window attention reconstruction.
+
 ## Rotary value encoding
 
 The optional content transport is an independent adaptation of

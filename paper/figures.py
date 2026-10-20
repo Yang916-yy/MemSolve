@@ -31,7 +31,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Rectangle, Circle
 import numpy as np
 
-BLUE, GREEN, ORANGE, DARK = '#0072B2', '#00735A', '#B45100', '#202B35'
+BLUE, GREEN, ORANGE, DARK = '#258BC4', '#329B73', '#D79924', '#202B35'
+TEXT_INK = {BLUE: '#23668E', GREEN: '#246D50', ORANGE: '#855C16'}
 STYLE = {
     'font.family': 'STIXGeneral', 'font.size': 9,
     'mathtext.fontset': 'stix', 'pdf.fonttype': 42,
@@ -46,7 +47,7 @@ STYLE = {
 # Diagram geometry uses local coordinates; font sizes stay in physical points.
 # Pale matrix cells are schematic, not measured data.
 DIAGRAM_FONT = {'title': 10, 'label': 9, 'detail': 9}
-PALE_BLUE, PALE_GREEN, PALE_ORANGE = '#EDF4FA', '#EBF5F0', '#FFF1E5'
+PALE_BLUE, PALE_GREEN, PALE_ORANGE = '#DDF3FF', '#E1F5DF', '#FFF0BC'
 GRAY, PALE_GRAY, RULE = '#62717E', '#F4F6F8', '#D6DDE3'
 
 
@@ -59,7 +60,8 @@ def canvas(height, width=6.5, coordinate_width=468):
 
 
 def label(ax, x, y, text, role='label', color=DARK, ha='center', **kwargs):
-    return ax.text(x, y, text, fontsize=DIAGRAM_FONT[role], color=color,
+    return ax.text(x, y, text, fontsize=DIAGRAM_FONT[role],
+                   color=TEXT_INK.get(color, color),
                    ha=ha, va='center', **kwargs)
 
 
@@ -89,7 +91,7 @@ def box(ax, x, y, w, h, text='', color=DARK, fill=PALE_GRAY):
 
 def matrix(ax, x, y, w, h, color=GREEN, nr=4, nc=3):
     from matplotlib.colors import to_rgb
-    fill = 1 - (1 - np.array(to_rgb(color))) * .2
+    fill = 1 - (1 - np.array(to_rgb(color))) * .27
     ax.add_patch(Rectangle((x, y), w, h, facecolor=fill, edgecolor='none', zorder=3))
     for i in range(1, nr):
         ax.plot([x, x+w], [y+i*h/nr]*2, color='white', lw=.8, zorder=4)
@@ -119,123 +121,73 @@ def save(fig, stem, output, audit):
 
 
 def graphical_abstract(output, audit):
-    fig, ax = canvas(188, width=5.4)
-    label(ax, 10, 174, '(a) Sequential updates', 'title', ha='left', weight='bold')
-    label(ax, 220, 174, '(b) Global equilibrium', 'title', ha='left', weight='bold')
-    ax.plot([207, 207], [14, 160], color=RULE, lw=.7)
+    fig, ax = canvas(156, width=5.4)
+    fig.set_size_inches(6.2, fig.get_figheight())
+    ax.set_aspect('auto')
+    label(ax, 10, 142, '(a) Sequential updates', 'title', ha='left', weight='bold')
+    label(ax, 220, 142, '(b) Global equilibrium', 'title', ha='left', weight='bold')
+    ax.plot([207, 207], [10, 130], color=RULE, lw=.7)
 
     for x, name in [(20, r'$U_0$'), (70, r'$U_1$'), (164, r'$U_N$')]:
-        matrix(ax, x, 83, 24, 24, GRAY, nr=3, nc=3)
-        label(ax, x+12, 71, name)
-    arrow(ax, (44, 95), (70, 95), GRAY)
-    arrow(ax, (94, 95), (119, 95), GRAY)
-    label(ax, 133, 95, r'$\cdots$', color=GRAY)
-    arrow(ax, (146, 95), (164, 95), GRAY)
+        matrix(ax, x, 69, 24, 24, GRAY, nr=3, nc=3)
+        label(ax, x+12, 57, name)
+    arrow(ax, (44, 81), (70, 81), GRAY)
+    arrow(ax, (94, 81), (119, 81), GRAY)
+    label(ax, 133, 81, r'$\cdots$', color=GRAY)
+    arrow(ax, (146, 81), (164, 81), GRAY)
     for x, name in [(62, r'$(k_1,c_1)$'), (156, r'$(k_N,c_N)$')]:
-        box(ax, x, 130, 40, 20, name, BLUE, PALE_BLUE)
-        arrow(ax, (x+20, 130), (x+20, 107), BLUE)
-    label(ax, 104, 37, r'$U_t=U_{t-1}+\beta_t k_t e_t^{\mathsf{T}}$')
-    label(ax, 104, 18, r'$e_t=c_t-U_{t-1}^{\mathsf{T}}k_t$', color=GRAY)
+        box(ax, x, 108, 40, 20, name, BLUE, PALE_BLUE)
+        arrow(ax, (x+20, 108), (x+20, 93), BLUE)
+    label(ax, 104, 29, r'$U_t=U_{t-1}+\beta_t k_t e_t^{\mathsf{T}}$')
+    label(ax, 104, 12, r'$e_t=c_t-U_{t-1}^{\mathsf{T}}k_t$', color=GRAY)
 
     # Converging associations and a shared readout contrast with the chain.
-    for y in (66, 82, 98, 114):
+    for y in (50, 64, 78, 92):
         box(ax, 230, y, 20, 10, color=GRAY, fill=PALE_GRAY)
-        route(ax, [(250, y+5), (284, 100)], GRAY, head=False)
+        route(ax, [(250, y+5), (284, 84)], GRAY, head=False)
         box(ax, 432, y, 20, 10, color=ORANGE, fill=PALE_ORANGE)
-        arrow(ax, (408, 100), (432, y+5), ORANGE)
-    arrow(ax, (284, 100), (308, 100), BLUE)
-    route(ax, [(376, 100), (408, 100)], GREEN, head=False)
-    box(ax, 308, 70, 68, 66, color=GREEN, fill=PALE_GREEN)
-    label(ax, 342, 124, r'$U^\star$', color=GREEN)
-    matrix(ax, 326, 88, 32, 24, GREEN, nr=3, nc=4)
-    label(ax, 342, 78, r'$r\times h$', 'detail', color=GREEN)
-    box(ax, 326, 146, 32, 18, r'$J$', GREEN, PALE_GREEN)
-    arrow(ax, (342, 146), (342, 136), GREEN)
-    label(ax, 279, 141, 'Write', 'detail', color=BLUE)
-    label(ax, 279, 125, r'$P^{\mathsf{T}}$', color=BLUE)
-    label(ax, 406, 141, 'Read', 'detail', color=GREEN)
-    label(ax, 406, 125, r'$\mathcal{R}$', color=GREEN)
-    label(ax, 240, 50, r'$X$')
-    label(ax, 442, 50, r'$Y$')
-    label(ax, 342, 27, r'$(I+J)U^\star=P^{\mathsf{T}}C$', color=GREEN)
+        arrow(ax, (408, 84), (432, y+5), ORANGE)
+    arrow(ax, (284, 84), (308, 84), BLUE)
+    route(ax, [(376, 84), (408, 84)], GREEN, head=False)
+    box(ax, 308, 55, 68, 54, color=GREEN, fill=PALE_GREEN)
+    label(ax, 342, 101, r'$U^\star$', color=GREEN)
+    matrix(ax, 326, 72, 32, 24, GREEN, nr=3, nc=4)
+    label(ax, 342, 62, r'$r\times h$', 'detail', color=GREEN)
+    box(ax, 326, 114, 32, 16, r'$J$', GREEN, PALE_GREEN)
+    arrow(ax, (342, 114), (342, 109), GREEN)
+    label(ax, 279, 124, 'Write', 'detail', color=BLUE)
+    label(ax, 279, 109, r'$P^{\mathsf{T}}$', color=BLUE)
+    label(ax, 406, 124, 'Read', 'detail', color=GREEN)
+    label(ax, 406, 109, r'$\mathcal{R}$', color=GREEN)
+    label(ax, 240, 40, r'$X$')
+    label(ax, 442, 40, r'$Y$')
+    label(ax, 342, 15, r'$(I+J)U^\star=P^{\mathsf{T}}C$', color=GREEN)
     save(fig, 'graphical_abstract', output, audit)
 
 
-def overview(output, audit):
-    fig, ax = canvas(174, width=5.8)
-    label(ax, 14, 95, r'$X$')
-    box(ax, 34, 83, 40, 24, r'$W_{BC}$')
-    arrow(ax, (22, 95), (34, 95))
-    route(ax, [(74, 95), (87, 95), (87, 140), (103, 140)], BLUE)
-    route(ax, [(87, 95), (87, 67), (103, 67)], ORANGE)
-    junction(ax, 87, 95)
-    matrix(ax, 103, 125, 20, 30, BLUE, nr=6, nc=3)
-    label(ax, 113, 163, r'$B$', color=BLUE)
-    arrow(ax, (123, 140), (142, 140), BLUE)
-    box(ax, 142, 123, 144, 34,
-        r'$P=AR^{-1},\quad A=B/\sqrt{N}$'+'\n'+r'$R^{\mathsf{T}}R=I+A^{\mathsf{T}}A$',
-        BLUE, PALE_BLUE)
-    arrow(ax, (286, 140), (317, 140), BLUE)
-    matrix(ax, 317, 125, 20, 30, BLUE, nr=6, nc=3)
-    label(ax, 327, 163, r'$P$', color=BLUE)
-    label(ax, 347, 140, r'$N\times r$', 'detail', color=BLUE, ha='left')
-
-    ax.add_patch(FancyBboxPatch((184, 32), 164, 69,
-                               boxstyle='round,pad=0,rounding_size=5',
-                               facecolor='#F4F9F6', edgecolor='none', zorder=0))
-    matrix(ax, 103, 49, 24, 36, ORANGE, nr=6, nc=4)
-    label(ax, 115, 95, r'$C$', color=ORANGE)
-    label(ax, 87, 38, r'$N\times h$', 'detail', color=ORANGE, ha='right')
-    pointop(ax, 161, 67, '×', GREEN)
-    arrow(ax, (127, 67), (156, 67), ORANGE)
-    route(ax, [(327, 125), (327, 112), (161, 112), (161, 72)], BLUE)
-    label(ax, 172, 91, r'$P^{\mathsf{T}}$', color=BLUE)
-    route(ax, [(327, 112), (375, 112), (375, 72)], BLUE)
-    junction(ax, 327, 112, BLUE)
-    label(ax, 386, 91, r'$P$', color=BLUE)
-    matrix(ax, 191, 55, 30, 24, GREEN, nr=3, nc=4)
-    label(ax, 206, 90, r'$Z$', color=GREEN)
-    label(ax, 206, 42, r'$r\times h$', 'detail', color=GREEN)
-    arrow(ax, (166, 67), (191, 67), GREEN)
-    arrow(ax, (221, 67), (245, 67), GREEN)
-    box(ax, 245, 53, 92, 28, r'$F-\eta I$', GREEN, PALE_GREEN)
-    label(ax, 291, 90, 'Core', 'detail', color=GREEN)
-    label(ax, 291, 42, r'$r\times r$', 'detail', color=GREEN)
-    pointop(ax, 375, 67, '×', BLUE)
-    arrow(ax, (337, 67), (370, 67), GREEN)
-    pointop(ax, 417, 67, '+', ORANGE)
-    arrow(ax, (380, 67), (412, 67), BLUE)
-    arrow(ax, (422, 67), (444, 67), ORANGE)
-    label(ax, 454, 67, r'$Y$')
-    route(ax, [(115, 49), (115, 15), (417, 15), (417, 62)], ORANGE)
-    label(ax, 267, 23, r'$\eta C$', color=ORANGE)
-    save(fig, 'operator_overview', output, audit)
-
-
 def visual_backbone(output, audit):
-    fig, ax = canvas(145, width=5.8)
-    matrix(ax, 9, 105, 24, 24, BLUE, nr=4, nc=4)
-    label(ax, 21, 95, 'Image', 'detail')
-    arrow(ax, (33, 117), (51, 117))
-    box(ax, 51, 104, 65, 26, 'Patch embed', BLUE, PALE_BLUE)
-    label(ax, 83.5, 139, r'$16\times16$', 'detail', color=BLUE)
-    arrow(ax, (116, 117), (144, 117))
+    fig, ax = canvas(126, width=5.8)
+    matrix(ax, 9, 86, 24, 24, BLUE, nr=4, nc=4)
+    arrow(ax, (33, 98), (51, 98))
+    box(ax, 51, 85, 65, 26, 'Patch embed', BLUE, PALE_BLUE)
+    label(ax, 83.5, 118, r'$16\times16$', 'detail', color=BLUE)
+    arrow(ax, (116, 98), (144, 98))
     for shift in (6, 3, 0):
-        box(ax, 144+shift, 104+shift, 65, 26, color=GREEN, fill=PALE_GREEN)
-    label(ax, 176.5, 117, 'Block', color=GREEN, zorder=5)
-    label(ax, 229, 136, r'$\times12$', color=GREEN)
-    arrow(ax, (215, 117), (242, 117))
-    box(ax, 242, 104, 29, 26, 'LN')
-    arrow(ax, (271, 117), (290, 117))
-    box(ax, 290, 104, 58, 26, 'Mean pool')
-    arrow(ax, (348, 117), (367, 117))
-    box(ax, 367, 104, 48, 26, 'Linear')
-    arrow(ax, (415, 117), (439, 117))
-    label(ax, 451, 117, r'$\hat{y}$')
+        box(ax, 144+shift, 85+shift, 65, 26, color=GREEN, fill=PALE_GREEN)
+    label(ax, 176.5, 98, 'Block', color=GREEN, zorder=5)
+    label(ax, 229, 116, r'$\times12$', color=GREEN)
+    arrow(ax, (215, 98), (242, 98))
+    box(ax, 242, 85, 29, 26, 'LN')
+    arrow(ax, (271, 98), (290, 98))
+    box(ax, 290, 85, 58, 26, 'Mean pool')
+    arrow(ax, (348, 98), (367, 98))
+    box(ax, 367, 85, 48, 26, 'Linear')
+    arrow(ax, (415, 98), (439, 98))
+    label(ax, 451, 98, r'$\hat{y}$')
 
     # The dotted leaders expand one block; they are not data-flow edges.
-    ax.plot([144, 18], [102, 76], color=RULE, lw=.8, ls='--')
-    ax.plot([209, 450], [102, 76], color=RULE, lw=.8, ls='--')
+    ax.plot([144, 18], [83, 76], color=RULE, lw=.8, ls='--')
+    ax.plot([209, 450], [83, 76], color=RULE, lw=.8, ls='--')
     ax.add_patch(FancyBboxPatch((14, 8), 440, 68,
                                boxstyle='round,pad=0,rounding_size=5',
                                facecolor='#FAFBFC', edgecolor=RULE, lw=.8))
@@ -295,7 +247,7 @@ def curves(evidence, output, audit):
     baselines = data['baselines']
     baseline_rows = {r['id']: baseline_records(r) for r in baselines}
     provenance.extend(baselines)
-    fig, ax = plt.subplots(figsize=(3.125, 2.2), layout='constrained')
+    fig, ax = plt.subplots(figsize=(2.9375, 2.1), layout='constrained')
 
     def plot(ax, records, name, color, style, width=1.4):
         last = max(r['epoch'] for r in records)
@@ -320,10 +272,11 @@ def curves(evidence, output, audit):
         'overview': 'Original schematic; main.tex equations frame, solve and readout',
         'review_status': 'Agent-generated draft; author scientific review pending',
         'matplotlib': matplotlib.__version__,
-        'files': ['graphical_abstract.pdf', 'graphical_abstract.svg', 'operator_overview.pdf', 'operator_overview.svg', 'visual_backbone.pdf', 'visual_backbone.svg', 'training_curves.pdf', 'training_curves.svg'],
+        'files': [f'{stem}.{ext}' for stem in (
+            'graphical_abstract',
+            'visual_backbone', 'training_curves') for ext in ('pdf', 'svg')],
         'alt_text': {
             'graphical_abstract': 'A generic ordered memory chain motivates a full-context alternative: all tokens contribute to one compact equilibrium state, and all outputs use that state. This is a conceptual comparison, not numerical equivalence to the chain.',
-            'operator_overview': 'One MemSolve head forms P, writes Z=P transpose C, transforms Z by F minus eta I, and reads through P before adding eta C.',
         'visual_backbone': 'Patch embedding, twelve constant-width blocks, token LayerNorm, mean pooling and a linear classifier. An expanded block shows three residual branches: CPE, pre-LayerNorm MemSolve and pre-LayerNorm GELU FFN.',
         'training_curves': 'Validation Top-1 over 300 epochs: MemSolve-S ordinary weights and the author-released four-GPU DeiT-S run. Protocols differ; this is not a wall-clock comparison.'}
     }, indent=2))
@@ -333,7 +286,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--evidence', type=Path)
     parser.add_argument('--schematics-only', action='store_true',
-                        help='Rebuild the three diagrams without reading experiment logs.')
+                        help='Rebuild the two diagrams without reading experiment logs.')
     parser.add_argument('--output', type=Path, default=Path(__file__).parent)
     parser.add_argument('--audit-dir', type=Path, required=True)
     args = parser.parse_args()
@@ -341,7 +294,6 @@ def main():
         parser.error('--evidence is required unless --schematics-only is used')
     args.output.mkdir(parents=True, exist_ok=True); args.audit_dir.mkdir(parents=True, exist_ok=True)
     with plt.rc_context(STYLE):
-        overview(args.output, args.audit_dir)
         visual_backbone(args.output, args.audit_dir)
         graphical_abstract(args.output, args.audit_dir)
         if not args.schematics_only:

@@ -1,7 +1,28 @@
-\documentclass[10pt]{article}
+\documentclass[10pt,twocolumn]{article}
 \usepackage[margin=1in]{geometry}
+\setlength{\columnsep}{0.25in}
 \usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{times}
 \usepackage{booktabs,array,graphicx,microtype}
+\usepackage{titlesec}
+\usepackage[font=small]{caption}
+\usepackage{placeins}
+% ICML type sizes; retain this working draft's page and column layout.
+\let\draftnormalsize\normalsize
+\renewcommand{\normalsize}{\draftnormalsize\fontsize{10}{11}\selectfont}
+\let\draftsmall\small
+\renewcommand{\small}{\draftsmall\fontsize{9}{10}\selectfont}
+\let\draftfootnotesize\footnotesize
+\renewcommand{\footnotesize}{\draftfootnotesize\fontsize{9}{10}\selectfont}
+\titleformat{\section}{\normalfont\fontsize{11}{12}\selectfont\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalfont\fontsize{10}{11}\selectfont\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalfont\fontsize{10}{11}\selectfont\scshape}{\thesubsubsection}{1em}{}
+\renewenvironment{abstract}{%
+  \begin{center}\fontsize{11}{12}\selectfont\bfseries\abstractname\end{center}%
+  \normalfont\normalsize\ignorespaces
+}{\par}
+\AtBeginDocument{\normalsize}
+\usepackage[table]{xcolor}
 \usepackage{algorithm,algpseudocode}
 \usepackage[hidelinks]{hyperref}
 \algrenewcommand\algorithmicrequire{\textbf{Input:}}
@@ -27,283 +48,321 @@
 \newcommand{\Solve}{\operatorname{solve}}
 \newcommand{\Chol}{\operatorname{chol}_{u}}
 \newcommand{\CholSolve}{\operatorname{cholsolve}}
-\title{MemSolve: From Sequential Memory Updates to Global Equilibrium}
-\author{Zhaoyang Wang\\\texttt{zhaoy@uir.edu.cn}}
-\date{\small Working draft --- October 14, 2026}
+\title{\fontsize{14}{17}\selectfont\bfseries MemSolve: From Sequential Memory Updates to Global Equilibrium}
+\author{\fontsize{10}{11}\selectfont\textbf{Zhaoyang Wang}\\\fontsize{10}{11}\selectfont\texttt{zhaoy@uir.edu.cn}}
+\date{\small Working draft --- October 20, 2026}
 \begin{document}
 \maketitle
+\raggedbottom
 
 \begin{abstract}
-Error-correcting associative memories update their state using the mismatch
-between stored predictions and incoming content. For tasks with access to the
-complete input, this raises a question: can all associations determine one
-joint memory without an ordered sequence of updates? We introduce MemSolve,
-a bidirectional token mixer that evaluates such a memory at equilibrium.
-An input-dependent soft frame aggregates contextual associations, and a
-learned accretive core defines a uniquely solvable correction system.
-The same frame reads the memory back to tokens, combining a content branch
-with a low-rank correction. This construction gives a contractive token map
-for each realized frame and permits exact spectral analysis in rank space.
-Although the core parameters are shared across inputs, both the frame and
-the memory state remain input-dependent. A compact implementation avoids
-materializing the frame and has linear cost in sequence length at fixed rank.
-On ImageNet-1K, MemSolve-ViT-S reaches $80.95\%$ Top-1 accuracy with
-$19.88$M parameters after 300 epochs at $224\times224$ resolution.
-A matched ImageNet-100 study further finds that learning the compact core
-improves accuracy over the content-complement variant.
+Gated Delta Networks (GDNs) learn and refine associations by writing
+prediction errors back into memory. This error-correcting mechanism has
+advanced causal sequence modeling.
+In bidirectional settings, the model can access the entire context.
+It can therefore build a shared memory from all positions.
+Yet extending sequential error correction to this setting can be costly.
+The direct full-attention DeltaNet formulation studied in LION requires a
+sequence-sized matrix inverse. Its cubic cost undermines the efficiency
+of a compact memory. We propose MemSolve, which constructs memory by directly
+solving a joint error-correction problem over the full context.
+Associations from all positions jointly determine a compact equilibrium state.
+Each position then reads context from this shared memory.
+Memory writes and reads depend on the entire context.
+This allows information on both sides of a position to interact.
+Locally parameterized bidirectional scans with linear merging cannot express
+all such interactions. We prove that the equilibrium is unique and that the
+readout is contractive for each fixed write--read frame.
+To execute this global computation efficiently, we design a hardware-aware
+parallel algorithm. It supports exact sequence parallelism across devices.
+At fixed rank, computation scales linearly with sequence length.
+With a simple non-hierarchical visual backbone, our Base model reaches
+$82.7\%$ Top-1 on ImageNet-1K with $78$M parameters.
+It exceeds Vim-B without extra fine-tuning by $0.8$ percentage points
+with approximately $20\%$ fewer parameters.
+It also surpasses Hydra-ViT-B by $1.1$ points.
+Our Small model reaches $81.0\%$ with $20$M parameters.
+Both results use EMA. After C4 masked-language pretraining, a parameter-matched
+BERT-style encoder achieves an $81.9$ average of GLUE development task means.
 \end{abstract}
 
-\begin{figure}[!ht]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\linewidth]{graphical_abstract.pdf}
+\includegraphics[width=5.4in]{graphical_abstract.pdf}
 \caption{\textbf{From sequential memory updates to global equilibrium.}
-(a) The delta rule corrects one association at a time.
-(b) MemSolve forms an input-specific equilibrium from all associations.
-$J$ is learned across samples; $P$ and $C$ depend on the input.
-The readout is $\mathcal R(U^\star)=\eta C+P[2U^\star-(1+\eta)P^\T C]$.
-This compares memory mechanisms; MemSolve is not an equivalent unrolling
-of (a). Fig.~\ref{fig:architecture} expands its computation.}
+(a) Ordered updates correct one association at a time.
+(b) MemSolve combines all associations in one shared equilibrium and reads
+it back to every token. The core $J$ is learned; the frame $P$ and content
+$C$ depend on the input. Figure~\ref{fig:architecture} details the operator.}
 \label{fig:overview}
-\end{figure}
+\end{figure*}
 
 \section{Introduction}
 
-Error-correcting associative memories store contextual associations by
-predicting their content and updating the memory from the residual. The
-delta rule implements this mechanism through successive writes, while
-test-time training (TTT) treats the state more generally as
-an internal model adapted to the current context
-\cite{schlag2021fastweights,yang2025deltanet,sun2025ttt}.
+Error-correcting memories have strengthened causal sequence models
+\cite{yang2025gdn,kimi2025linear,hatamizadeh2026gdn2}.
+These models must retain useful associations in a limited state.
+Self-attention retains an explicit context for retrieval
+\cite{vaswani2017attention}. Linear attention and state-space models (SSMs)
+compress that context into a fixed-size memory
+\cite{katharopoulos2020linear,gu2024mamba}.
+Within an associative memory, additive writes can interfere with stored
+associations. The delta rule corrects this interference: it predicts
+content from the current memory, then writes the prediction residual
+\cite{schlag2021fastweights,yang2025deltanet}.
+Gated Delta Networks (GDNs) combine this correction with adaptive forgetting
+\cite{yang2025gdn}. Recent variants introduce channel-wise forgetting and
+separate erase/write controls \cite{kimi2025linear,hatamizadeh2026gdn2}.
+Together, these methods treat memory as an internal model that learns
+from context. Test-time training (TTT) makes this perspective explicit
+\cite{sun2025ttt}. MesaNet takes it further by solving for locally optimal
+regression states \cite{vonoswald2026mesanet}.
 
-For visual recognition and other full-context tasks, all associations are
-available together. An ordered update rule nevertheless makes each
-correction depend on the memory left by earlier positions, introducing a
-sequential dependency into a task that permits joint processing.
-ViT$^3$ studies this issue in vision and finds that a full-batch inner update
-can outperform sequential mini-batch updates. More inner steps can improve
-accuracy, but also reduce throughput and may destabilize training
-\cite{han2026vit3}. A natural alternative is to determine a memory that is
-already consistent with the joint correction field.
+In bidirectional settings, the complete context is available when memory
+is constructed. All associations can therefore contribute to the same
+state. This state can use evidence from both sides of any position,
+without having to serve every intermediate prefix.
+ViT$^3$ explores a related opportunity in vision: its full-batch inner
+updates can outperform sequential mini-batch updates \cite{han2026vit3}.
+However, additional inner steps increase cost and can impair stability.
+A direct equilibrium would let all associations act jointly without
+an inner iteration budget.
 
-Two obstacles must be resolved. First, exposing bidirectional interactions
-does not by itself make error correction cheap. LION's Appendix~B.7 derives
-bidirectional recurrent and chunkwise DeltaNet forms, but its discussed
-full-attention expression requires an inverse with cubic cost in sequence
-length \cite{afzal2025lion}. That expression can therefore lose the
-computational advantage sought from a compact memory: doubling the sequence
-length multiplies the inversion cost by eight. This is a limitation of that
-formulation, rather than an impossibility result for bidirectional DeltaNet.
-Second, a well-defined memory state is not enough. Its readout must control
-how a compact correction acts on the much larger token space.
+The challenge is to retain the efficiency of compact memory.
+Vim, Hydra, and LION already offer efficient bidirectional context mixing
+\cite{zhu2024vim,hwang2024hydra,afzal2025lion}.
+For delta-rule memory, each correction also depends on the current state.
+Removing the causal mask does not remove that dependence.
+LION's Appendix~B.7 derives recurrent and chunkwise bidirectional DeltaNet
+forms \cite{afzal2025lion}. Its direct full-attention expression, however,
+requires a sequence-sized matrix inverse. The inversion costs cubic time:
+doubling the sequence length multiplies that cost by eight.
+A compact memory thus loses its efficiency advantage if the joint solve
+grows with the sequence.
 
-We address these obstacles by designing the memory coordinates, correction
-system, and readout together. MemSolve maps relation features to a soft frame
-whose singular values are below one. It then combines a positive-definite
-component with a skew-symmetric coupling to define an accretive system in
-rank space. The system has a unique equilibrium; its reflected resolvent
-supplies the compact readout map. Using the same frame to write and read
-makes the resulting token operator a scalar content map plus a rank-limited
-correction, with a spectral norm strictly below one for every realized frame.
-The solve dimension depends on the chosen rank, not the sequence length.
+We introduce \textbf{MemSolve}, which constructs full-context memory
+through a direct solve in compact memory space. Its design connects
+joint error correction, controlled readout, and parallel computation.
 
-This design separates \emph{learning the correction law} from
-\emph{adapting the memory state}. The core is learned across training samples,
-whereas the frame, contextual statistic, and equilibrium state are computed
-anew for each input. A sample-conditioned core generator is therefore not
-required for input-dependent memory. This distinction also has a practical
-consequence: each head's compact core map can be computed once per forward
-pass and reused across the batch.
+\paragraph{Global Equilibrium ($\S$\ref{sec:method}, $\S$\ref{sec:stability}).}
+MemSolve combines all associations in one residual equation.
+An input-dependent soft frame sets the coordinates for writing and reading
+memory. An accretive core makes the equation uniquely solvable.
+We couple the frame to the regularizer, reducing the memory equation to
+a learned core shared across inputs. We solve it directly and read the
+state back through the same frame.
+The readout adds a low-rank contextual correction to a content branch.
+For each realized frame, we prove that the resulting token map is contractive.
+Its exact spectrum can also be computed in compact space.
 
-Intention studies global regression with query readout, and MesaNet develops
-locally optimal test-time regression for causal sequence modeling
-\cite{garnelo2023intention,vonoswald2026mesanet}. Building on this perspective,
-our contribution is the joint construction of a shared soft frame, an
-accretive correction law, and a complementary content path. This structure
-connects three aspects of the mixer: a uniquely solvable memory, a
-contractive readout with an exact compact spectral characterization, and
-an implementation whose cost is linear in sequence length at fixed rank.
-We evaluate it in a non-hierarchical visual backbone: MemSolve-ViT-S reaches
-$80.95\%$ on ImageNet-1K, while a matched short-run comparison on
-ImageNet-100 tests the contribution of the learned core.
+\paragraph{Beyond Directional Scans ($\S$\ref{sec:ssm}).}
+MemSolve is not a reparameterization of a standard bidirectional SSM mixer
+with local coefficients and a linear merge of the two directions.
+Such a mixer adds a prefix response to a suffix response.
+MemSolve instead normalizes its frame using the entire context.
+Changing the suffix can therefore change how prefix content reaches a
+token, even when that token is fixed. Theorem~\ref{thm:ssm} proves this
+separation with a three-token counterexample.
 
-\section{Related Work}
+\paragraph{Parallel Algorithm ($\S$\ref{sec:implementation}).}
+The full context enters the solve through two compact sufficient statistics.
+We compute these statistics in parallel, solve the compact system, and
+read out each token independently. The forward pass exchanges only these statistics between sequence shards.
+This partition preserves the operator exactly. The learned core is shared
+across inputs and evaluated once per head per forward pass.
+Selective fusion avoids storing the token-sized frame and reduces GPU
+memory traffic. The total cost is linear in sequence length at fixed rank.
 
-\paragraph{Error-correcting and test-time memories.}
-Fast-weight models connect linear sequence layers with associative-memory
-updates \cite{schlag2021fastweights}. DeltaNet replaces additive writes
-with residual correction; its chunkwise formulation makes such updates
-amenable to parallel training \cite{yang2025deltanet}. TTT uses an internal
-learner as the sequence state \cite{sun2025ttt}, and test-time regression
-provides a common language for several memory update rules
-\cite{wang2025testtimeregression}. MesaNet solves contextual regression
-problems with conjugate gradients \cite{vonoswald2026mesanet}.
-MemSolve combines residual correction with a direct full-context solve.
-Its correction field is defined jointly over the input, rather than by
-composing causal memory updates.
-
-\paragraph{Global regression and equilibrium layers.}
-Intention maps keys and values to a regularized least-squares solution and
-reads that solution with queries \cite{garnelo2023intention}. MemSolve couples
-the write and read coordinates through a normalized frame and extends the
-compact equilibrium map with a complementary content path. Deep equilibrium models and monotone equilibrium
-networks also obtain representations through fixed points
-\cite{bai2019deep,winston2020mondeq}. Here the equilibrium is a compact linear
-system with a direct factorization. The Cayley transform and its relation to
-accretive operators are classical \cite{bauschke2017convex}; we use this
-relation to control the realized token mixer.
-
-\paragraph{Bidirectional efficient mixers.}
-Linear attention reorganizes feature interactions to avoid a quadratic
-attention matrix \cite{katharopoulos2020linear}. Vision Mamba adapts selective
-state-space modeling to visual inputs, Hydra constructs bidirectional matrix
-mixers, and LION relates full-attention, recurrent, and chunkwise bidirectional
-forms \cite{zhu2024vim,hwang2024hydra,afzal2025lion}.
-MemSolve instead obtains a joint memory through sufficient statistics and a
-rank-space solve. Its operator does not prescribe a spatial scan order.
-For vision, we supply local spatial structure through conditional positional
-encoding (CPE) \cite{chu2023cpe} in a plain backbone derived from
-ViT$^3$ \cite{han2026vit3}.
+\paragraph{Architectures and Results ($\S$\ref{sec:experiments}).}
+We use the same operator in plain visual backbones and a BERT-style encoder.
+On ImageNet-1K, MemSolve-ViT-S and MemSolve-ViT-B reach
+$81.0\%$ and $82.7\%$ Top-1 with $20$M and $78$M parameters, respectively.
+Both results use EMA.
+The Base model exceeds Vim-B without extra fine-tuning by $0.8$
+percentage points with approximately $20\%$ fewer parameters.
+The Small model also reaches the same validation accuracy in fewer
+epochs than an author-released DeiT-S run.
+The parameter-matched language encoder achieves an $81.9$ average of
+GLUE development task means. Execution measurements show where
+exact sequence parallelism improves training throughput.
+Appendix~\ref{app:related} expands the connections to memory updates,
+regression layers, and bidirectional sequence operators.
 
 \section{MemSolve}
 \label{sec:method}
 
-\begin{figure}[t]
+MemSolve builds one memory from all positions. We first express this task
+as joint error correction. We then choose the memory coordinates and
+regularization so that the equilibrium has a compact, shared system.
+Finally, we read the memory back to tokens with a controlled gain.
+All equations describe one head with $N$ valid tokens, rank $r$, and
+content width $h$.
+
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\linewidth]{operator_overview.pdf}
-\caption{\textbf{MemSolve-ViT and its token mixer.}
-(a) The visual block has residual CPE, a pre-LayerNorm MemSolve branch, and
-a pre-LayerNorm GELU FFN branch; stochastic depth on the latter two branches
-is omitted from the drawing. (b) One head projects relations $B$ and content
-$C$, forms the soft frame $P$, writes $Z=P^\T C$, applies the shared core
-correction, and reads through $P$ before adding $\eta C$. Circled multiplication symbols denote matrix products. Head concatenation
-and the output projection follow this computation; $F$ is defined in
-Eq.~\eqref{eq:solve}. The figure shows the
-mathematical factorization; CUDA evaluates compact statistics without
-storing the token-sized frame.}
+\includegraphics[width=5.8in]{operator_overview.pdf}
+\caption{\textbf{One MemSolve head.}
+Relation features form the soft frame $P$. The head writes $Z=P^\T C$,
+applies the core correction, and reads through $P$ before adding $\eta C$.
+Circled multiplication symbols denote matrix products; head concatenation
+and an output projection follow. This mathematical view makes $P$
+explicit; the CUDA path uses compact statistics without storing it.}
 \label{fig:architecture}
-\end{figure}
+\end{figure*}
 
-\subsection{Relation features and a soft frame}
+\subsection[Correcting all associations together]{\raggedright Correcting all associations together}
+\label{sec:joint-memory}
 
-Consider one head with $N$ valid tokens, relation rank $r$, and content width
-$h$. A learned projection produces relation features $B\in\R^{N\times r}$
-and content $C\in\R^{N\times h}$ from the input $X$. Define
+Let $C\in\R^{N\times h}$ contain the content to be stored, and let
+$P\in\R^{N\times r}$ assign memory coordinates to each position.
+A memory $U\in\R^{r\times h}$ predicts content as $PU$.
+For row $p_i^\T$ of $P$ and row $c_i^\T$ of $C$, the prediction error is
+$c_i^\T-p_i^\T U$. Writing all errors back gives
 \begin{equation}
- A=\frac{B}{\sqrt{N}},\qquad
- R^\T R=\I_r+A^\T A,\qquad P=AR^{-1},\qquad Z=P^\T C,
+ P^\T(C-PU)=\sum_{i=1}^{N}p_i(c_i^\T-p_i^\T U).
+ \label{eq:joint-residual}
+\end{equation}
+Each association is evaluated against the same memory. This is the
+full-context counterpart of correcting associations one at a time.
+
+To control the joint correction, we add a positive-definite regularizer
+$\Gamma_X$ and a learned skew-symmetric coupling $\Omega$:
+\begin{equation}
+ \dot U=P^\T(C-PU)-\Gamma_X U-\Omega U.
+ \label{eq:joint-field}
+\end{equation}
+The regularizer damps the memory. The skew term couples its coordinates
+with zero contribution to memory energy: $\langle U,\Omega U\rangle_F=0$.
+MemSolve obtains the memory by solving for the equilibrium of this field.
+The next step is to construct $P$ and $\Gamma_X$ so that this solve is
+well posed and its core can be shared across inputs.
+
+\subsection{Constructing a compact equilibrium}
+\label{sec:equilibrium}
+
+A learned projection produces relation features $B\in\R^{N\times r}$
+and content $C$ from the input $X$. We normalize the relations and define
+\begin{equation}
+ \begin{aligned}
+ A&=B/\sqrt{N}, & R^\T R&=\I_r+A^\T A,\\
+ P&=AR^{-1}, & Z&=P^\T C.
+ \end{aligned}
  \label{eq:frame}
 \end{equation}
 where $R$ is the upper Cholesky factor with positive diagonal.
-The same $P$ writes content into the statistic $Z\in\R^{r\times h}$ and
-reads a compact state back to tokens. There is no independent query
-projection. The $N^{-1/2}$ factor makes $A^\T A$ an average relation
-second moment instead of an unnormalized sum.
+The normalization makes $A^\T A$ an average relation second moment.
+The identity term keeps the factorization positive definite and ensures
+$\norm{P}_2<1$. We call $P$ a \emph{soft frame}: it provides shared
+write--read coordinates with bounded gain. Appendix~\ref{app:frame}
+gives its singular values and geometry.
 
-The identity term in Eq.~\eqref{eq:frame} keeps the factorization
-positive definite even when the relations are rank deficient. It also gives
+Each head learns a core shared across samples:
 \begin{equation}
- \sigma_i(P)=\frac{\sigma_i(A)}{\sqrt{1+\sigma_i(A)^2}}<1.
- \label{eq:soft-singular}
-\end{equation}
-We call $P$ a \emph{soft frame}: it is a contractive relation map, but its
-columns are not generally orthonormal. In particular, $PP^\T$ and
-$\I_N-PP^\T$ are not orthogonal projectors.
-
-\subsection{A learned correction law and an input-dependent state}
-\label{sec:equilibrium}
-
-Each head learns a matrix $\Theta\in\R^{r\times r}$ shared across samples.
-Its lower and upper triangular entries parameterize
-\begin{align}
- L&=\tril(\Theta,-1)+\diag\!\left(
-    \operatorname{softplus}(\diag\Theta+\log(e-1))\right),\\
- \Omega&=\triu(\Theta,1)-\triu(\Theta,1)^\T,\qquad
- J=LL^\T+\Omega.
+ J=LL^\T+\Omega,\qquad LL^\T\succ0,\qquad\Omega^\T=-\Omega.
  \label{eq:core}
-\end{align}
-Since $L$ has a positive diagonal, $LL^\T\succ0$; since
-$\Omega^\T=-\Omega$, it contributes coupling without changing the symmetric
-part of $J$. The equilibrium memory and compact map are
-\begin{equation}
- U^\star=(\I_r+J)^{-1}Z,\qquad
- F=(\I_r+J)^{-1}(\I_r-J)=2(\I_r+J)^{-1}-\I_r.
- \label{eq:solve}
 \end{equation}
-In implementations, inverse notation denotes a linear solve.
-$J$ and $F$ are shared across samples; $P$, $Z$, and $U^\star$ are not.
-
-To see the error-correction interpretation, define
+Its symmetric part is positive definite, so $J$ is strictly accretive.
+We use a lower triangular $L$ with positive diagonal; the unconstrained
+parameterization is given in Appendix~\ref{app:parameters}.
+Choose the regularizer to match the frame:
 \begin{equation}
  \Gamma_X=\I_r+LL^\T-P^\T P\succ0.
  \label{eq:gamma}
 \end{equation}
-The memory dynamics become
-\begin{align}
- \dot U&=\underbrace{P^\T(C-PU)}_{\text{association residuals}}
-         -\underbrace{\Gamma_XU}_{\text{regularization}}
-         -\underbrace{\Omega U}_{\text{skew coupling}}\\
-       &=Z-(\I_r+J)U.
+Positivity follows from $P^\T P\prec\I_r$.
+This choice cancels the frame Gram term in Eq.~\eqref{eq:joint-field}:
+\begin{equation}
+ \dot U=Z-(P^\T P+\Gamma_X+\Omega)U
+       =Z-(\I_r+J)U.
  \label{eq:dynamics}
-\end{align}
-The residual term sums all positions' prediction errors against the same
-state. When $\Omega=0$, its equilibrium minimizes
+\end{equation}
+The equilibrium and its reflected map are therefore
+\begin{equation}
+ \begin{aligned}
+ U^\star&=(\I_r+J)^{-1}Z,\\
+ F&=2(\I_r+J)^{-1}-\I_r\\
+  &=(\I_r+J)^{-1}(\I_r-J).
+ \end{aligned}
+ \label{eq:solve}
+\end{equation}
+Here and below, inverse notation denotes a linear solve.
+The learned $J$ and $F$ are shared across samples. Each input supplies its
+own $P$, $Z$, and $U^\star$. Thus one core factorization serves the batch,
+while the frame factorization remains input-dependent.
+No inner iteration count or learning rate is needed.
+
+The cancellation is a design choice: the frame and regularizer jointly
+define the memory problem. When $\Omega=0$, the equilibrium minimizes
 \begin{equation}
  \mathcal E_X(U)=\tfrac12\norm{PU-C}_F^2+
                     \tfrac12\tr(U^\T\Gamma_XU).
  \label{eq:objective}
 \end{equation}
-For nonzero $\Omega$, the equilibrium solves the strongly monotone linear
-equation $(\I_r+J)U=Z$, while the dynamics need not be a gradient flow of
-this scalar objective.
+With nonzero $\Omega$, it solves a strongly monotone linear equation.
+The same existence guarantee holds, although the field is no longer the
+gradient of this scalar objective.
 
-The dependence of $\Gamma_X$ on $P$ is deliberate. It cancels the frame Gram
-matrix in the total correction system, leaving the learned matrix
-$\I_r+J$. This is a structured regularized-memory construction, not ordinary
-ridge regression with an independently chosen scalar penalty. It is also
-why the solve can be shared across samples without making their memories
-identical. The dynamics explain the state; the forward pass computes that
-state directly and does not choose an inner step count or learning rate.
+\subsection{Reading the memory back to tokens}
+\label{sec:readout}
 
-\subsection{Content plus a compact correction}
+The equilibrium alone specifies a memory, not a token output.
+We read it through the same coordinates used for writing.
+First, form the reflected response $2U^\star-Z=FZ$.
+This gives a contractive compact map $F$
+(Theorem~\ref{thm:contraction}). Its parameterization covers every real
+strict contraction in $r$ dimensions, including nonsymmetric maps.
 
-The solve in Eq.~\eqref{eq:solve} maps the contextual statistic $Z$ to
-$U^\star$. Reflecting this resolvent gives $2U^\star-Z=FZ$, a compact
-contraction (Theorem~\ref{thm:contraction}). We lift this map through the
-same frame used to write the memory and retain a content response through
-$\I_N-PP^\T$. With a learned per-head scalar
-$\eta=\tanh(\eta_{\rm raw})\in(-1,1)$, the resulting readout is
+We combine this contextual response with a content response:
 \begin{align}
- Y&=\eta C+P\left[2U^\star-(1+\eta)Z\right]\\
-  &=\underbrace{\eta C}_{\text{content term}}
-    +\underbrace{P(F-\eta\I_r)P^\T C}_{\text{rank-limited correction}}.
+ Y&=\eta(\I_N-PP^\T)C+PFP^\T C\\
+  &=\underbrace{\eta C}_{\text{content}}
+    +\underbrace{P(F-\eta\I_r)P^\T C}_{\text{contextual correction}}.
  \label{eq:readout}
 \end{align}
-Equivalently, $Y=\eta(\I_N-PP^\T)C+PFP^\T C$.
-The factor two is inherited from the reflected resolvent in
-Eq.~\eqref{eq:solve}; it is not an arbitrary output scale.
+Here $\eta=\tanh(\eta_{\rm raw})\in(-1,1)$ is learned per head.
+Equivalently, $Y=\eta C+P[2U^\star-(1+\eta)Z]$.
+The factor two comes from the reflection in Eq.~\eqref{eq:solve}.
+The paired terms in Eq.~\eqref{eq:readout} preserve the gain bound when
+lifting $F$ to token space. Theorem~\ref{thm:contraction} makes this precise.
 Head outputs are concatenated and passed through a learned output projection.
 
 The default \textsc{Equilibrium} mode learns $F$ through $J$.
-The \textsc{Complement} mode fixes $F=0$ and omits the core parameters:
+Setting $F=0$ gives \textsc{Complement}, which omits the core parameters:
 \begin{equation}
  Y_{\rm com}=\eta(\I_N-PP^\T)C
             =\eta(\I_N+AA^\T)^{-1}C.
  \label{eq:complement}
 \end{equation}
-It is a nonzero, input-dependent mixer. The identity on the right is useful
-for analysis; long sequences do not require a token-space inverse.
-At initialization, $\Theta=0$ gives $L=\I_r$, $J=\I_r$, and $F=0$.
-With identical remaining parameters, both modes therefore start from the
-same function. The memory itself is $U^\star=Z/2$, not zero.
-Equilibrium can subsequently learn a compact correction, while Complement
-continues to learn the frame, content, output projection, and $\eta$.
-We initialize $\eta$ to $0.9$.
+Complement still mixes context through $P$.
+Neither $PP^\T$ nor $\I_N-PP^\T$ is an orthogonal projector. We initialize Equilibrium at $J=\I_r$, hence $F=0$, and use
+$\eta=0.9$ in both modes. With matched remaining parameters, the modes
+start from the same function. Equilibrium then learns the compact map,
+while both modes learn the frame, content, output projection, and $\eta$.
+
+\paragraph{Optional rotary value encoding.}
+Relative position can enter through the content pathway without separating
+write and read coordinates. Following RoVE \cite{garcia2026rove}, we rotate
+content before aggregation and apply the inverse rotation at readout.
+For column vectors $c_i$ and rotations $O_i=O(t_i)$ at positions $t_i$,
+\begin{equation}
+ y_i=\eta c_i+\sum_j D_{ij}O_i^\T O_j c_j,
+ \qquad D=P(F-\eta\I_r)P^\T.
+ \label{eq:rove-readout}
+\end{equation}
+At a fixed frequency scale, $O_i^\T O_j=O(t_j-t_i)$ encodes relative offset.
+This extension adds no learned parameters and preserves the fixed-frame
+gain bound. Appendix~\ref{app:rove} gives the compact computation and settings.
 
 \section{Properties of the Operator}
 \label{sec:theory}
 
-All statements in this section concern one head in exact arithmetic.
+The core equation determines whether memory exists; the readout determines
+how it affects tokens. We analyze both in exact arithmetic for one head,
+then distinguish the resulting input dependence from bidirectional scans.
 Proofs are in Appendix~\ref{app:proofs}.
+
+\subsection{A unique memory and a bounded readout}
+\label{sec:stability}
 
 \begin{proposition}[Well-posed memory]
 \label{prop:solve}
@@ -314,13 +373,11 @@ unique equilibrium in Eq.~\eqref{eq:solve}, and
  \norm{(\I_r+J)^{-\T}}_2\le\mu^{-1}.
 \end{equation}
 Every trajectory obeys
-$\norm{U(t)-U^\star}_F\le e^{-\mu t}\norm{U(0)-U^\star}_F$.
+\[\norm{U(t)-U^\star}_F\le e^{-\mu t}\norm{U(0)-U^\star}_F.\]
 \end{proposition}
 
-The bound controls sensitivity to the right-hand side in both the forward
-and adjoint solves. The full parameter gradients additionally depend on the
-projections, frame, and core parameterization; the system's condition number
-also depends on $\norm{\I_r+J}_2$.
+The same bound controls right-hand-side perturbations in the forward and
+adjoint solves. It does not depend on the number of tokens.
 
 \begin{theorem}[Contractive compact and token maps]
 \label{thm:contraction}
@@ -347,286 +404,432 @@ The accretive Cayley parameterization covers every real strict contraction
 in $r$ dimensions (Appendix~\ref{app:coverage}); the rank and shared-frame
 structure still constrain the token operator.
 
-The norm bound is conditional on the realized frame. The nonlinear map
-$X\mapsto K_XC(X)$ also differentiates through $P(X)$, and the surrounding
-output projection and residual connection are unrestricted. We therefore do
-not interpret Theorem~\ref{thm:contraction} as a global Lipschitz certificate
-for the model or as a proof of generalization.
+The norm statement holds for a fixed realized frame: it bounds the content
+map $C\mapsto K_XC$, rather than the derivative through $P(X)$ or the
+surrounding residual block.
 
-\begin{proposition}[Exact analysis in compact space]
-\label{prop:spectrum}
-Let $P=Q S V^\T$ be a thin singular value decomposition with
-$k=\rank(P)$, $Q^\T Q=V^\T V=\I_k$, and positive diagonal $S$.
-The token map is orthogonally similar to
+The exact singular values of the token map can also be recovered from a
+matrix of size at most $r$. Appendix~\ref{app:spectrum} gives this compact
+representation and its proof.
+
+\subsection{Interactions across both sides of a token}
+\label{sec:ssm}
+
+Global frame normalization lets one side of a token change how the other
+side is read. A three-token example shows this directly. Set
+$A=(1,1,t)^\T$, $C=(s,0,0)^\T$, $F=0$, and $\eta\ne0$.
+Equation~\eqref{eq:complement} gives
 \begin{equation}
- \left[\eta\I_k+S V^\T(F-\eta\I_r)V S\right]
-       \oplus\eta\I_{N-k}.
- \label{eq:certificate}
+ y_2=-\frac{\eta s}{3+t^2}.
+ \label{eq:cross-context}
 \end{equation}
-Its singular values, including its exact spectral norm, can therefore be
-obtained from a matrix of size at most $r$, together with $N-k$ copies of
-$|\eta|$.
-\end{proposition}
+The center token is fixed. Yet changing the suffix variable $t$ changes
+the coefficient of the prefix content $s$.
 
-Without a positional module, permuting input rows permutes the output rows:
-$A^\T A$ and the shared core are unchanged. This is useful for unordered
-full-context aggregation, but it does not encode positions by itself.
-The visual backbone introduces spatial information separately through CPE.
+A locally parameterized bidirectional state-space mixer has the form
+\begin{equation}
+ \begin{aligned}
+ h_i^+&=A^+(x_i)h_{i-1}^++b^+(x_i),\\
+ h_i^-&=A^-(x_i)h_{i+1}^-+b^-(x_i),\\
+ y_i&=C^+(x_i)h_i^++C^-(x_i)h_i^-+d(x_i).
+ \end{aligned}
+ \label{eq:ssm-class}
+\end{equation}
+Its boundary states are input-independent. The coefficients may be
+nonlinear functions of the current token, and the state dimension is
+unrestricted. Once $x_i$ is fixed, the output separates into
+$y_i=f_i(x_{1:i})+g_i(x_{i:N})$. Changing the suffix cannot change the
+prefix response. This additive structure cannot express
+Eq.~\eqref{eq:cross-context} for all $s,t$.
 
-\section{Compact Computation}
+\begin{theorem}[Separation from locally parameterized bidirectional SSMs]
+\label{thm:ssm}
+For every positive rank $r$, the MemSolve family contains a map that cannot
+be represented by Eq.~\eqref{eq:ssm-class} for all inputs, irrespective of
+that mixer's state dimension. The result holds for both Equilibrium and
+Complement.
+\end{theorem}
+
+Appendix~\ref{app:ssm} proves the result by a mixed finite difference and
+extends the example to any rank. The theorem concerns individual mixers
+with local coefficients and linear directional merging. Stacks, nonlinear
+merges, and globally conditioned coefficients define different model classes.
+
+\section{Hardware-Aware Parallel Computation}
 \label{sec:implementation}
 
-The forward pass can eliminate the frame in Eq.~\eqref{eq:frame} by forming
-the sufficient statistics
+A compact memory alone does not guarantee efficient execution.
+Materializing the frame adds token-sized storage and memory traffic.
+We instead reduce the input to two compact statistics, solve in memory
+space, and read out token rows in parallel.
+
+\subsection{Reduce, solve, and read out}
+
+Substituting $P=AR^{-1}$ into Eq.~\eqref{eq:readout} gives
 \begin{equation}
- G=A^\T A,\qquad H=A^\T C,\qquad R^\T R=\I_r+G.
-\end{equation}
-The forward pass is exactly
-\begin{equation}
- Z=R^{-\T}H,\qquad
- W=R^{-1}(F-\eta\I_r)Z,\qquad Y=\eta C+AW.
+ \begin{aligned}
+ G&=A^\T A,\qquad H=A^\T C,\\
+ R^\T R&=\I_r+G,\qquad Z=R^{-\T}H,\\
+ W&=R^{-1}(F-\eta\I_r)Z,\\
+ Y&=\eta C+AW.
+ \end{aligned}
  \label{eq:nop}
 \end{equation}
-This eliminates the token-sized intermediate $P$ and computes $F$ once per
-head per forward pass. The core is recomputed on each forward pass.
-Complement can instead solve
-$(\I_r+G)D=H$ and use $Y=\eta(C-AD)$, avoiding the core solve entirely.
-The current CUDA implementation uses a common factor-based computation for
-both modes: it constructs $T=R^{-\T}$ once by solving triangular systems
-with identity right-hand sides, then evaluates $Z=TH$ and
-$W=T^\T(F-\eta\I_r)Z$, with $F=0$ for Complement. This replaces repeated
-triangular dependencies with compact matrix products without changing the operator.
+Only $G$ and $H$ aggregate information across tokens.
+Once $W$ is available, each output row depends only on its local $A,C$.
+Algorithm~\ref{alg:compact-forward} gives this computation.
+Equilibrium and Complement use the same steps; Complement takes $F=0$.
 
-Per head, the mixer costs
-$O(Nr^2+Nrh+r^3+r^2h)$, with token storage linear in $N$ and compact
-storage $O(r^2+rh)$. Input and output projections add their usual dense-linear
-costs, also linear in $N$ for fixed model dimensions. These bounds concern
-sequence scaling; increasing rank still raises the cost of statistics and
-factorizations. When physical $N\le r$, the implementation evaluates the
-complementary term using the smaller positive-definite system
-$\eta(\I_N+AA^\T)^{-1}C$. This algebraically equivalent branch avoids
-subtraction of nearly equal terms for short, strong-relation inputs and
-never creates a system larger than the supported rank.
+\begin{algorithm}[H]
+\caption{MemSolve: compact forward computation (one sample and head)}
+\label{alg:compact-forward}
+\begin{algorithmic}[1]
+\Require Relations $B\in\R^{N\times r}$, content $C\in\R^{N\times h}$;
+ shared $F$, scalar $\eta$; $N>r$ valid tokens
+\Ensure Token output $Y\in\R^{N\times h}$
+\State $A\gets B/\sqrt N$
+\State $G\gets A^\T A$; $H\gets A^\T C$ \Comment{Parallel token reductions}
+\State $R\gets\Chol(\I_r+G)$ \Comment{$R^\T R=\I_r+G$}
+\State $Z\gets\Solve(R^\T,H)$
+\State $W\gets\Solve(R,(F-\eta\I_r)Z)$
+\State \Return $\eta C+AW$ \Comment{Parallel token readout}
+\end{algorithmic}
+\end{algorithm}
 
-Our CUDA implementation combines tiled token statistics and readout kernels
-with library factorizations and compact solves. It uses Triton for token
-operations and selective fusion, cuSOLVERDx for small factorizations and
-solves, and cuBLASLt for projection gradients. The backward pass
-uses analytic first-order derivatives for the rank-space path and reuses
-compact factors. The short-sequence path differentiates its direct solves;
-neither path backpropagates through an unrolled memory trajectory.
-BF16 token operands are accumulated in FP32. Compact matrices and solves
-remain in FP32, while sensitive readout coefficients are represented by a
-BF16 leading part and a BF16 residual part, following the multiword
-arithmetic principle of Henry et al.~\cite{henry2019bfloat}.
-The output follows the activation dtype. Algorithms~\ref{alg:forward}--\ref{alg:core-backward}
-in Appendix~\ref{app:implementation} specify the forward computation,
-rank-space backward pass, and shared-core gradients.
+The learned $F$ is evaluated once per head in each forward pass.
+Each sample then requires $O(Nr^2+Nrh+r^3+r^2h)$ arithmetic and
+$O(r^2+rh)$ compact storage per head. Token storage is linear in $N$.
+Input and output projections also have linear sequence cost at fixed width.
+For physical length $N\le r$, an equivalent token-space solve avoids
+subtraction in the complementary term. Its dimension is at most $r$.
+Appendix~\ref{app:forward} gives both length regimes and padding handling.
+
+\subsection{Exact sequence parallelism}
+
+The two statistics are sums over token rows. Partition those rows across
+$p$ devices, using the same global valid count $N$ to normalize each shard:
+\begin{equation}
+ \begin{gathered}
+ A_s=B_s/\sqrt N,\\
+ G=\sum_{s=1}^{p}A_s^\T A_s,\qquad
+ H=\sum_{s=1}^{p}A_s^\T C_s.
+ \end{gathered}
+ \label{eq:sequence-parallel}
+\end{equation}
+A sum reduction gives each device the centralized $G,H$.
+Each device computes the same $W$ and reads out its own rows as
+$Y_s=\eta C_s+A_sW$. The statistic payload is $O(r^2+rh)$ per sample and
+head, independent of sequence length. No token activation gather is needed.
+
+The backward pass likewise reduces a compact readout adjoint before
+computing local token gradients. Outputs and reduced gradients equal the
+unsharded computation in real arithmetic; floating-point reduction order
+can change rounding. Algorithm~\ref{alg:sequence-parallel} specifies the
+reductions and the treatment of shared parameter gradients.
+
+\subsection{Selective fusion}
+
+The main memory traffic comes from token projections, statistics, and
+readout. We fuse token operations around their compact intermediates and
+keep factorizations separate. This avoids storing $P$ and lets the
+factorizations use specialized solvers. The backward pass reuses compact
+factors. It also reduces core gradients across the batch without storing
+one core adjoint per sample.
+
+The GPU implementation uses Triton for tiled token operations, cuSOLVERDx
+for compact factorizations, and cuBLASLt for projection gradients.
+Compact solves and adjoints retain FP32 storage.
+The readout splits sensitive coefficients into a BF16 leading word and a
+BF16 residual word \cite{henry2019bfloat}. Both products accumulate in FP32
+before output rounding. This improves coefficient precision while retaining
+Tensor Core products. Appendix~\ref{app:precision} specifies precision,
+scheduling, and the surrounding compilation and CUDA Graph execution.
 
 \section{Experiments}
 \label{sec:experiments}
 
-We evaluate MemSolve-ViT-S on ImageNet-1K and study its learned core on a
-fixed ImageNet-100 subset. Table~\ref{tab:architecture} also lists Tiny and
-Base configurations; all classification results below use the Small backbone.
+We evaluate whether the same equilibrium operator supports visual
+recognition and bidirectional language modeling, and whether its sufficient
+statistics provide useful sequence parallelism. All MemSolve models below
+use Equilibrium unless explicitly labeled Complement.
+The reported experiments do not enable the optional RoVE extension.
 
-\subsection{Visual backbone and training}
+\subsection{ImageNet classification}
 
-MemSolve-ViT uses non-overlapping $16\times16$ patches and twelve blocks at a
-constant width. Each block first adds a residual $3\times3$ depthwise CPE,
-then applies a pre-LayerNorm MemSolve branch and a pre-LayerNorm GELU FFN
-branch, each with a residual connection and stochastic depth.
-A final per-token LayerNorm precedes mean pooling and a linear classifier.
-There is no class token, absolute position table, LayerScale, or internal
-rotary transform. Table~\ref{tab:architecture} specifies the configurations.
+\paragraph{Model and protocol.}
+MemSolve-ViT is a non-hierarchical backbone with non-overlapping
+$16\times16$ patches and twelve constant-width blocks. Each block adds
+residual $3\times3$ depthwise CPE \cite{chu2023cpe}, then applies pre-LayerNorm MemSolve and
+GELU FFN branches with residual connections and stochastic depth
+(Fig.~\ref{fig:visual-backbone}). A final token-wise LayerNorm precedes mean
+pooling and a linear classifier. We report completed Small and Base runs;
+Appendix~\ref{app:vision} gives the model configurations.
 
-\begin{table}[t]
+\begin{figure*}[t]
 \centering
-\caption{\textbf{MemSolve-ViT configurations.} Parameters include the
-1,000-class head and the Equilibrium core. All models have depth 12 and
-patch size 16; DropPath increases linearly to the listed maximum.}
-\label{tab:architecture}
-\begin{tabular}{lrrrrrr}
+\includegraphics[width=5.8in]{visual_backbone.pdf}
+\caption{\textbf{MemSolve-ViT.}
+The constant-width backbone stacks twelve blocks and uses mean pooling.
+The expanded block has three residual branches: depthwise CPE,
+pre-LayerNorm MemSolve, and pre-LayerNorm GELU FFN.
+Stochastic depth on the latter two branches is omitted.}
+\label{fig:visual-backbone}
+\end{figure*}
+
+We train from scratch on ImageNet-1K \cite{russakovsky2015imagenet} for
+300 epochs at $224\times224$ with a recipe derived from plain ViT$^3$.
+Both models use AdamW, cross-entropy, Mixup/CutMix, RandAugment, and
+repeated augmentation, with global batch 2,048 and peak learning rate
+$2\times10^{-3}$. We evaluate EMA weights with decay $0.9999$ and report
+the checkpoint with the highest validation Top-1.
+Validation uses bicubic resize to a shorter side of 256 and a
+$224\times224$ center crop. Appendix~\ref{app:vision} gives the full recipe.
+
+\begin{table}[!ht]
+\centering
+\small
+\setlength{\tabcolsep}{2.5pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{lcrr}
 \toprule
-Model & Width & Heads & Rank/head & FFN width & DropPath & Params (M)\\
+Method & Type & \#Params & Top-1\\
 \midrule
-Tiny &192&6&16&768&0.0&5.054\\
-Small&384&6&32&1584&0.1&19.876\\
-Base &768&12&48&3072&0.4&77.981\\
+ConvNeXt-S (iso.) \cite{liu2022convnext} & ConvNet & 22M & 79.7\\
+DeiT-S \cite{touvron2021deit} & Transformer & 22M & 79.8\\
+Vim-S \cite{zhu2024vim} & SSM & 26M & 80.3\\
+Vim-S$^\dagger$ \cite{zhu2024vim} & SSM & 26M & 81.4\\
+LION-d$^\natural$-S \cite{afzal2025lion} & Linear & 22M & 79.9\\
+ViG-S \cite{liao2025vig} & Linear & 23M & 81.7\\
+ViT$^3$-S \cite{han2026vit3} & TTT & 24M & 81.6\\
+\rowcolor{black!5}
+\textbf{MemSolve-ViT-S} & Equilibrium & 20M & 81.0\\
+\midrule
+ConvNeXt-B (iso.) \cite{liu2022convnext} & ConvNet & 87M & 82.0\\
+ViT-B \cite{hwang2024hydra} & Transformer & 87M & 80.6\\
+DeiT-B \cite{touvron2021deit} & Transformer & 86M & 81.8\\
+Vim-B \cite{zhu2024vim} & SSM & 98M & 81.9\\
+Vim-B$^\dagger$ \cite{zhu2024vim} & SSM & 98M & 83.2\\
+Hydra-ViT-B \cite{hwang2024hydra} & SSM & 91M & 81.6\\
+LION-d$^\natural$-B \cite{afzal2025lion} & Linear & 86M & 80.2\\
+ViG-B \cite{liao2025vig} & Linear & 89M & 82.6\\
+ViT$^3$-B \cite{han2026vit3} & TTT & 90M & 82.6\\
+\rowcolor{black!5}
+\textbf{MemSolve-ViT-B} & Equilibrium & 78M & 82.7\\
 \bottomrule
 \end{tabular}
-\end{table}
-
-We train from scratch for 300 epochs at $224\times224$ on ImageNet-1K
-\cite{russakovsky2015imagenet}. The recipe is derived from the plain
-ViT$^3$ training setup, with the batching and augmentation changes detailed below.
-Both completed Small runs use fused AdamW, weight decay $0.05$, gradient
-clipping at norm 5, cross-entropy with label smoothing $0.1$, Mixup $0.8$,
-CutMix $1.0$, RandAugment, and random erasing $0.25$.
-The learning rate warms up linearly for 20 epochs and then decays with an
-update-based cosine schedule. Validation resizes the shorter side to 256
-and takes a $224\times224$ center crop. Both runs use seed 0 and evaluate
-ordinary model weights without EMA. We report the best validation Top-1
-checkpoint, and provide final-epoch results separately.
-
-The baseline uses global batch 1,024 and peak learning rate $10^{-3}$.
-The second run uses three-view repeated augmentation (RA), global batch
-2,048, and peak learning rate $2\times10^{-3}$. Each GPU processes 512 images
-per microbatch; the second run accumulates two microbatches on each of two
-A800 GPUs. Mixup/CutMix acts on the complete physical microbatch.
-Repeated augmentation keeps an approximately 1.28M-presentation epoch
-budget instead of tripling it. The second run also changes sample ordering.
-Consequently, this comparison measures the combined training configuration,
-not the isolated causal effect of RA.
-
-\subsection{ImageNet-1K classification}
-
-\begin{table}[t]
-\centering
-\caption{\textbf{Published non-hierarchical Small backbones and MemSolve.}
-All entries use $224\times224$ inputs. Baseline numbers are taken from the
-cited papers; these are not matched-training-protocol comparisons.
-$\natural$ denotes LION's multiple scans. Vim-S$^\dagger$ additionally uses
-30 epochs of long-sequence fine-tuning. MemSolve values use the best
-validation checkpoint of each completed 300-epoch run.}
+\caption{\textbf{Non-hierarchical models on ImageNet-1K.}
+Top-1 is in percent. All inputs are $224\times224$. Baselines follow their published training
+protocols; MemSolve reports EMA results.
+$\dagger$: additional long-sequence fine-tuning;
+$\natural$: multiple scans.
+Appendix~\ref{app:vision} details the reporting conventions.}
 \label{tab:imagenet}
-\begin{tabular}{llrr}
-\toprule
-Model & Mixer family & Params (M) & Top-1 (\%)\\
-\midrule
-DeiT-S \cite{touvron2021deit} & Self-attention &22&79.8\\
-LION-d$^\natural$-S \cite{afzal2025lion} & Bidirectional linear recurrence &22&79.9\\
-Vim-S \cite{zhu2024vim} & Bidirectional state space &26&80.3\\
-Vim-S$^\dagger$ \cite{zhu2024vim} & Bidirectional state space &26&81.4\\
-ViT$^3$-S \cite{han2026vit3} & Test-time training &24&81.6\\
-\midrule
-MemSolve-ViT-S & Associative-memory equilibrium &19.88&80.79\\
-MemSolve-ViT-S (RA, batch 2,048) & Associative-memory equilibrium &19.88&80.95\\
-\bottomrule
-\end{tabular}
 \end{table}
 
-Table~\ref{tab:imagenet} places MemSolve among published plain backbones.
-The batch-1,024 configuration reaches $80.79\%$ Top-1, while the RA/batch-2,048
-configuration reaches $80.95\%$ with $19.88$M parameters. The latter is
-above the paper-reported Vim-S result and below Vim-S$^\dagger$ and
-ViT$^3$-S. This is a comparison of complete models under their respective
-recipes; it does not isolate the effect of replacing the token mixer.
+\paragraph{Results.}
+MemSolve-ViT-S reaches $81.0\%$ with $20$M parameters
+(Table~\ref{tab:imagenet}). It exceeds DeiT-S, isotropic ConvNeXt-S,
+Vim-S, and LION-d$^\natural$-S, while remaining below ViG-S, ViT$^3$-S,
+and Vim-S with long-sequence fine-tuning.
+MemSolve-ViT-B reaches $82.7\%$ with $78$M parameters.
+It exceeds Vim-B's standard-training result ($81.9\%$, $98$M)
+by $0.8$ percentage points with approximately $20\%$ fewer parameters.
+It also outperforms Hydra-ViT-B ($81.6\%$, $91$M) by $1.1$ points.
+It is close to ViG-B and ViT$^3$-B, which report $82.6\%$ with $89$M
+and $90$M parameters.
 
-\begin{table}[t]
-\centering
-\caption{\textbf{Completed Small runs on ImageNet-1K.} CE is hard-label
-validation cross-entropy. ``Best'' refers to Top-1 selection; the CE shown
-in that column comes from the same checkpoint, not a separately selected
-minimum. Each row is one seed-0 run.}
-\label{tab:smallruns}
-\begin{tabular}{lrrrrr}
-\toprule
-Configuration & Best epoch & Best Top-1 & CE at best & Final Top-1 & Final CE\\
-\midrule
-Batch 1,024, no RA &294&80.785&0.8556&80.680&0.8576\\
-Batch 2,048, RA    &300&80.948&0.8419&80.948&0.8419\\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The combined RA/batching change improves best accuracy by $0.163$
-percentage points and lowers validation CE at the selected checkpoint
-(Table~\ref{tab:smallruns}). Figure~\ref{fig:curves} includes the full
-validation trajectories. These observations describe two training runs;
-they do not estimate seed-to-seed uncertainty.
-
-\subsection{Does the learned core contribute?}
-\label{sec:ablation}
-
-We compare Equilibrium with Complement on the 100 ImageNet classes used in
-the public CMC class list\footnote{\url{https://github.com/HobbitLong/CMC/blob/master/imagenet100.txt}}.
-Both use the Small backbone, a 100-class classifier, rank 32, seed 0,
-and the same initialization for every shared parameter.
-The two modes have the same initial mathematical function, since $F=0$;
-only Equilibrium has trainable core parameters. We train each for 30 epochs
-with batch 512, a five-epoch warmup, peak learning rate $5\times10^{-4}$,
-and a full 30-epoch cosine schedule. Other augmentation and optimizer
-settings follow the no-RA configuration above.
-
-\begin{table}[t]
-\centering
-\caption{\textbf{Learning the compact core on ImageNet-100.}
-Both modes reach their best Top-1 at epoch 30. This is a single-seed,
-30-epoch comparison with matched shared initialization, not a converged
-ImageNet-1K comparison.}
-\label{tab:core}
-\begin{tabular}{lrrrr}
-\toprule
-Mode & Params (M) & Top-1 (\%) & Top-5 (\%) & Validation CE\\
-\midrule
-Complement ($F=0$)&19.456&62.84&87.74&1.4929\\
-Equilibrium (learned $F$)&19.530&64.54&88.76&1.4541\\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Equilibrium improves Top-1 by $1.70$ percentage points and reduces validation
-CE (Table~\ref{tab:core}). Its additional 73,728 parameters are the
-12 layers' six rank-32 cores. Starting from the same mathematical function,
-learning the compact map therefore improves the 30-epoch outcome in this
-setting. Longer runs and component ablations would be needed to determine
-the gain at convergence and the separate contributions of symmetric and
-skew coupling.
+\paragraph{Convergence.}
+MemSolve-ViT-S reaches the same validation accuracy in fewer epochs
+than the author-released DeiT-S run \cite{touvron2021deit}
+(Fig.~\ref{fig:curves}).
+Under their respective 300-epoch recipes, MemSolve-ViT-S first reaches
+$70\%$ Top-1 at epoch 65, compared with epoch 118 for DeiT-S.
+It reaches $75\%$ at epoch 148 rather than 192.
+These thresholds require approximately $45\%$ and $23\%$ fewer epochs,
+respectively. Both curves evaluate ordinary weights.
 
 \begin{figure}[!ht]
 \centering
-\includegraphics[width=\linewidth]{training_curves.pdf}
-\caption{\textbf{Validation trajectories from completed runs.}
-Top: the two 300-epoch ImageNet-1K Small configurations. Bottom: the
-30-epoch ImageNet-100 core comparison. Every recorded epoch is plotted
-without smoothing, using ordinary model weights. Curves show one seed
-per configuration, not means over repeated runs. The RA comparison also
-changes effective batch, learning-rate scale, and sample ordering.}
+\includegraphics[width=\columnwidth]{training_curves.pdf}
+\caption{\textbf{ImageNet-1K convergence from training logs.}
+Validation at $224\times224$; every recorded epoch is shown without smoothing.
+Both models train for 300 epochs and evaluate ordinary weights.
+Recipes differ, and epochs do not measure wall-clock time.
+Appendix~\ref{app:vision} gives the log sources.}
 \label{fig:curves}
 \end{figure}
 
+\begin{table*}[t]
+\centering
+\caption{\textbf{GLUE development results at Base scale.}
+Published baselines are from LION Table~10, M2-BASE rows; MemSolve reports
+per-task means. MNLI averages matched/mismatched accuracy, QQP averages
+accuracy/F1, MRPC uses F1, STS-B uses Spearman, and CoLA uses Matthews
+correlation; other tasks use accuracy. Avg. is the unweighted mean of the
+eight task scores. Baseline pretraining, checkpoint selection, and seed
+aggregation are not matched to our runs.}
+\label{tab:glue}
+\setlength{\tabcolsep}{3.2pt}
+\small
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrrrrrrr@{}}
+\toprule
+Model & MNLI & RTE & QQP & QNLI & SST-2 & STS-B & MRPC & CoLA & Avg.\\
+\midrule
+BERT &84.6&64.3&90.0&89.8&92.5&86.7&89.6&60.4&82.3\\
+LION-LIT &82.5&63.5&89.7&89.3&91.7&87.2&89.4&49.2&80.3\\
+LION-D &82.9&52.5&89.6&88.4&91.9&86.0&83.9&53.6&78.6\\
+LION-S &83.2&53.5&89.4&88.9&93.0&37.7&77.9&53.2&72.1\\
+\midrule
+MemSolve &83.0&74.2&89.8&88.6&91.6&89.2&91.0&47.5&81.9\\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+\subsection{Masked language modeling and GLUE}
+\label{sec:language}
+
+\paragraph{A parameter-matched encoder.}
+We replace BERT's attention mixer with MemSolve in a 14-layer encoder with
+width 768, twelve heads, rank 32, and a SwiGLU FFN with intermediate width
+2,048 per branch. It has 112M parameters including the tied MLM head,
+close to the 110M BERT-Base scale \cite{devlin2019bert}.
+The model uses BERT's post-LayerNorm residual structure and learned
+absolute positions. A centered residual depthwise convolution of width
+three precedes the relation/content projection in every layer. It starts
+as the identity and receives only the corrupted MLM input. The completed
+model does not use rotary encoding.
+
+\paragraph{Pretraining.}
+We follow the LION/M2-derived C4 masked-language setup
+\cite{raffel2020t5,afzal2025lion}: sequence length 128, global batch 4,096,
+70,000 optimizer steps, and training mask probability $0.30$.
+Local C4 files are streamed and documents are individually truncated;
+independent documents are not packed into one attention context.
+AdamW uses peak learning rate $8\times10^{-4}$, $6\%$ linear warmup,
+and linear decay to $2\%$ of the peak, following the public code setting.
+Appendix~\ref{app:nlp} states the optimizer conversion and differences from
+the paper description. On a fixed 10,000-document validation subset with
+$15\%$ masking, the selected checkpoint reaches $66.4\%$ masked-token
+accuracy and masked-token NLL $1.6211$ over 169,544 targets. The complete
+run takes 31.80 hours on two A800-80GB GPUs, including scheduled validation
+and checkpointing.
+
+\paragraph{Downstream evaluation.}
+We fine-tune on eight GLUE tasks using the LION paper's M2-BASE task
+hyperparameters \cite{wang2019glue,afzal2025lion}. MNLI, QQP, QNLI,
+SST-2, and CoLA start from the MLM checkpoint; RTE, MRPC, and STS-B start
+from the fine-tuned MNLI encoder. All tasks use length 128 and final-checkpoint
+development evaluation. We repeat the smaller tasks with three to five
+seeds while retaining one run for MNLI, QQP, and QNLI.
+
+
+
+MemSolve achieves an average of $81.9$ (Table~\ref{tab:glue}).
+This exceeds the reported LION M2-BASE aggregates and is $0.4$ points
+below the reported BERT aggregate. Relative to BERT, RTE has the largest
+gain and CoLA the largest shortfall.
+Appendix~\ref{app:glue} reports each task's seed count and standard deviation.
+The average combines task means from different numbers of fine-tuning runs.
+
+\subsection{Sequence-parallel execution}
+\label{sec:efficiency}
+
+We measure forward and backward for a complete MemSolve layer, including
+input/output projections and parameter gradients, with batch one, width
+768, twelve heads, and rank 32. Table~\ref{tab:sequence-speed} compares one
+A800-80GB GPU with two-way sequence parallelism on the same GPU type.
+Synthetic inputs are BF16 and parameters are FP32. CUDA Graph replay excludes
+compilation and capture; the two-device measurement includes collectives
+and uses the slower rank's wall time. Optimizer steps are excluded.
+
+\begin{table}[!ht]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\caption{\textbf{Exact sequence-parallel training computation.}
+Times are milliseconds for forward plus backward; speedup is one-device
+time divided by two-device time. Each time is the median of three blocks
+of 50 graph replays after warmup.}
+\label{tab:sequence-speed}
+\begin{tabular}{llrrr}
+\toprule
+Mode & Tokens & 1 GPU & 2 GPUs & Speedup\\
+\midrule
+Equilibrium &128&0.322&0.489&$0.66\times$\\
+ &8,192&0.707&0.647&$1.09\times$\\
+ &32,768&2.221&1.341&$1.66\times$\\
+Complement &128&0.132&0.322&$0.41\times$\\
+ &8,192&0.692&0.586&$1.18\times$\\
+ &32,768&2.090&1.202&$1.74\times$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At 32,768 tokens, sequence parallelism gives training-computation speedups
+of $1.66\times$ for Equilibrium and $1.74\times$ for Complement. At 128 tokens,
+communication and replicated compact work outweigh the saved token work.
+The partition becomes useful as token work grows relative to communication.
+These measurements test execution scaling; they do not measure task
+accuracy at longer lengths.
+
 \section{Discussion and Limitations}
 
-MemSolve concentrates global interaction in a learned relation span.
-This gives a direct computational tradeoff: larger ranks can represent more
-independent interaction directions, but increase statistics and factorization
-costs. The shared frame also couples writing and reading, whereas separate
-query and key projections permit different association geometries.
-The present results support the shared construction for image classification;
-tasks requiring distinct write and read coordinates remain an open direction.
+MemSolve concentrates contextual changes in a learned relation span.
+Rank controls the number of modified directions and the cost of the compact
+systems. Outside that span, the operator retains a scalar content response.
+Sharing write and read coordinates supports the contraction guarantee,
+but it also ties where information is stored to where it is retrieved.
+These choices define the operator's capacity and computational tradeoff.
 
-The shared solve relies on co-designing the regularizer with the frame.
-Changing the memory objective may require a different factorization and
-readout analysis. Empirically, the present evaluation covers a Small visual
-backbone and a short core comparison. Larger models, language tasks, and
-longer sequences will test how broadly this construction applies. Repeated
-runs are also needed to quantify the training variance of the reported
-single-seed results.
+The experiments show that this construction learns useful representations
+in vision and language. Length generalization remains unresolved. The language experiments train
+and fine-tune at 128 tokens with learned absolute positions.
+The sequence-parallel benchmark establishes execution scaling, while task
+accuracy beyond the training length remains to be measured.
+ImageNet and MLM pretraining each use one seed per configuration.
+Repeated GLUE runs measure fine-tuning variation from a shared pretrained model.
 
 \section{Conclusion}
 
-MemSolve constructs a full-context associative memory by solving a compact
-correction system. A shared soft frame connects memory formation to a
-content-plus-correction readout, allowing the solve, contraction, and token
-spectrum to be analyzed within one formulation. The learned core is shared
-across samples while the memory remains input-dependent. Compact statistics
-make this formulation executable without a token-sized frame, and the
-completed image-classification experiments demonstrate that the resulting
-plain backbone is competitive at Small scale.
+MemSolve constructs full-context associative memory by solving a joint
+error-correction equilibrium. Its frame and regularizer reduce the memory
+equation to a shared compact core. The reflected readout gives a contractive
+token map for each fixed frame. Global normalization also couples evidence
+across both sides of a token, beyond the additive responses of locally
+parameterized bidirectional scans.
+Two compact statistics make this construction linear in sequence length
+at fixed rank and support exact sequence parallelism.
+The visual and language results demonstrate its use as a general token mixer.
 
-\clearpage
+\FloatBarrier
+\begingroup
+\raggedright
+\bibliographystyle{plain}
+\bibliography{references}
+\endgroup
+
+\onecolumn
 \appendix
 \section{Proofs and Structural Details}
 \label{app:proofs}
 
+We first establish the frame geometry. It gives the positive regularizer
+used in the memory equation. We then prove existence, contraction, and
+the compact spectrum, followed by the bidirectional-scan separation.
+
 \subsection{Soft-frame geometry}
+\label{app:frame}
 
 Since $R^\T R=\I+A^\T A$,
 \begin{equation}
  PP^\T=A(\I+A^\T A)^{-1}A^\T.
 \end{equation}
-An SVD of $A$ gives Eq.~\eqref{eq:soft-singular}. In particular,
+An SVD of $A$ gives
+\begin{equation}
+ \sigma_i(P)=\frac{\sigma_i(A)}{\sqrt{1+\sigma_i(A)^2}}<1.
+ \label{eq:soft-singular}
+\end{equation}
+In particular,
 $P^\T P\prec\I_r$ and $PP^\T\prec\I_N$, including rank-deficient cases.
 The Woodbury identity yields
 \begin{equation}
@@ -637,13 +840,17 @@ The reduced QR factorization of $[A^\T,\I_r]^\T$ with a positive diagonal
 in its triangular factor has top block $P$. Thus the QR reference and the
 compact Cholesky construction agree in exact arithmetic.
 
-Normalization by $\sqrt N$ has a specific, limited role. If
+The $\sqrt N$ normalization controls the scale of the relation statistic. If
 $N^{-1}\sum_i\norm{b_i}_2^2\le c$, then
 $\norm{A}_2^2\le\norm{A}_F^2\le c$ and
 $\kappa_2(\I+A^\T A)\le1+c$, independently of $N$.
-This conditional bound prevents sequence length alone from scaling the
-Gram matrix; it does not assume that feature energy is bounded throughout
-training or imply accuracy under length extrapolation.
+Under this feature-energy bound, the condition number does not grow with
+sequence length. Accuracy at unseen lengths is a separate empirical question.
+
+Without a positional module, the operator is permutation equivariant:
+permuting the rows of $A,C$ leaves $G,H$ unchanged and permutes the rows
+of $Y$. The visual and language backbones therefore supply position
+information outside the core operator.
 
 \subsection{Memory existence, sensitivity, and convergence}
 
@@ -683,12 +890,13 @@ Then $\I+F_0$ is invertible and
 \end{equation}
 Factor $\sym(J_0)=LL^\T$ and set
 $\Omega=(J_0-J_0^\T)/2$. The triangular/softplus parameterization can
-represent every such $L$ and $\Omega$. This establishes coverage of the
-strict contraction ball in compact space. It is an application of the
-classical accretive--Cayley correspondence, not an unrestricted token-map
-universality statement.
+represent every such $L$ and $\Omega$. This is the classical accretive--Cayley correspondence
+\cite{bauschke2017convex}. It establishes coverage of all real strict
+contractions in compact space; the token map retains its shared-frame
+and rank constraints.
 
 \subsection{Token contraction and the exact compact spectrum}
+\label{app:spectrum}
 
 Let $D=(\I_N-PP^\T)^{1/2}$ and
 $V_0=[D^\T,P]^\T\in\R^{(N+r)\times N}$, so $V_0^\T V_0=\I_N$.
@@ -700,46 +908,129 @@ which proves the norm bound in Theorem~\ref{thm:contraction}.
 The rank and nullspace statements follow directly from
 $K_X-\eta\I_N=P(F-\eta\I_r)P^\T$.
 
-For Proposition~\ref{prop:spectrum}, extend $Q$ to an orthogonal basis
+\begin{proposition}[Exact analysis in compact space]
+\label{prop:spectrum}
+Let $P=Q S V^\T$ be a thin singular value decomposition with
+$k=\rank(P)$, $Q^\T Q=V^\T V=\I_k$, and positive diagonal $S$.
+The token map is orthogonally similar to
+\begin{equation}
+ \left[\eta\I_k+S V^\T(F-\eta\I_r)V S\right]
+       \oplus\eta\I_{N-k}.
+ \label{eq:certificate}
+\end{equation}
+Its singular values, including its exact spectral norm, can therefore be
+obtained from a matrix of size at most $r$, together with $N-k$ copies of
+$|\eta|$.
+\end{proposition}
+
+To prove the proposition, extend $Q$ to an orthogonal basis
 $[Q,Q_\perp]$. In this basis the low-rank correction acts only on the first
 $k$ coordinates, giving Eq.~\eqref{eq:certificate}. If $k=0$, the result is
 simply $\eta\I_N$; if $k=N$, the complementary block is absent.
 One may compute $V$ and $S$ from the positive eigenspace of $P^\T P$, so no
 $N\times N$ matrix or token-space SVD is required.
 
+\subsection{Proof of the bidirectional SSM separation}
+\label{app:ssm}
+
+Fix the center token $x_i$ in Eq.~\eqref{eq:ssm-class}. Recursion with
+input-independent boundary states gives
+$y_i=f_i(x_{1:i})+g_i(x_{i:N})$. For any prefix perturbation $s$ and suffix
+perturbation $t$ that leave $x_i$ fixed, its mixed finite difference is
+\begin{equation}
+ \Delta_{s,t}y_i
+ =y_i(s_1,t_1)-y_i(s_1,t_0)-y_i(s_0,t_1)+y_i(s_0,t_0)=0.
+ \label{eq:mixed-difference}
+\end{equation}
+This conclusion holds for arbitrary coefficient functions and state size.
+
+For MemSolve, take three tokens whose two coordinates independently
+control relation and content:
+$x_1=(1,s)$, $x_2=(1,0)$, and $x_3=(t,0)$.
+A fixed relation projection with scale $\sqrt3$ gives
+$A=(1,1,t)^\T$ after the normalization in Eq.~\eqref{eq:frame}; a content
+projection gives $C=(s,0,0)^\T$. With $F=0$,
+\begin{equation}
+ PP^\T=\frac{AA^\T}{1+A^\T A},\qquad
+ y_2=-\frac{\eta s}{3+t^2}.
+\end{equation}
+At $(s_0,s_1)=(0,1)$ and $(t_0,t_1)=(0,1)$,
+\begin{equation}
+ \Delta_{s,t}y_2=-\frac{\eta}{4}+\frac{\eta}{3}
+ =\frac{\eta}{12}\ne0.
+\end{equation}
+Therefore no mixer of Eq.~\eqref{eq:ssm-class} represents this MemSolve
+map for all inputs. For any larger rank, append zero relation columns;
+the first Cholesky coordinate and the output above remain unchanged.
+Complement sets $F=0$ by definition, and Equilibrium realizes $F=0$ at
+$J=\I_r$. This proves Theorem~\ref{thm:ssm}.
+
+The distinction concerns how inputs determine the map, not the rank of a
+matrix after fixing the input. A realized MemSolve matrix is low rank plus
+a diagonal and can admit other algebraic factorizations. Such a
+factorization does not supply the local coefficient dependence required
+by Eq.~\eqref{eq:ssm-class}.
+
 \section{Algorithms and Numerical Details}
 \label{app:implementation}
+
+This appendix gives the core parameterization, the masked forward pass,
+and the analytic backward. It then specifies sequence-parallel reductions
+and floating-point execution. The pseudocode describes exact arithmetic;
+Section~\ref{app:precision} explains how the GPU kernels evaluate it.
+
+\subsection{Core parameters and initialization}
+\label{app:parameters}
+
+Each head stores an unconstrained matrix $\Theta\in\R^{r\times r}$.
+Its lower and upper entries define the symmetric and skew parts of $J$:
+\begin{align}
+ L&=\tril(\Theta,-1)+\diag\!\left(
+    \operatorname{softplus}(\diag\Theta+\log(e-1))\right),\\
+ \Omega&=\triu(\Theta,1)-\triu(\Theta,1)^\T,\qquad J=LL^\T+\Omega.
+ \label{eq:core-parameters}
+\end{align}
+The diagonal of $L$ is positive, so $LL^\T\succ0$.
+At $\Theta=0$, $L=\I_r$, $J=\I_r$, and $F=0$.
+This initialization preserves the core's training signal:
+$\delta F=-\tfrac12\delta J$ at $J=\I_r$.
+The initial learned correction is zero, but its derivative need not be.
+
+The per-head scalar is parameterized by $\eta=\tanh(\eta_{\rm raw})$ and
+initialized to $0.9$. Floating-point execution uses
+\begin{equation}
+ \eta_{\rm fp}=(1-\epsilon_{\rm mach})\tanh(\eta_{\rm raw}),\qquad
+ \frac{d\eta_{\rm fp}}{d\eta_{\rm raw}}
+ =(1-\epsilon_{\rm mach})\frac{4q}{(1+q)^2},\quad
+ q=e^{-2|\eta_{\rm raw}|}.
+ \label{eq:eta-numerical}
+\end{equation}
+The scale keeps the value inside $(-1,1)$.
+Native $\tanh$ preserves small values near zero; the exponential derivative
+retains representable tail gradients after $\tanh$ rounds to an endpoint.
 
 \subsection{Forward computation}
 \label{app:forward}
 
-Algorithm~\ref{alg:forward} gives the computation for one head across a
-batch; heads can be evaluated independently. The projections into $B,C$
-and the output projection are ordinary affine layers. The algorithm returns
-head outputs, which are concatenated, projected, and masked again so that
-an output bias cannot populate padded positions.
+Algorithm~\ref{alg:forward} expands Algorithm~\ref{alg:compact-forward}
+to masked batches and short sequences. The input and output projections
+are ordinary affine layers. Head outputs are concatenated, projected, and
+masked again so that output bias cannot populate padding.
 
-We distinguish physical length $N$ from the number $n_b$ of valid tokens
-in sample $b$. Masks multiply rows and are held fixed under differentiation.
-We use $\Solve(M,V)$ for the solution of $MU=V$,
-$\Chol(S)$ for the upper factor $R$ such that $R^\T R=S$, and
+Physical length is $N$; sample $b$ has $n_b$ valid tokens.
+Masks multiply rows and are fixed under differentiation. An all-masked
+sample uses a divisor of one and produces zero.
+We use $\Solve(M,V)$ for the solution of $MU=V$ and $\Chol(S)$ for the
+upper factor $R$ satisfying $R^\T R=S$. Thus
 \begin{equation}
  \CholSolve(R,V)=\Solve\!\left(R,\Solve(R^\T,V)\right).
  \label{eq:cholsolve}
 \end{equation}
-The solve notation specifies exact-arithmetic dependencies; a general core
-system uses an LU factorization. CUDA constructs the inverse triangular factor
-$T=R^{-\T}$ with library triangular solves and reuses it in forward and backward
-products. It does not form a dense inverse of the token-space operator.
-The pseudocode also gives the equivalent Complement-specific derivative for
-clarity; the implementation shares the inverse-factor adjoint between modes.
-For lower factor $L_R=R^\T$, set $M_F=F-\eta\I_r$,
-$U=TE_W$, and $V=UZ^\T$. The common compact adjoints are
-$\overline H=T^\T M_F^\T U$ and
-$\overline G=T^\T\operatorname{sym}_{\ell}(-M_FV^\T-M_F^\T V)T$,
-where $\operatorname{sym}_{\ell}(K)=[\tril(K)+\tril(K,-1)^\T]/2$.
-The shared-core and scalar adjoints reuse $V$.
-Appendix~\ref{app:precision} gives the execution precision and fusion choices.
+A general core system uses LU factorization. For $N\le r$, the
+complementary term uses the equivalent solve
+$\eta\Solve(\I_N+AA^\T,C)$. This avoids subtracting nearly equal terms
+in $\eta(C-PP^\T C)$. Equilibrium adds its learned correction to that result.
+The largest factorization has dimension at most $r$ in either regime.
 
 \begin{algorithm}[!ht]
 \caption{MemSolve forward without materializing $P$ (one head)}
@@ -750,9 +1041,11 @@ Appendix~\ref{app:precision} gives the execution precision and fusion choices.
  mode, $\eta$; $\Theta\in\R^{r\times r}$ for Equilibrium
 \Ensure Head outputs $\{Y_b\in\R^{N\times h}\}_{b=1}^{s}$
 \If{mode is Equilibrium}
-  \State Construct $L,\Omega,J$ from $\Theta$ using Eq.~\eqref{eq:core}
+  \State Construct $L,\Omega,J$ from $\Theta$ using Eq.~\eqref{eq:core-parameters}
   \State $M\gets\I_r+J$; factor $M$ once
   \State $F\gets\Solve(M,\I_r-J)$ \Comment{Shared across this batch}
+\Else
+  \State $F\gets0$ \Comment{Complement}
 \EndIf
 \For{each sample $b$ in parallel}
   \State $n_b\gets\sum_i m_{b,i}$; $A\gets(m_b\odot B_b)/\sqrt{\max(n_b,1)}$; $C\gets m_b\odot C_b$
@@ -764,11 +1057,7 @@ Appendix~\ref{app:precision} gives the execution precision and fusion choices.
     \EndIf
   \Else
     \State $G\gets A^\T A$; $H\gets A^\T C$; $R\gets\Chol(\I_r+G)$
-    \If{mode is Equilibrium}
-      \State $Z\gets\Solve(R^\T,H)$; $W\gets\Solve(R,(F-\eta\I_r)Z)$
-    \Else \Comment{Complement}
-      \State $D\gets\CholSolve(R,H)$; $W\gets-\eta D$
-    \EndIf
+    \State $Z\gets\Solve(R^\T,H)$; $W\gets\Solve(R,(F-\eta\I_r)Z)$
     \State $Y_b\gets\eta C+AW$
   \EndIf
 \EndFor
@@ -776,32 +1065,23 @@ Appendix~\ref{app:precision} gives the execution precision and fusion choices.
 \end{algorithmic}
 \end{algorithm}
 
-For $N>r$, backward needs $A,C,R,W$ and either $Z$ or $D$; these can be
-saved or reconstructed from saved projections and compact quantities.
-Equilibrium also reuses $F$, $L$, and the factorization of $M$ across the
-batch. No token-sized frame is needed. For $N\le r$, the implementation
-differentiates the short direct-solve expression using automatic
-differentiation, with an analytic adjoint for the shared linear solve.
-The largest factorization in either branch is at most $r\times r$.
+For $N>r$, the backward below uses $A,C,R,W,Z$ and the shared $F$.
+Implementations can save these values or reconstruct them from projections
+and compact intermediates. Equilibrium also reuses $L$ and the LU factors
+of $\I_r+J$. No token-sized frame is needed.
+For $N\le r$, automatic differentiation handles the short-sequence
+expression, with an analytic adjoint for the shared core solve.
 
-\paragraph{Initialization and scalar parameterization.}
-An all-masked input uses a safe divisor of one and yields zero.
-The floating-point implementation uses an interior form of $\tanh$ for
-$\eta$ to avoid rounding to the endpoints. The theoretical parameterization
-uses the open interval $(-1,1)$.
-Core initialization $\Theta=0$ does not remove its training signal:
-$\delta F=-\tfrac12\delta J$ at $J=\I_r$, so the core can receive gradients
-although its initial forward correction $PFP^\T C$ is zero.
-
-\subsection{Rank-space backward and shared-core gradients}
+\subsection{A common compact backward}
 \label{app:backward}
 
-Algorithm~\ref{alg:backward} differentiates the $N>r$ branch for one sample
-and head. A bar denotes the adjoint of a variable under the Frobenius inner
-product, and $\sym(T)=(T+T^\T)/2$. The algorithm includes both the direct
-content term and the correction, so that their contributions to $\eta$ and
-$C$ are accumulated together. Projection gradients then follow the usual
-affine-layer rules.
+Algorithm~\ref{alg:backward} differentiates Eq.~\eqref{eq:nop} for one
+sample and head. It applies to both modes: set $F=0$ for Complement and
+discard the adjoint of this fixed matrix. A bar denotes a loss adjoint
+under the Frobenius inner product, and $\sym(T)=(T+T^\T)/2$.
+The algorithm includes both the direct content term and the correction.
+Their contributions to $C$ and $\eta$ are added before returning.
+Projection gradients follow the usual affine-layer rules.
 
 For an upper Cholesky factor $R$, define
 \begin{equation}
@@ -820,29 +1100,43 @@ convention in Eq.~\eqref{eq:chol-adjoint}.
 \label{alg:backward}
 \small
 \begin{algorithmic}[1]
-\Require $E=\overline Y\in\R^{N\times h}$; forward values $A,C,R,W,\eta$;
- mode; $F,Z$ for Equilibrium or $D$ for Complement; fixed mask $m$ and count $n$
-\Ensure $\overline B,\overline C_{\rm in}$; per-sample contributions $\overline\eta,\overline F$
+\Require $E=\overline Y\in\R^{N\times h}$; forward values $A,C,R,W,Z,F,\eta$;
+ fixed mask $m$ and valid count $n$
+\Ensure $\overline B,\overline C_{\rm in}$; contributions $\overline\eta,\overline F$
 \State $E_W\gets A^\T E$; $\overline A\gets EW^\T$; $\overline C\gets\eta E$
-\State $\overline\eta\gets\langle E,C\rangle_F$; $\overline F\gets0$
-\If{mode is Equilibrium}
-  \State $E_T\gets\Solve(R^\T,E_W)$
-  \State $\overline F\gets E_TZ^\T$; $\overline\eta\gets\overline\eta-\langle E_T,Z\rangle_F$
-  \State $\overline Z\gets(F-\eta\I_r)^\T E_T$; $\overline H\gets\Solve(R,\overline Z)$
-  \State $\overline R\gets-E_TW^\T-Z\overline H^\T$
-  \State $\overline G\gets\mathcal C(R,\overline R)$ \Comment{Eq.~\eqref{eq:chol-adjoint}}
-\Else \Comment{Complement: $D=(\I_r+G)^{-1}H$}
-  \State $T\gets\CholSolve(R,E_W)$
-  \State $\overline H\gets-\eta T$; $\overline G\gets\eta\sym(TD^\T)$
-  \State $\overline\eta\gets\overline\eta-\langle E_W,D\rangle_F$
-\EndIf
+\State $\overline\eta\gets\langle E,C\rangle_F$
+\State $E_T\gets\Solve(R^\T,E_W)$
+\State $\overline F\gets E_TZ^\T$; $\overline\eta\gets\overline\eta-\langle E_T,Z\rangle_F$
+\State $\overline Z\gets(F-\eta\I_r)^\T E_T$; $\overline H\gets\Solve(R,\overline Z)$
+\State $\overline R\gets-E_TW^\T-Z\overline H^\T$
+\State $\overline G\gets\mathcal C(R,\overline R)$ \Comment{Eq.~\eqref{eq:chol-adjoint}}
 \State $\overline A\gets\overline A+C\overline H^\T+A(\overline G+\overline G^\T)$
 \State $\overline C\gets\overline C+A\overline H$
-\State $\overline B\gets m\odot\overline A/\sqrt{\max(n,1)}$; $\overline C_{\rm in}\gets m\odot\overline C$
+\State $\overline B\gets m\odot\overline A/\sqrt{\max(n,1)}$
+\State $\overline C_{\rm in}\gets m\odot\overline C$
 \State \Return $\overline B,\overline C_{\rm in},\overline\eta,\overline F$
 \end{algorithmic}
 \end{algorithm}
 
+\paragraph{Reusing the inverse triangular factor.}
+The GPU path computes $T=R^{-\T}$ once and reuses it in forward and backward
+products. The compact derivatives above can be evaluated directly in terms
+of $T$. Let $M_F=F-\eta\I_r$, $E_T=TE_W$, and $V=E_TZ^\T$. Then
+\begin{align}
+ \overline H&=T^\T M_F^\T E_T,\\
+ \overline G&=T^\T\operatorname{sym}_{\ell}
+       (-M_FV^\T-M_F^\T V)T,
+ \label{eq:inverse-factor-adjoint}
+\end{align}
+where $\operatorname{sym}_{\ell}(K)=[\tril(K)+\tril(K,-1)^\T]/2$.
+The core and scalar contributions reuse $V$:
+$\overline F=V$ and $\overline\eta=\langle E,C\rangle_F-\tr(V)$.
+This form shares the same compact adjoint between Equilibrium and Complement.
+
+\subsection{Shared-core and scalar gradients}
+\label{app:core-backward}
+
+Write $M=\I_r+J$.
 For $F=M^{-1}(\I-J)$, differentiation gives
 \begin{equation}
  dF=-M^{-1}(dJ)(\I+F).
@@ -870,89 +1164,403 @@ $r\times r$ core adjoint per sample.
 \end{algorithmic}
 \end{algorithm}
 
-For either mode, $\overline{\eta_{\rm raw}}=
-(d\eta/d\eta_{\rm raw})\sum_b\overline\eta_b$.
-The mathematical derivative is $1-\tanh^2(\eta_{\rm raw})$.
-The implementation evaluates the interior-scaled value with native $\tanh$
-and its derivative through the exponential identity. This retains small values
-near zero and representable tail derivatives after $\tanh$ itself rounds to an endpoint.
-The implementation supports first-order training gradients; higher-order
-differentiation is not provided by the fast path.
+For either mode, sum the scalar adjoints over samples before applying
+$\overline{\eta_{\rm raw}}=(d\eta/d\eta_{\rm raw})\sum_b\overline\eta_b$.
+For the mathematical parameterization, $d\eta/d\eta_{\rm raw}
+=1-\tanh^2(\eta_{\rm raw})$.
+The fast path provides first-order training gradients.
+
+\subsection{Sequence-parallel reductions}
+\label{app:parallel}
+
+Algorithm~\ref{alg:sequence-parallel} expresses the operator for a sum of
+local losses. A global mean is obtained by normalizing every local loss
+with the same global denominator. $\operatorname{VJP}_W$ denotes the
+adjoint of $(G,H,F,\eta)\mapsto W$ in Eq.~\eqref{eq:nop}.
+It is the compact part of Algorithm~\ref{alg:backward} and excludes
+the direct term $\eta C$.
+A sum reduction of $E_W$ gives every device the same compact adjoints.
+Shared $F,\eta$ gradients are therefore already global and must be counted
+once. The implementation divides their replicated contributions by the
+number of devices before the final parameter-gradient sum.
+
+\begin{algorithm}[!ht]
+\caption{Exact sequence-parallel MemSolve (one sample and head)}
+\label{alg:sequence-parallel}
+\small
+\begin{algorithmic}[1]
+\Require Local rows $B_s,C_s$, mask $m_s$; replicated $F,\eta$; $p$ devices;
+ global physical length $N>r$
+\Ensure Local output $Y_s$, local input gradients, and global parameter gradients
+\State $n\gets\operatorname{AllReduceSum}(\sum_i m_{s,i})$
+\State $A_s\gets(m_s\odot B_s)/\sqrt{\max(n,1)}$; $C_s\gets m_s\odot C_s$
+\State $(G,H)\gets\operatorname{AllReduceSum}(A_s^\T A_s,A_s^\T C_s)$
+\State $R\gets\Chol(\I_r+G)$; $Z\gets\Solve(R^\T,H)$
+\State $W\gets\Solve(R,(F-\eta\I_r)Z)$; $Y_s\gets\eta C_s+A_sW$
+\State \textbf{Backward:} receive local output adjoint $E_s$
+\State $E_W\gets\operatorname{AllReduceSum}(A_s^\T E_s)$
+\State $(\overline G,\overline H,\overline F,\overline\eta_W)
+  \gets\operatorname{VJP}_W(G,H,F,\eta;E_W)$
+\State $\overline A_s\gets E_sW^\T+C_s\overline H^\T+A_s(\overline G+\overline G^\T)$
+\State $\overline C_s\gets\eta E_s+A_s\overline H$
+\State $\overline\eta\gets\operatorname{AllReduceSum}(\langle E_s,C_s\rangle_F)+\overline\eta_W$
+\State $\overline B_s\gets m_s\odot\overline A_s/\sqrt{\max(n,1)}$;
+ $\overline C_{{\rm in},s}\gets m_s\odot\overline C_s$
+\State Backpropagate local projection gradients and sum them across devices
+\State Apply the shared-core adjoint to $\overline F$ once; retain one copy of $\overline\eta$
+\end{algorithmic}
+\end{algorithm}
+
+The proof is the additivity of $G,H$ in the forward pass and the chain
+rule in the backward pass. No recurrence connects neighboring sequence
+shards. In a backbone with a centered convolution, that local operation
+requires a separate halo exchange; it does not change the memory reduction.
+The implemented sequence-parallel path uses the compact formulation and
+requires global physical length greater than the operator rank.
 
 \subsection{Precision and scheduling}
 \label{app:precision}
 The fast path supports ranks 16, 32, 48, and 64. Token projections and
-statistics use BF16 multiplicands and FP32 accumulation. Gram matrices,
-compact states, factorization results, and adjoints retain FP32 storage.
+statistics use BF16 multiplicands and FP32 accumulation.
+Gram matrices, compact states, factors, and adjoints retain FP32 storage.
 Batched compact products use Triton's three-term TF32 decomposition;
 small shared-core products and solves retain IEEE FP32 arithmetic.
 Readout kernels split sensitive FP32 coefficients into BF16 leading and
 residual words before accumulating both products in FP32.
-This retains additional coefficient precision without promoting token-sized
-matrix products to FP32 operands. Completely masked inputs are covered explicitly. Very sparse masks
-with strong relations can still amplify relative cancellation error in the
-rank-space complementary readout; this is a finite-precision boundary,
-not a change in the exact operator.
+The extra product recovers coefficient precision without using FP32
+operands for token-sized products. With very sparse masks and strong
+relations, cancellation can still amplify relative error in the compact
+complementary readout.
 
 \paragraph{Measured implementation scope.}
 The completed training runs used NVIDIA A800-SXM4-80GB GPUs, PyTorch
 2.14.0 with CUDA 13.2, and timm 1.0.29. Compilation fuses surrounding
 operations; CUDA Graph replay reduces launch overhead. These execution
 choices do not alter Eqs.~\eqref{eq:frame}--\eqref{eq:readout}.
-This draft reports classification measurements rather than transferring
-latency numbers from older operator implementations or claiming a matched
-throughput advantage over other mixers.
+Table~\ref{tab:sequence-speed} reports the recorded sequence-parallel
+implementation on this hardware. It compares partitioning strategies for
+MemSolve rather than matched throughput against other mixers.
 
-\section{Experimental Details and Provenance}
+\subsection{Optional rotary value encoding}
+\label{app:rove}
+
+Let $\mathcal O$ rotate each content row: $(\mathcal O C)_i^\T=O_i c_i$.
+The rotations cover all $h$ channels in adjacent pairs, so $h$ is even.
+The compact forward changes only the content statistic and final readout:
+\begin{equation}
+ \begin{aligned}
+ \widetilde C&=\mathcal O C, &H&=A^\T\widetilde C, &Z&=R^{-\T}H,\\
+ W&=R^{-1}(F-\eta\I_r)Z, &&Y=\eta C+\mathcal O^{-1}(AW).
+ \end{aligned}
+ \label{eq:rove-compact}
+\end{equation}
+The Gram matrix and core solve are unchanged. Both modes use this form,
+with $F=0$ for Complement. The inverse rotation covers the full correction,
+including its $-\eta\I_r$ term, and precedes the output projection.
+Backward applies the transposed rotations around the same compact adjoints.
+The rotations cost $O(Nh)$ and fuse into statistics and readout.
+Sequence shards use global positions and the same frequency scale.
+
+For a fixed frame, write $\mathcal K(C)=K_XC$ with $K_X$ from
+Eq.~\eqref{eq:tokenmap}. Equation~\eqref{eq:rove-compact} is
+$\mathcal O^{-1}\mathcal K\mathcal O$.
+Since $\mathcal O$ is orthogonal under the Frobenius inner product, this
+conjugation preserves singular values and the gain bound in
+Theorem~\ref{thm:contraction}.
+
+We follow RoVE's value rotations and upstream frequency interpolation
+\cite{garcia2026rove,peng2024yarn}. Frequencies are fixed at
+$\omega_k=10000^{-2k/h}$ for $k=0,\ldots,h/2-1$.
+The optional language configuration uses a 128-token training window.
+Beyond it, frequency-only YaRN retains high frequencies and smoothly
+scales low frequencies, with $\beta_{\rm fast}=32$ and $\beta_{\rm slow}=1$.
+Forward and inverse rotations use the same frequency table and unit amplitude.
+This implemented extension has not yet been evaluated in the full pretraining
+and downstream experiments reported here.
+
+\section{Experimental Protocols and Results}
 \label{app:experiments}
 
-\paragraph{Optimization and augmentation.}
+\subsection{Visual models and optimization}
+\label{app:vision}
+
+Table~\ref{tab:architecture} lists the Tiny, Small, and Base configurations.
+
+\begin{table}[!ht]
+\centering
+\caption{\textbf{MemSolve-ViT configurations.} Parameters include the
+1,000-class head and the Equilibrium core and are rounded to whole millions. All models have depth 12 and
+patch size 16; DropPath increases linearly to the listed maximum.}
+\label{tab:architecture}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Width & Heads & Rank/head & FFN width & DropPath & Params (M)\\
+\midrule
+Tiny &192&6&16&768&0.0&5\\
+Small&384&6&32&1584&0.1&20\\
+Base &768&12&48&3072&0.4&78\\
+\bottomrule
+\end{tabular}
+\end{table}
+
 Small uses FFN ratio $1584/384=4.125$; Tiny and Base use ratio 4.
-The ratio 4 appearing in the shared recipe defaults does not override the
-Small-specific width. LayerNorm uses $\epsilon=10^{-6}$.
+LayerNorm uses $\epsilon=10^{-6}$. CPE is a residual depthwise $3\times3$
+convolution with padding one, applied at every block.
+The visual encoder has neither a class token nor an absolute position
+table. All model parameters remain FP32 under BF16 autocast.
+
+All completed runs use fused AdamW, weight decay $0.05$,
+gradient clipping at norm 5, cross-entropy with label smoothing $0.1$,
+Mixup $0.8$, CutMix $1.0$, RandAugment, and random erasing $0.25$.
+The learning rate uses 20 epochs of linear warmup and update-based cosine
+decay. Validation uses bicubic resize to a shorter side of 256 followed by
+a $224\times224$ center crop. No rotary transform or LayerScale is used.
+
+Both Small and Base use three-repeat augmentation, global batch 2,048,
+and peak learning rate $2\times10^{-3}$, with 512 images per GPU and two
+accumulation steps on two A800 GPUs. Repeated augmentation retains a
+1.28M-presentation epoch budget. Mixup/CutMix operates on each complete
+physical microbatch. We evaluate EMA weights and select the checkpoint
+with the highest validation Top-1.
+
+AdamW uses $(\beta_1,\beta_2)=(0.9,0.999)$ and $\epsilon=10^{-8}$.
 RandAugment is \texttt{rand-m9-mstd0.5-inc1}, color jitter is $0.4$,
 and Mixup/CutMix uses application probability 1 and switching probability
-$0.5$. The batch-1,024 run warms up from $10^{-6}$ and decays to $10^{-5}$;
-the batch-2,048 run uses $2\times10^{-6}$ and $2\times10^{-5}$.
-There are 1,251 and 625 optimizer updates per epoch, respectively.
-The latter uses timm's three-repeat augmentation convention with a fixed
-epoch budget, global sample permutation, and rank-strided assignment.
-Persistent data-loader workers receive epoch-dependent random states.
+$0.5$. Learning rate warms up from $2\times10^{-6}$ and decays to
+$2\times10^{-5}$. The cosine schedule uses the full 300-epoch time
+coordinate, with linear warmup replacing its first 20 epochs.
+There are 625 optimizer updates per epoch.
+Repeated augmentation uses timm's three-repeat convention, global sample
+permutation, rank-strided assignment, and a fixed epoch presentation budget.
+Persistent workers receive epoch-dependent random states.
+EMA updates after each optimizer step with constant decay $0.9999$ from
+the first step. Each model trains for 300 epochs with seed 0.
 
-\paragraph{Core comparison.}
-The ImageNet-100 class-list SHA-256 is
-\begin{center}\small\ttfamily
-79f3f1552ccc478ce24bd934b4573625db5\\
-84ddc1f4643ae23c994a94cb11397
-\end{center}
-The run uses 247 optimizer updates, or 126,464 training presentations, per
-epoch. The minimum learning rate is $10^{-5}$ and warmup starts at
-$10^{-6}$. Shared weights were checked for equality before training.
-The initial FP64 reference logits agree exactly in the recorded check;
-the two BF16 execution paths have a relative logit difference of about
-$0.235\%$ because their algebraically equivalent computations round
-differently. This distinction does not imply different initialized
-mathematical operators, but it precludes a bitwise-identical trajectory.
+\paragraph{Baseline reporting.}
+Table~\ref{tab:imagenet} contains non-hierarchical models only.
+``iso.'' denotes isotropic ConvNeXt. The Type column uses SSM for
+state-space models, Linear for linear-attention and linear-recurrence
+mixers, and TTT for test-time training.
+ViT-B and Hydra-ViT-B use the EMA entries in Hydra's Table~5
+\cite{hwang2024hydra}. Vim's $\dagger$ entries include 30 additional
+epochs of long-sequence fine-tuning at $224\times224$, with patch size 16
+and extraction stride 8 \cite{zhu2024vim}.
+LION's $\natural$ entries use multiple scans \cite{afzal2025lion}.
+Parameter counts are rounded to whole millions and Top-1 to one decimal
+place. Training protocols differ across papers.
 
-\paragraph{Result scope.}
-The current names Equilibrium and Complement correspond to the former
-Static and Zero formulas, respectively. Renaming does not change those
-formulas. The no-RA Small run retained its original Static label in its
-training record; its shared-frame core and visual shell match the model
-reported here. Earlier LSSO/Ridgon variants used different generators,
-projections, positional mechanisms, or training protocols. Their ImageNet,
-DNA, LRA, and operator-timing measurements are not reported as measurements
-of the current model. Base training is ongoing and has no final result in
-this draft.
+\paragraph{Convergence logs.}
+Figure~\ref{fig:curves} uses the
+\href{https://gist.github.com/fmassa/0dbd0184a0adb904ef42277b487d8b53}{DeiT authors' four-GPU Small log}.
+The authors state that this run differs from the released checkpoint.
+The log contains 300 epochs and ordinary-weight validation.
+Zero-based DeiT epochs are shifted by one to denote completed epochs.
+MemSolve-S uses the ordinary-weight validation recorded during the
+same run as its EMA result in Table~\ref{tab:imagenet}.
+No smoothing, interpolation of missing epochs, or extension beyond a
+run's recorded training budget is applied.
+These runs illustrate recipe-level convergence; they do not
+isolate architecture or establish a training-time speedup.
 
-\paragraph{Figures and writing tools.}
-The overview is a vector schematic of the stated equations. Validation
-plots use all recorded epochs without smoothing or interpolated missing
-values. The accompanying plotting script reconstructs figures from local
-run records and records their provenance. Scientific Agent Skills
-\cite{kassis2026skills} provided writing and figure-review procedures for
-this revision; the draft remains subject to author verification.
+\subsection{Language pretraining}
+\label{app:nlp}
 
-\bibliographystyle{plain}
-\bibliography{references}
+The completed encoder has 14 layers, width 768, twelve heads, rank 32,
+and 2,048 hidden units in each SwiGLU branch. Including the tied MLM head,
+it has 111,517,154 parameters; the encoder without that head has
+110,894,504. WordPiece vocabulary size is 30,522. The learned absolute
+position table has 512 entries, and the token-type table has two.
+BERT embedding, residual-dropout, LayerNorm, and MLM-head conventions are
+retained: dropout $0.1$, LayerNorm $\epsilon=10^{-12}$, and a GELU/LayerNorm
+prediction transform with tied vocabulary decoder.
+Each centered depthwise Conv1d has width three and a residual connection;
+zero-initialized convolution weights make that connection initially the
+identity. Padding is masked before and after the local operation.
+
+C4 training uses the complete local source shard collection through the
+Hugging Face Datasets streaming pipeline, with shuffle buffer 10,000.
+Each document is tokenized and truncated to 128 tokens, including special
+tokens. Sampling is budgeted by optimizer steps rather than a corpus pass.
+The budget is 286,720,000 sequence presentations, or 36.70 billion padded
+token slots; the latter is not a count of distinct or non-padding tokens.
+The MLM collator selects $30\%$ of eligible training tokens and uses the
+standard 80/10/10 mask/random/unchanged corruption convention.
+Validation fixes the corruption of 10,000 C4 validation documents at
+$15\%$ selection. Padding and special tokens are excluded from targets;
+\texttt{[MASK]} remains a valid context position. Validation NLL and accuracy
+are weighted by masked-target count.
+
+We use fused PyTorch AdamW with betas $(0.9,0.98)$, $\epsilon=10^{-6}$,
+and gradient clipping at norm 1. The public LION recipe's Composer decay
+$10^{-5}$ is converted to PyTorch decay $0.0125$ by division by the peak
+learning rate $8\times10^{-4}$. Bias and normalization parameters are
+excluded from pretraining decay. The run warms up for 4,200 steps and
+then decays linearly to $1.6\times10^{-5}$. This follows the public code's
+$2\%$ endpoint; the LION paper's prose states $20\%$. Our document
+streaming, frozen validation subset, clipping, and HF optimizer execution
+also form part of the reported implementation.
+
+Training uses two A800-SXM4-80GB GPUs, microbatch 512 per GPU, four
+accumulation steps, eight persistent data workers per rank, FP32 parameters,
+and BF16 autocast. Inductor compiles the surrounding model and CUDA Graph
+captures model/loss forward and backward. DDP communication and optimizer
+steps remain outside capture. The masked-target loss denominator spans
+all devices and accumulation steps. Validation and checkpointing occur
+every 1,000 updates. Minimum validation masked NLL selects step 70,000,
+which is also the final step. The recorded runtime is 114,490 seconds.
+
+\subsection{GLUE fine-tuning and repeated seeds}
+\label{app:glue}
+
+The classifier uses BERT's CLS pooler (dense plus $\tanh$), dropout, and
+a task-specific linear head. All encoder weights transfer from MLM;
+the absent pooler and classifier are initialized with BERT's initializer.
+For MNLI transfer, the trained pooler is retained and the classifier is
+reset. STS-B uses mean squared error; other tasks use cross-entropy.
+
+\begin{table}[!ht]
+\centering
+\caption{\textbf{GLUE fine-tuning configuration.} WD lists the source
+recipe value. For Composer rows, PyTorch WD equals the listed value
+ divided by peak LR; STS-B uses its listed PyTorch value directly.}
+\label{tab:glue-recipe}
+\small
+\begin{tabular}{llrrrrl}
+\toprule
+Task & Start & Epochs & Batch & Peak LR & WD & WD convention\\
+\midrule
+MNLI &MLM&3&48&$5\cdot10^{-5}$&$5\cdot10^{-6}$&Composer\\
+QNLI &MLM&10&16&$5\cdot10^{-5}$&$10^{-5}$&Composer\\
+QQP &MLM&5&16&$3\cdot10^{-5}$&$3\cdot10^{-6}$&Composer\\
+RTE &MNLI&3&16&$10^{-5}$&$10^{-6}$&Composer\\
+SST-2 &MLM&3&16&$3\cdot10^{-5}$&$3\cdot10^{-6}$&Composer\\
+MRPC &MNLI&10&32&$8\cdot10^{-5}$&$8\cdot10^{-5}$&Composer\\
+CoLA &MLM&10&32&$8\cdot10^{-5}$&$5\cdot10^{-6}$&Composer\\
+STS-B &MNLI&10&32&$8\cdot10^{-5}$&$3\cdot10^{-6}$&PyTorch\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All tasks use sequence length 128, AdamW betas $(0.9,0.98)$,
+$\epsilon=10^{-6}$, $6\%$ step warmup, linear decay to zero, and no
+gradient clipping. Weight decay applies to all parameters in fine-tuning,
+as in the source GLUE jobs. Sequential sampling keeps partial final
+batches. Evaluation uses the final checkpoint on the development set;
+no hidden test labels are used. Fine-tuning uses eager execution of the
+BERT shell with the native CUDA mixer and BF16 autocast.
+
+\begin{table}[!ht]
+\centering
+\caption{\textbf{MemSolve GLUE seed aggregation.} SD is the sample standard
+deviation over fine-tuning seeds. A dash denotes one run. Seed sets are
+$\mathcal S_1=\{19\}$,
+$\mathcal S_3=\{19,8364,717\}$,
+$\mathcal S_4=\mathcal S_3\cup\{10536\}$, and
+$\mathcal S_5=\mathcal S_4\cup\{90166\}$.}
+\label{tab:glue-seeds}
+\begin{tabular}{llrrr}
+\toprule
+Task & Metric & Seeds & Mean & SD\\
+\midrule
+MNLI &Matched/mismatched accuracy mean &$\mathcal S_1$&83.0&---\\
+QQP &Accuracy/F1 mean &$\mathcal S_1$&89.8&---\\
+QNLI &Accuracy &$\mathcal S_1$&88.6&---\\
+SST-2 &Accuracy &$\mathcal S_3$&91.6&0.350\\
+CoLA &Matthews correlation &$\mathcal S_4$&47.5&1.505\\
+RTE &Accuracy &$\mathcal S_5$&74.2&0.791\\
+MRPC &F1 &$\mathcal S_5$&91.0&0.653\\
+STS-B &Spearman correlation &$\mathcal S_5$&89.2&0.140\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All runs share the seed-17 pretrained checkpoint. The MNLI-transfer tasks
+also share the seed-19 MNLI parent checkpoint. Their SD therefore measures
+variation in the final task's fine-tuning, not independent pretraining or
+independent MNLI transfer. The $81.9$ aggregate averages the eight task
+means and has no suite-level SD because task seed counts differ.
+
+\subsection{Execution measurements and reproducibility}
+
+The sequence-parallel measurements use the archived October 16
+implementation with the same equilibrium and complement equations.
+Each timing captures a complete layer forward and backward, including the
+sequence group's final shared-parameter gradient sum. It warms up five
+eager executions, captures a graph, warms up 20 replays, and records the
+median of three blocks of 50 replays with device synchronization.
+The distributed time is the maximum over both ranks. These measurements
+cover the layer; they do not include data loading or optimizer updates.
+
+The training records preserve resolved recipes, source snapshots, data
+manifests, and checkpoint selection. The accompanying repository provides
+model code, training entrypoints, and figure-generation code at
+\url{https://github.com/Yang916-yy/MemSolve}.
+Figures are vector schematics of the equations and plots of all recorded
+epochs without smoothing. Scientific Agent Skills \cite{kassis2026skills}
+provided writing and figure-review procedures for this revision; the draft
+remains subject to author verification.
+
+\section{Extended Related Work}
+\label{app:related}
+
+\subsection{From memory updates to joint error correction}
+
+Linear attention accumulates feature--value associations in a compact
+state \cite{katharopoulos2020linear}. Delta-rule fast weights write the
+prediction residual instead, allowing each association to correct the
+current memory \cite{schlag2021fastweights,yang2025deltanet}.
+GDNs add adaptive forgetting and richer erase/write controls
+\cite{yang2025gdn,kimi2025linear,hatamizadeh2026gdn2}.
+TTT makes the internal-learning view explicit: the hidden state is a
+model trained on context \cite{sun2025ttt}. Test-time regression connects
+several such update rules \cite{wang2025testtimeregression}.
+
+These connections motivate MemSolve's error-correction equation.
+The change is in how associations determine memory. Sequential updates
+evaluate each residual against the state reached so far. MemSolve
+evaluates all residuals against one shared state and solves their joint
+balance. Its construction therefore uses the full context without
+following an ordered update trajectory.
+
+\subsection{Regression layers and equilibrium models}
+
+Intention studies global regularized regression with query readout and
+feature-dimensional inversion \cite{garnelo2023intention}.
+MesaNet solves for locally optimal causal regression states using
+conjugate gradients \cite{vonoswald2026mesanet}.
+ViT$^3$ studies full-batch inner updates for visual representations
+\cite{han2026vit3}. These works establish regression and internal
+optimization as ways to construct contextual memory.
+
+MemSolve couples its write--read frame to the regularizer
+(Eq.~\eqref{eq:gamma}). This cancels the Gram term in the memory
+equation and leaves a learned core shared across samples.
+The reflected readout then controls the gain in token space.
+This coupling and readout distinguish the construction from a generic
+global regression layer.
+
+Deep equilibrium and monotone equilibrium models also define states
+through equilibrium equations \cite{bai2019deep,winston2020mondeq}.
+MemSolve obtains its state from a compact linear system.
+Its contraction analysis uses the classical accretive--Cayley
+correspondence \cite{bauschke2017convex}.
+
+\subsection{Bidirectional state-space and linear-recurrence models}
+
+Structured SSMs provide efficient sequence maps
+\cite{gu2022s4,gu2024mamba,dao2024mamba2}.
+Vim adapts selective scans to vision, Hydra develops bidirectional
+matrix mixers, and LION relates full-attention, recurrent, and chunkwise
+forms \cite{zhu2024vim,hwang2024hydra,afzal2025lion}.
+Video DeltaNet combines local attention with bidirectional memory
+updated jointly within each frame \cite{xi2026videodeltanet}.
+
+MemSolve gathers full-input statistics before solving one memory.
+Its frame normalization couples information from both sides of a token.
+Theorem~\ref{thm:ssm} shows that locally parameterized bidirectional scans
+with linear merging cannot express all of these interactions in one
+mixer. The distinction concerns input dependence as well as execution:
+the compact solve can use full-context statistics while retaining
+linear complexity in sequence length at fixed rank.
+
 \end{document}

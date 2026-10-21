@@ -1,6 +1,13 @@
+"""Full-mixer timings for MemSolve, FlashAttention, and official Vim BiMamba-v2.
+
+The direct baseline reuses timm.layers.Attention without normalization or gates:
+https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/attention.py
+"""
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from importlib import import_module
 import statistics
 import time
 
@@ -12,7 +19,7 @@ from memsolve import CoreMode, MemSolve, MemSolveConfig
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark a complete MemSolve or MHA mixer block on one CUDA device."
+        description="Benchmark complete MemSolve, FlashAttention, or BiMamba mixers on one CUDA device."
     )
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--length", type=int, default=512)
@@ -31,7 +38,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Microbatches per parameter-gradient reset.",
     )
-    parser.add_argument("--operator", choices=("memsolve", "mha"), default="memsolve")
+    parser.add_argument("--operator", choices=("memsolve", "flashattention", "bimamba"), default="memsolve")
+    parser.add_argument(
+        "--bimamba-module", default="mamba_ssm.modules.mamba_simple",
+        help="Module containing Vim's official BiMamba-v2 Mamba class.",
+    )
+    parser.add_argument("--sdpa-backend", choices=("auto", "flash"), default="auto")
+    parser.add_argument("--profile", action="store_true", help="Print one step's CUDA kernels after timing.")
     parser.add_argument("--mode", choices=("forward", "train"), default="train")
     parser.add_argument(
         "--implementation",
@@ -56,11 +69,11 @@ def _dtype(name: str) -> torch.dtype:
 
 
 class _BenchmarkMixer(nn.Module):
-    """Present MemSolve and MHA through one tensor-only benchmark surface."""
+    """Present the three mixers through one tensor-only benchmark surface."""
 
     def __init__(
         self,
-        mixer: MemSolve | nn.MultiheadAttention,
+        mixer: nn.Module,
         *,
         operator: str,
         implementation: str,
@@ -77,13 +90,10 @@ class _BenchmarkMixer(nn.Module):
                 x,
                 implementation=self.implementation,
             )
-        assert isinstance(self.mixer, nn.MultiheadAttention)
-        output, _ = self.mixer(x, x, x, need_weights=False)
-        return output
+        return self.mixer(x)
 
 
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("the benchmark requires a CUDA device")
     if args.steps <= 0 or args.warmup < 0 or args.repeats <= 0:
@@ -100,7 +110,7 @@ def main() -> None:
     torch.backends.cuda.matmul.fp32_precision = "tf32" if args.tf32 else "ieee"
     torch.backends.cudnn.fp32_precision = "tf32" if args.tf32 else "ieee"
     if args.operator == "memsolve":
-        mixer: MemSolve | nn.MultiheadAttention = MemSolve(
+        mixer: nn.Module = MemSolve(
             MemSolveConfig(
                 dim=args.dim,
                 num_heads=args.heads,
@@ -109,13 +119,21 @@ def main() -> None:
                 bias=args.bias,
             )
         ).to(device)
+    elif args.operator == "flashattention":
+        # Reuse timm's batch-first packed QKV -> SDPA -> output projection.
+        from timm.layers import Attention
+
+        mixer = Attention(
+            args.dim, num_heads=args.heads, qkv_bias=args.bias,
+            proj_bias=args.bias, attn_drop=0.0, proj_drop=0.0,
+        ).to(device)
+        mixer.fused_attn = True
     else:
-        mixer = nn.MultiheadAttention(
-            args.dim,
-            args.heads,
-            dropout=0.0,
+        Mamba = import_module(args.bimamba_module).Mamba
+        mixer = Mamba(
+            args.dim, d_state=16, d_conv=4, expand=2,
+            bimamba_type="v2", if_divide_out=True, use_fast_path=True,
             bias=args.bias,
-            batch_first=True,
         ).to(device)
     layer = _BenchmarkMixer(
         mixer,
@@ -225,7 +243,11 @@ def main() -> None:
         gpu_samples.append(start_event.elapsed_time(end_event) / args.steps)
 
     properties = torch.cuda.get_device_properties(device)
-    implementation = args.implementation if args.operator == "memsolve" else "torch_mha"
+    implementation = {
+        "memsolve": args.implementation,
+        "flashattention": "timm_flash_sdpa",
+        "bimamba": "vim_bimamba_v2_fused",
+    }[args.operator]
     rank = str(args.rank) if args.operator == "memsolve" else "na"
     position = "external"
     core_mode = args.core_mode if args.operator == "memsolve" else "na"
@@ -234,13 +256,38 @@ def main() -> None:
         f"torch={torch.__version__} cuda={torch.version.cuda} "
         f"operator={args.operator} implementation={implementation} mode={args.mode} core_mode={core_mode} "
         f"dtype={args.dtype} tf32={args.tf32} graph={args.graph} bias={args.bias} "
+        f"sdpa_backend={args.sdpa_backend} "
         f"batch={args.batch} grad_accum={args.grad_accum} length={args.length} "
         f"dim={args.dim} heads={args.heads} rank={rank} position={position} "
+        f"parameters={sum(p.numel() for p in layer.parameters())} "
         f"median_ms={statistics.median(samples):.3f} "
         f"median_gpu_ms={statistics.median(gpu_samples):.3f} "
         f"min_ms={min(samples):.3f} max_ms={max(samples):.3f} "
         f"peak_allocated_mib={torch.cuda.max_memory_allocated() / 2**20:.2f}"
     )
+    if args.profile:
+        clear_parameter_gradients()
+        clear_input_gradient()
+        with torch.profiler.profile(activities=[
+            torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
+        ]) as prof:
+            step()
+            torch.cuda.synchronize()
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+        kernels = sorted({event.name for event in prof.events()
+                          if event.device_type == torch.autograd.DeviceType.CUDA})
+        print(f"cuda_kernels={kernels}")
+
+
+def main() -> None:
+    args = parse_args()
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    if args.operator == "flashattention":
+        args.sdpa_backend = "flash"
+    backend = sdpa_kernel(SDPBackend.FLASH_ATTENTION) if args.sdpa_backend == "flash" else nullcontext()
+    with backend:
+        run(args)
 
 
 if __name__ == "__main__":

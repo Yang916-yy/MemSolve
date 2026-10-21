@@ -57,7 +57,7 @@
 \newcommand{\CholSolve}{\operatorname{cholsolve}}
 \title{\fontsize{14}{17}\selectfont\bfseries MemSolve: From Sequential Memory Updates to Global Equilibrium}
 \author{\fontsize{10}{11}\selectfont\textbf{Zhaoyang Wang}\\\fontsize{10}{11}\selectfont\texttt{zhaoy@uir.edu.cn}}
-\date{\small Working draft --- October 20, 2026}
+\date{\small Working draft --- October 21, 2026}
 \begin{document}
 \maketitle
 \raggedbottom
@@ -80,6 +80,8 @@ Our analysis also establishes a unique equilibrium and a contractive readout
 for each fixed write--read frame.
 Our hardware-aware algorithm supports exact sequence parallelism across devices
 and linear sequence complexity at fixed rank.
+At 8,192 tokens, its complete mixer is $7.5\times$ faster than FlashAttention
+and $7.9\times$ faster than BiMamba in single-GPU forward--backward execution.
 On ImageNet-1K, our Base model reaches $82.7\%$ Top-1 with a plain
 non-hierarchical backbone and just $78$M parameters.
 It surpasses ViG-B and ViT$^3$-B with approximately $13\%$ fewer parameters.
@@ -172,6 +174,10 @@ The learned core is shared across inputs and
 evaluated once per head in each forward pass.
 Selective fusion avoids storing the token-sized frame and reduces GPU
 memory traffic. Computation scales linearly with sequence length at fixed rank.
+In our length sweep, MemSolve overtakes FlashAttention at 512 tokens
+for complete-mixer forward and backward passes.
+At 8,192 tokens, it is $7.5\times$ faster than FlashAttention and
+$7.9\times$ faster than BiMamba on one GPU (\S\ref{sec:efficiency}).
 
 \paragraph{Architectures and Results ($\S$\ref{sec:experiments}).}
 We use the same operator in a plain non-hierarchical visual backbone and
@@ -831,8 +837,61 @@ vision and language.
 
 \subsection{Computational efficiency}
 \label{sec:efficiency}
-% TODO: Add current-version, same-GPU latency and memory comparisons
-% against optimized MHA and BiMamba, with traceable benchmark records.
+We compare MemSolve with FlashAttention \cite{dao2024flashattention2}
+and Vim's official BiMamba mixer \cite{zhu2024vim} on one A800-80GB
+(Table~\ref{tab:mixer-efficiency}).
+We time complete mixers, including input and output projections,
+using BF16 autocast and CUDA Graphs for all three implementations.
+
+\paragraph{Speed.}
+MemSolve's advantage grows with sequence length.
+In the fixed-width sweep, its forward--backward pass overtakes
+FlashAttention at 512 tokens. The speedup reaches $2.3\times$ at
+2,048 tokens and $28.2\times$ at 32,768 tokens.
+At the latter length, it also outperforms the fused
+BiMamba implementation by $9.0\times$.
+The benefit extends to the 196-token visual shapes:
+MemSolve is $1.1$--$1.7\times$ faster than FlashAttention and
+$8.4$--$12.8\times$ faster than BiMamba across Tiny, Small, and Base.
+FlashAttention leads at 128 and 196 tokens in the small-batch sweep.
+It also has a faster forward-only pass for the Small and Base visual
+shapes; Appendix~\ref{app:efficiency} reports these measurements.
+
+\paragraph{Memory.}
+MemSolve has the lowest peak allocated memory in every measured setting.
+At 32,768 tokens, its forward--backward pass uses 2.58\,GiB,
+compared with 2.87\,GiB for FlashAttention and 6.00\,GiB for BiMamba.
+This reduces memory by $10\%$ and $57\%$, respectively.
+The compact solve thus supports long sequences with both lower latency
+and lower memory use.
+
+\begin{table*}[t]
+\centering
+\captionsetup{width=.94\linewidth}
+\caption{\textbf{Mixer forward--backward latency and peak memory.} All three use CUDA Graphs on one A800-80GB. Lower is better.}
+\label{tab:mixer-efficiency}
+\small
+\begin{tabular*}{.94\linewidth}{@{\extracolsep{\fill}}lrrrrrr@{}}
+\toprule
+&\multicolumn{2}{c}{MemSolve}&\multicolumn{2}{c}{FlashAttention}&\multicolumn{2}{c}{BiMamba}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(l){6-7}
+Setting &ms &MiB &ms &MiB &ms &MiB\\
+\midrule
+\multicolumn{7}{l}{\emph{Visual shapes: 196 tokens}}\\
+Tiny &\textbf{0.620} &\textbf{169.2} &1.066 &193.9 &7.921 &359.6\\
+Small &\textbf{1.248} &\textbf{308.1} &1.783 &321.1 &15.565 &664.7\\
+Base &\textbf{1.900} &\textbf{329.2} &2.087 &332.1 &16.052 &680.3\\
+\midrule
+\multicolumn{7}{l}{\emph{Length sweep: batch 4, width 768}}\\
+128 tokens &0.374 &\textbf{64.4} &\textbf{0.267} &76.2 &0.987 &103.2\\
+196 tokens &0.400 &\textbf{66.2} &\textbf{0.332} &78.4 &1.363 &115.5\\
+512 tokens &\textbf{0.524} &\textbf{90.8} &0.564 &120.4 &1.775 &172.6\\
+2,048 tokens &\textbf{0.997} &\textbf{213.3} &2.295 &236.4 &5.790 &455.7\\
+8,192 tokens &\textbf{2.792} &\textbf{698.2} &20.907 &775.6 &21.948 &1592.8\\
+32,768 tokens &\textbf{10.047} &\textbf{2642.2} &283.266 &2940.1 &90.289 &6140.7\\
+\bottomrule
+\end{tabular*}
+\end{table*}
 
 \section{Discussion and Limitations}
 
@@ -1575,11 +1634,89 @@ variation in the final task's fine-tuning, not independent pretraining or
 independent MNLI transfer. The $81.9$ aggregate averages the eight task
 means and has no suite-level SD because task seed counts differ.
 
+\subsection{Efficiency benchmark}
+\label{app:efficiency}
+
+\paragraph{Mixers and shapes.}
+We benchmark complete mixers with input and output projections.
+MemSolve uses Equilibrium without RoVE or an external positional module.
+FlashAttention uses \texttt{timm} attention with packed QKV projections
+and PyTorch's FlashAttention-2 SDPA backend, without a causal mask.
+BiMamba uses Vim's fused v2 implementation: expansion factor two,
+state size 16, convolution width four, and averaged directional outputs.
+It shares input and output projections across directions.
+The three mixers receive identical input shapes.
+The 196-token visual settings use
+$(B,D,H,r)=(128,192,6,16)$, $(128,384,6,32)$, and $(64,768,12,48)$
+for Tiny, Small, and Base. Here $B$ is batch size, $D$ is width,
+$H$ is the head count for MemSolve and attention, and $r$ is MemSolve's rank.
+The length sweep fixes $(B,D,H,r)=(4,768,12,32)$ and varies length
+from 128 to 32,768.
+
+\paragraph{Execution and measurement.}
+All runs use one NVIDIA A800-SXM4-80GB, PyTorch 2.14.0 with CUDA 13.2,
+FP32 parameters, BF16 inputs and autocast, and enabled TF32.
+All three mixers use CUDA Graphs without \texttt{torch.compile}.
+Forward--backward timing includes the mean squared output as a scalar loss
+and its backward pass, without an optimizer step.
+Forward-only timing uses inference mode.
+Each process performs 20 warmup steps, captures the computation,
+then performs 20 graph warmups.
+CUDA events measure seven groups of 50 replays.
+We report the mean of the median latencies from two independent processes,
+reversing operator order in the second repetition.
+For example, the two MemSolve forward--backward measurements at 2,048
+tokens are 0.918 and 1.076\,ms; their mean is 0.997\,ms.
+We reset PyTorch's peak allocated memory after the initial warmup and
+measure through graph capture and replay.
+This includes parameters, gradients, and intermediates;
+allocator reserves and the CUDA context are excluded.
+Tables~\ref{tab:mixer-efficiency} and~\ref{tab:mixer-forward} report
+forward--backward and forward-only measurements, respectively.
+
+\paragraph{Implementation provenance.}
+BiMamba comes from Vim commit \texttt{dd0358a}, with the upstream fused
+selective-scan and causal-convolution kernels.
+We adapt its convolution API calls to the current upstream allocation
+interface. Forward and gradient comparisons check this adaptation, and
+profiling confirms native scan and convolution kernels.
+Profiling also confirms the FlashAttention backend.
+The benchmark records retain source snapshots, compatibility patches,
+commands, and both timing repetitions.
+
+\begin{table}[t]
+\centering
+\captionsetup{width=.94\linewidth}
+\caption{\textbf{Forward-only mixer latency and peak memory.} Settings match Table~\ref{tab:mixer-efficiency}.}
+\label{tab:mixer-forward}
+\small
+\begin{tabular*}{.94\linewidth}{@{\extracolsep{\fill}}lrrrrrr@{}}
+\toprule
+&\multicolumn{2}{c}{MemSolve}&\multicolumn{2}{c}{FlashAttention}&\multicolumn{2}{c}{BiMamba}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(l){6-7}
+Setting &ms &MiB &ms &MiB &ms &MiB\\
+\midrule
+\multicolumn{7}{l}{\emph{Visual shapes: 196 tokens}}\\
+Tiny &\textbf{0.169} &\textbf{66.4} &0.208 &80.6 &2.143 &209.7\\
+Small &0.418 &\textbf{109.2} &\textbf{0.343} &138.0 &4.244 &394.9\\
+Base &0.724 &\textbf{131.3} &\textbf{0.477} &146.1 &4.433 &405.0\\
+\midrule
+\multicolumn{7}{l}{\emph{Length sweep: batch 4, width 768}}\\
+128 tokens &0.165 &\textbf{35.1} &\textbf{0.054} &39.8 &0.269 &55.3\\
+196 tokens &0.167 &\textbf{36.9} &\textbf{0.074} &41.4 &0.446 &63.4\\
+512 tokens &0.200 &\textbf{45.2} &\textbf{0.134} &52.9 &0.548 &98.4\\
+2,048 tokens &\textbf{0.334} &\textbf{86.0} &0.589 &106.5 &1.632 &270.7\\
+8,192 tokens &\textbf{0.768} &\textbf{247.2} &5.346 &322.5 &6.179 &962.2\\
+32,768 tokens &\textbf{2.357} &\textbf{895.2} &75.901 &1186.5 &25.735 &3728.7\\
+\bottomrule
+\end{tabular*}
+\end{table}
+
 \subsection{Reproducibility}
 
 The training records preserve resolved recipes, source snapshots, data
 manifests, and checkpoint selection. The accompanying repository provides
-model code, training entrypoints, and figure-generation code at
+model code, training entrypoints, and benchmark code at
 \url{https://github.com/Yang916-yy/MemSolve}.
 Figures are vector schematics of the equations and plots of all recorded
 epochs without smoothing. Scientific Agent Skills \cite{kassis2026skills}

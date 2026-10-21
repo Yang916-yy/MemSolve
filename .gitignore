@@ -21,3 +21,5 @@ paper/main.out
 paper/main.fdb_latexmk
 paper/main.fls
 paper/main.toc
+paper/figures.py
+paper/*.svg

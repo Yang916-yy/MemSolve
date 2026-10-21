@@ -1,589 +1,777 @@
-@inproceedings{vaswani2017attention,
-  title     = {Attention Is All You Need},
-  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, Lukasz and Polosukhin, Illia},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2017}
-}
-
-@article{wang2020linformer,
-  title         = {Linformer: Self-Attention with Linear Complexity},
-  author        = {Wang, Sinong and Li, Belinda Z. and Khabsa, Madian and Fang, Han and Ma, Hao},
-  journal       = {arXiv preprint arXiv:2006.04768},
-  year          = {2020},
-  url           = {https://arxiv.org/abs/2006.04768}
+@inproceedings{afzal2025lion,
+  title      = {Linear Attention for Efficient Bidirectional Sequence Modeling},
+  author     = {Afzal, Arshia and Abad Rocamora, Elias and Candogan, Leyla Naz and Puigdemont, Pol and Tonin, Francesco and Wu, Yongtao and Shoaran, Mahsa and Cevher, Volkan},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {38},
+  pages      = {78994--79039},
+  year       = {2025},
+  doi        = {10.52202/085713-2643},
+  url        = {https://proceedings.neurips.cc/paper_files/paper/2025/hash/71845d09f05d40d030fa3cde8b5dcd13-Abstract-Conference.html}
 }
 
 @inproceedings{ali2021xcit,
-  title     = {{XCiT}: Cross-Covariance Image Transformers},
-  author    = {Ali, Alaaeldin and Touvron, Hugo and Caron, Mathilde and Bojanowski, Piotr and Douze, Matthijs and Joulin, Armand and Laptev, Ivan and Neverova, Natalia and Synnaeve, Gabriel and Verbeek, Jakob and J{\'e}gou, Herv{\'e}},
-  booktitle = {Advances in Neural Information Processing Systems},
-  volume    = {34},
-  pages     = {20014--20027},
-  year      = {2021},
-  url       = {https://proceedings.neurips.cc/paper/2021/hash/a655fbe4b8d7439994aa37dd1e941572-Abstract.html}
-}
-
-@article{wang2023direct,
-  title         = {Direct Parameterization of Lipschitz-Bounded Deep Networks},
-  author        = {Wang, Ruigang and Manchester, Ian R.},
-  journal       = {arXiv preprint arXiv:2301.11526},
-  year          = {2023},
-  doi           = {10.48550/arXiv.2301.11526},
-  url           = {https://arxiv.org/abs/2301.11526}
-}
-
-@inproceedings{xiong2021nystrom,
-  title     = {Nystr{\"o}mformer: A Nystr{\"o}m-Based Algorithm for Approximating Self-Attention},
-  author    = {Xiong, Yunyang and Zeng, Zhanpeng and Chakraborty, Rudrasis and Tan, Mingxing and Fung, Glenn and Li, Yin and Singh, Vikas},
-  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
-  volume    = {35},
-  pages     = {14138--14148},
-  year      = {2021},
-  url       = {https://arxiv.org/abs/2102.03902}
-}
-
-@inproceedings{katharopoulos2020linear,
-  title     = {Transformers Are {RNNs}: Fast Autoregressive Transformers with Linear Attention},
-  author    = {Katharopoulos, Angelos and Vyas, Apoorv and Pappas, Nikolaos and Fleuret, Fran{\c{c}}ois},
-  booktitle = {Proceedings of the 37th International Conference on Machine Learning},
-  volume    = {119},
-  series    = {Proceedings of Machine Learning Research},
-  pages     = {5156--5165},
-  publisher = {PMLR},
-  year      = {2020},
-  url       = {https://proceedings.mlr.press/v119/katharopoulos20a.html}
-}
-
-@inproceedings{choromanski2021performer,
-  title     = {Rethinking Attention with Performers},
-  author    = {Choromanski, Krzysztof and Likhosherstov, Valerii and Dohan, David and Song, Xingyou and Gane, Andreea and Sarlos, Tamas and Hawkins, Peter and Davis, Jared and Mohiuddin, Afroz and Kaiser, Lukasz and Belanger, David and Colwell, Lucy and Weller, Adrian},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2021},
-  url       = {https://openreview.net/forum?id=Ua6zuk0WRH}
-}
-
-@inproceedings{qin2022cosformer,
-  title     = {{cosFormer}: Rethinking Softmax in Attention},
-  author    = {Qin, Zhen and Sun, Weixuan and Deng, Hui and Li, Dongxu and Wei, Yunshen and Lv, Baohong and Yan, Junjie and Kong, Lingpeng and Zhong, Yiran},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2022},
-  url       = {https://arxiv.org/abs/2202.08791}
-}
-
-@inproceedings{leethorp2022fnet,
-  title     = {{FNet}: Mixing Tokens with Fourier Transforms},
-  author    = {Lee-Thorp, James and Ainslie, Joshua and Eckstein, Ilya and Ontanon, Santiago},
-  booktitle = {Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies},
-  pages     = {4296--4313},
-  year      = {2022},
-  publisher = {Association for Computational Linguistics},
-  doi       = {10.18653/v1/2022.naacl-main.319},
-  url       = {https://aclanthology.org/2022.naacl-main.319/}
-}
-
-@inproceedings{jaegle2021perceiver,
-  title     = {Perceiver {IO}: A General Architecture for Structured Inputs and Outputs},
-  author    = {Jaegle, Andrew and Borgeaud, Sebastian and Alayrac, Jean-Baptiste and Doersch, Carl and Ionescu, Catalin and Ding, David and Koppula, Skanda and Zoran, Daniel and Brock, Andrew and Shelhamer, Evan and others},
-  booktitle = {International Conference on Machine Learning},
-  year      = {2021}
-}
-
-@inproceedings{lee2019settransformer,
-  title     = {Set Transformer: A Framework for Attention-based Permutation-Invariant Neural Networks},
-  author    = {Lee, Juho and Lee, Yoonho and Kim, Jungtaek and Kosiorek, Adam R. and Choi, Seungjin and Teh, Yee Whye},
-  booktitle = {Proceedings of the 36th International Conference on Machine Learning},
-  pages     = {3744--3753},
-  volume    = {97},
-  series    = {Proceedings of Machine Learning Research},
-  publisher = {PMLR},
-  year      = {2019},
-  url       = {https://proceedings.mlr.press/v97/lee19d.html}
-}
-
-@inproceedings{ma2021luna,
-  title     = {Luna: Linear Unified Nested Attention},
-  author    = {Ma, Xuezhe and Kong, Xiang and Wang, Sinong and Zhou, Chunting and May, Jonathan and Ma, Hao and Zettlemoyer, Luke},
-  booktitle = {Advances in Neural Information Processing Systems},
-  volume    = {34},
-  year      = {2021},
-  url       = {https://proceedings.neurips.cc/paper/2021/hash/14319d9cfc6123106878dc20b94fbaf3-Abstract.html}
-}
-
-@inproceedings{peng2022abc,
-  title     = {{ABC}: Attention with Bounded-memory Control},
-  author    = {Peng, Hao and Kasai, Jungo and Pappas, Nikolaos and Yogatama, Dani and Wu, Zhaofeng and Kong, Lingpeng and Schwartz, Roy and Smith, Noah A.},
-  booktitle = {Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
-  pages     = {7469--7483},
-  year      = {2022},
-  address   = {Dublin, Ireland},
-  publisher = {Association for Computational Linguistics},
-  doi       = {10.18653/v1/2022.acl-long.515},
-  url       = {https://aclanthology.org/2022.acl-long.515/}
-}
-
-@inproceedings{gu2022s4,
-  title     = {Efficiently Modeling Long Sequences with Structured State Spaces},
-  author    = {Gu, Albert and Goel, Karan and R{\'e}, Christopher},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2022}
-}
-
-@inproceedings{gu2022hippo,
-  title     = {How to Train Your {HiPPO}: State Space Models with Generalized Orthogonal Basis Projections},
-  author    = {Gu, Albert and Johnson, Isys and Timalsina, Aman and Rudra, Atri and R{\'e}, Christopher},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2023},
-  url       = {https://openreview.net/forum?id=klK17OQ3KB}
-}
-
-@inproceedings{ma2023mega,
-  title     = {Mega: Moving Average Equipped Gated Attention},
-  author    = {Ma, Xuezhe and Zhou, Chunting and Kong, Xiang and He, Junxian and Gui, Liangke and Neubig, Graham and May, Jonathan and Zettlemoyer, Luke},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2023},
-  url       = {https://openreview.net/forum?id=qNLe3iq2El}
-}
-
-@inproceedings{gu2024mamba,
-  title     = {Mamba: Linear-Time Sequence Modeling with Selective State Spaces},
-  author    = {Gu, Albert and Dao, Tri},
-  booktitle = {Conference on Language Modeling},
-  year      = {2024},
-  url       = {https://arxiv.org/abs/2312.00752}
-}
-
-@inproceedings{dao2022flashattention,
-  title     = {{FlashAttention}: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
-  author    = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
-  booktitle = {Advances in Neural Information Processing Systems},
-  volume    = {35},
-  pages     = {16344--16359},
-  year      = {2022},
-  url       = {https://proceedings.neurips.cc/paper_files/paper/2022/hash/3f116c24e55b683557a7bd8a3917c38e-Abstract-Conference.html}
-}
-
-@article{dao2024mamba2,
-  title         = {Transformers are {SSMs}: Generalized Models and Efficient Algorithms Through Structured State Space Duality},
-  author        = {Dao, Tri and Gu, Albert},
-  journal       = {arXiv preprint arXiv:2405.21060},
-  year          = {2024},
-  url           = {https://arxiv.org/abs/2405.21060}
-}
-
-@article{sun2025ttt,
-  title         = {Learning to {L}earn at Test Time: {RNNs} with Expressive Hidden States},
-  author        = {Sun, Yu and Li, Xinhao and Dalal, Karan and Xu, Jiarui and Vikram, Arjun and Zhang, Genghan and Dubois, Yann and Chen, Xinlei and Wang, Xiaolong and Koyejo, Sanmi and Hashimoto, Tatsunori and Guestrin, Carlos},
-  journal       = {arXiv preprint arXiv:2407.04620},
-  year          = {2025},
-  url           = {https://arxiv.org/abs/2407.04620}
-}
-
-@inproceedings{schlag2021fastweights,
-  title     = {Linear Transformers Are Secretly Fast Weight Programmers},
-  author    = {Schlag, Imanol and Irie, Kazuki and Schmidhuber, J{\"u}rgen},
-  booktitle = {International Conference on Machine Learning},
-  year      = {2021},
-  url       = {https://arxiv.org/abs/2102.11174}
-}
-
-@article{liu2024longhorn,
-  title         = {Longhorn: State Space Models Are Amortized Online Learners},
-  author        = {Liu, Bo and Wang, Rui and Wu, Lemeng and Feng, Yihao and Stone, Peter and Liu, Qiang},
-  journal       = {arXiv preprint arXiv:2407.14207},
-  year          = {2024},
-  url           = {https://arxiv.org/abs/2407.14207}
-}
-
-@article{wang2025testtimeregression,
-  title         = {Test-Time Regression: A Unifying Framework for Designing Sequence Models with Associative Memory},
-  author        = {Wang, Ke Alexander and Shi, Jiaxin and Fox, Emily B.},
-  journal       = {arXiv preprint arXiv:2501.12352},
-  year          = {2025},
-  url           = {https://arxiv.org/abs/2501.12352}
-}
-
-@inproceedings{vonoswald2026mesanet,
-  title     = {{MesaNet}: Sequence Modeling by Locally Optimal Test-Time Training},
-  author    = {von Oswald, Johannes and Scherrer, Nino and Kobayashi, Seijin and Versari, Luca and Yang, Songlin and Mittal, Sarthak and Schlegel, Maximilian and Maile, Kaitlin and Schimpf, Yanick and Sieberling, Oliver and Meulemans, Alexander and Saurous, Rif A. and Lajoie, Guillaume and Frenkel, Charlotte and Pascanu, Razvan and Ag{\"u}era y Arcas, Blaise and Sacramento, Jo{\~a}o},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2026},
-  url       = {https://arxiv.org/abs/2506.05233}
-}
-
-@inproceedings{han2026vit3,
-  title     = {{ViT}$^3$: Unlocking Test-Time Training in Vision},
-  author    = {Han, Dongchen and Li, Yining and Li, Tianyu and Cao, Zixuan and Wang, Ziming and Song, Jun and Cheng, Yu and Zheng, Bo and Huang, Gao},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year      = {2026},
-  pages     = {51--61},
-  url       = {https://openaccess.thecvf.com/content/CVPR2026/html/Han_ViT3_Unlocking_Test-Time_Training_in_Vision_CVPR_2026_paper.html}
-}
-
-@inproceedings{kim2021lipschitz,
-  title     = {The Lipschitz Constant of Self-Attention},
-  author    = {Kim, Hyunjik and Papamakarios, George and Mnih, Andriy},
-  booktitle = {International Conference on Machine Learning},
-  pages     = {5562--5571},
-  year      = {2021},
-  url       = {https://proceedings.mlr.press/v139/kim21i.html}
-}
-
-@inproceedings{winston2020mondeq,
-  title     = {Monotone Operator Equilibrium Networks},
-  author    = {Winston, Ezra and Kolter, J. Zico},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2020},
-  url       = {https://arxiv.org/abs/2006.08591}
+  title      = {{XCiT}: Cross-Covariance Image Transformers},
+  author     = {Ali, Alaaeldin and Touvron, Hugo and Caron, Mathilde and Bojanowski, Piotr and Douze, Matthijs and Joulin, Armand and Laptev, Ivan and Neverova, Natalia and Synnaeve, Gabriel and Verbeek, Jakob and J{\'e}gou, Herv{\'e}},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {34},
+  pages      = {20014--20027},
+  year       = {2021},
+  url        = {https://proceedings.neurips.cc/paper/2021/hash/a655fbe4b8d7439994aa37ddad80de56-Abstract.html}
 }
 
 @inproceedings{bai2019deep,
-  title     = {Deep Equilibrium Models},
-  author    = {Bai, Shaojie and Kolter, J. Zico and Koltun, Vladlen},
-  booktitle = {Advances in Neural Information Processing Systems},
-  volume    = {32},
-  year      = {2019},
-  url       = {https://proceedings.neurips.cc/paper/2019/hash/01386bd6d8e091c2ab4c7c7de644d37b-Abstract.html}
+  title      = {Deep Equilibrium Models},
+  author     = {Bai, Shaojie and Kolter, J. Zico and Koltun, Vladlen},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {32},
+  year       = {2019},
+  url        = {https://proceedings.neurips.cc/paper/2019/hash/01386bd6d8e091c2ab4c7c7de644d37b-Abstract.html}
 }
 
 @book{bauschke2017convex,
-  title     = {Convex Analysis and Monotone Operator Theory in Hilbert Spaces},
-  author    = {Bauschke, Heinz H. and Combettes, Patrick L.},
-  edition   = {2},
-  series    = {CMS Books in Mathematics},
-  publisher = {Springer},
-  address   = {Cham},
-  year      = {2017},
-  doi       = {10.1007/978-3-319-48311-5},
-  url       = {https://doi.org/10.1007/978-3-319-48311-5}
+  title      = {Convex Analysis and Monotone Operator Theory in Hilbert Spaces},
+  author     = {Bauschke, Heinz H. and Combettes, Patrick L.},
+  edition    = {Second},
+  series     = {CMS Books in Mathematics},
+  publisher  = {Springer},
+  address    = {Cham},
+  year       = {2017},
+  doi        = {10.1007/978-3-319-48311-5},
+  url        = {https://doi.org/10.1007/978-3-319-48311-5}
 }
 
-@inproceedings{tay2021lra,
-  title     = {Long Range Arena: A Benchmark for Efficient Transformers},
-  author    = {Tay, Yi and Dehghani, Mostafa and Abnar, Samira and Shen, Yikang and Bahri, Dara and Pham, Philip and Rao, Jinfeng and Yang, Liu and Ruder, Sebastian and Metzler, Donald},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2021},
-  url       = {https://openreview.net/forum?id=qVyeW-grC2k}
-}
-
-@article{mirallesgonzalez2025locality,
-  title   = {On the Locality Bias and Results in the Long Range Arena},
-  author  = {Miralles-Gonz{\'a}lez, Pablo and Huertas-Tato, Javier and Mart{\'i}n, Alejandro and Camacho, David},
-  journal = {arXiv preprint arXiv:2501.14850},
-  year    = {2025},
-  url     = {https://arxiv.org/abs/2501.14850}
-}
-
-@article{gresova2023genomicbenchmarks,
-  title   = {Genomic Benchmarks: A Collection of Datasets for Genomic Sequence Classification},
-  author  = {Gre{\v{s}}ov{\'a}, Katar{\'i}na and Martinek, Vlastimil and {\v{C}}ech{\'a}k, David and {\v{S}}ime{\v{c}}ek, Petr and Alexiou, Panagiotis},
-  journal = {BMC Genomic Data},
-  volume  = {24},
-  number  = {1},
-  pages   = {25},
-  year    = {2023},
-  doi     = {10.1186/s12863-023-01123-8},
-  url     = {https://doi.org/10.1186/s12863-023-01123-8}
-}
-
-@inproceedings{afzal2025lion,
-  title = {Linear Attention for Efficient Bidirectional Sequence Modeling},
-  author = {Afzal, Arshia and Abad Rocamora, Elias and Candogan, Leyla Naz and Puigdemont, Pol and Tonin, Francesco and Wu, Yongtao and Shoaran, Mahsa and Cevher, Volkan},
-  booktitle = {Advances in Neural Information Processing Systems},
-  volume = {38},
-  year = {2025},
-  url = {https://arxiv.org/abs/2502.16249}
-}
-
-@inproceedings{jin2026zipmap,
-  title = {{ZipMap}: Linear-Time Stateful {3D} Reconstruction via Test-Time Training},
-  author = {Jin, Haian and Wu, Rundi and Zhang, Tianyuan and Gao, Ruiqi and Barron, Jonathan T. and Snavely, Noah and Holynski, Aleksander},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year = {2026},
-  url = {https://arxiv.org/abs/2603.04385}
-}
-
-@article{liu2026kvbinding,
-  title = {Test-Time Training with {KV} Binding Is Secretly Linear Attention},
-  author = {Liu, Junchen and Elflein, Sven and Litany, Or and Gojcic, Zan and Li, Ruilong},
-  journal = {arXiv preprint arXiv:2602.21204},
-  year = {2026},
-  url = {https://arxiv.org/abs/2602.21204}
-}
-
-@article{kassis2026skills,
-  title = {Scientific Agent Skills: A Library of Procedural Knowledge for Research Agents},
-  author = {Kassis, Timothy and Agarwal, Vinayak and He, Yuhuan and Patel, Darshil and Brueckner, Aubrey M.},
-  journal = {arXiv preprint arXiv:2609.00065},
-  year = {2026},
-  doi = {10.48550/arXiv.2609.00065},
-  url = {https://arxiv.org/abs/2609.00065}
-}
-
-
-@article{yang2025deltanet,
-  title   = {Parallelizing Linear Transformers with the Delta Rule over Sequence Length},
-  author  = {Yang, Songlin and Wang, Bailin and Zhang, Yu and Shen, Yikang and Kim, Yoon},
-  journal = {arXiv preprint arXiv:2406.06484},
-  year    = {2025},
-  url     = {https://arxiv.org/abs/2406.06484}
-}
-
-@inproceedings{hwang2024hydra,
-  title     = {Hydra: Bidirectional State Space Models Through Generalized Matrix Mixers},
-  author    = {Hwang, Sukjun and Lahoti, Aakash and Puduppully, Ratish and Dao, Tri and Gu, Albert},
-  booktitle = {Advances in Neural Information Processing Systems},
-  volume    = {37},
-  year      = {2024},
-  url       = {https://proceedings.neurips.cc/paper_files/paper/2024/hash/c7f795dc3b4eb6ae630695d90001a2f8-Abstract-Conference.html}
-}
-
-
-@inproceedings{touvron2021deit,
-  title = {Training Data-Efficient Image Transformers and Distillation through Attention},
-  author = {Touvron, Hugo and Cord, Matthieu and Douze, Matthijs and Massa, Francisco and Sablayrolles, Alexandre and J{\'e}gou, Herv{\'e}},
-  booktitle = {International Conference on Machine Learning},
-  pages = {10347--10357},
-  year = {2021},
-  url = {https://proceedings.mlr.press/v139/touvron21a.html}
-}
-
-@article{touvron2022deit3,
-  title = {{DeiT III}: Revenge of the {ViT}},
-  author = {Touvron, Hugo and Cord, Matthieu and J{\'e}gou, Herv{\'e}},
-  journal = {arXiv preprint arXiv:2204.07118},
-  year = {2022},
-  url = {https://arxiv.org/abs/2204.07118},
-  note = {ImageNet-1K model results: \url{https://github.com/facebookresearch/deit/blob/main/README_revenge.md}}
-}
-
-@inproceedings{liu2022convnext,
-  title = {A {ConvNet} for the 2020s},
-  author = {Liu, Zhuang and Mao, Hanzi and Wu, Chao-Yuan and Feichtenhofer, Christoph and Darrell, Trevor and Xie, Saining},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year = {2022},
-  url = {https://openaccess.thecvf.com/content/CVPR2022/html/Liu_A_ConvNet_for_the_2020s_CVPR_2022_paper.html}
-}
-
-@inproceedings{zhu2024vim,
-  title = {Vision Mamba: Efficient Visual Representation Learning with Bidirectional State Space Model},
-  author = {Zhu, Lianghui and Liao, Bencheng and Zhang, Qian and Wang, Xinlong and Liu, Wenyu and Wang, Xinggang},
-  booktitle = {International Conference on Machine Learning},
-  pages = {62429--62442},
-  year = {2024},
-  url = {https://proceedings.mlr.press/v235/zhu24f.html}
-}
-
-@article{russakovsky2015imagenet,
-  title = {{ImageNet} Large Scale Visual Recognition Challenge},
-  author = {Russakovsky, Olga and Deng, Jia and Su, Hao and Krause, Jonathan and Satheesh, Sanjeev and Ma, Sean and Huang, Zhiheng and Karpathy, Andrej and Khosla, Aditya and Bernstein, Michael and Berg, Alexander C. and Fei-Fei, Li},
-  journal = {International Journal of Computer Vision},
-  volume = {115},
-  pages = {211--252},
-  year = {2015},
-  doi = {10.1007/s11263-015-0816-y}
-}
-
-@article{su2024roformer,
-  title = {{RoFormer}: Enhanced Transformer with Rotary Position Embedding},
-  author = {Su, Jianlin and Lu, Yu and Pan, Shengfeng and Murtadha, Ahmed and Wen, Bo and Liu, Yunfeng},
-  journal = {arXiv preprint arXiv:2104.09864},
-  year = {2021},
-  url = {https://arxiv.org/abs/2104.09864}
-}
-
-@inproceedings{heo2024ropevit,
-  title = {Rotary Position Embedding for Vision Transformer},
-  author = {Heo, Byeongho and Park, Song and Han, Dongyoon and Yun, Sangdoo},
-  booktitle = {European Conference on Computer Vision},
-  year = {2024},
-  url = {https://arxiv.org/abs/2403.13298}
-}
-
-@article{schenck2025string,
-  title = {Learning the {RoPEs}: Better {2D} and {3D} Position Encodings with {STRING}},
-  author = {Schenck, Connor and Reid, Isaac and Jacob, Mithun George and Bewley, Alex and Ainslie, Joshua and others},
-  journal = {arXiv preprint arXiv:2502.02562},
-  year = {2025},
-  url = {https://arxiv.org/abs/2502.02562}
-}
-
-@inproceedings{yu2025comrope,
-  title = {{ComRoPE}: Scalable and Robust Rotary Position Embedding Parameterized by Trainable Commuting Angle Matrices},
-  author = {Yu, Hao and Jiang, Tangyu and Jia, Shuning and Yan, Shannan and Liu, Shunning and Qian, Haolong and Li, Guanghao and Dong, Shuting and Yuan, Chun},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year = {2025},
-  pages = {4508--4517},
-  url = {https://openaccess.thecvf.com/content/CVPR2025/html/Yu_ComRoPE_Scalable_and_Robust_Rotary_Position_Embedding_Parameterized_by_Trainable_CVPR_2025_paper.html}
-}
-
-@inproceedings{ostmeier2025liere,
-  title = {{LieRE}: Lie Rotational Positional Encodings},
-  author = {Ostmeier, Sophie and Axelrod, Brian and Varma, Maya and Moseley, Michael and Chaudhari, Akshay S and Langlotz, Curtis},
-  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
-  year = {2025},
-  volume = {267},
-  pages = {47339--47355},
-  url = {https://proceedings.mlr.press/v267/ostmeier25a.html}
-}
-
-@inproceedings{min2026compass,
-  title = {Compass-{RoPE}: Isotropic Rotary Position Embeddings for Vision Transformers},
-  author = {Min, Chengxi and Wang, Wei and Zhao, Yao},
-  booktitle = {Proceedings of the 43rd International Conference on Machine Learning},
-  year = {2026},
-  volume = {306},
-  pages = {89011--89028},
-  url = {https://proceedings.mlr.press/v306/min26f.html}
-}
-
-@article{liu2026spiral,
-  title = {Spiral {RoPE}: Rotate Your Rotary Positional Embeddings in the {2D} Plane},
-  author = {Liu, Haoyu and Ren, Sucheng and Zhu, Tingyu and Wang, Peng and Xie, Cihang and Yuille, Alan and Zheng, Zeyu and Wang, Feng},
-  journal = {arXiv preprint arXiv:2602.03227},
-  year = {2026},
-  url = {https://arxiv.org/abs/2602.03227}
-}
-
-@inproceedings{peng2024yarn,
-  title = {{YaRN}: Efficient Context Window Extension of Large Language Models},
-  author = {Peng, Bowen and Quesnelle, Jeffrey and Fan, Honglu and Shippole, Enrico},
-  booktitle = {International Conference on Learning Representations},
-  year = {2024},
-  url = {https://arxiv.org/abs/2309.00071}
-}
-
-@article{garcia2026rove,
-  title = {{RoVE}: Rotary Value Embeddings Attention for Relative Position-dependent Value Pathways},
-  author = {Garc{\'i}a-Castellanos, Alejandro and Weiler, Maurice and Bekkers, Erik J.},
-  journal = {arXiv preprint arXiv:2606.11275},
-  year = {2026},
-  doi = {10.48550/arXiv.2606.11275},
-  url = {https://arxiv.org/abs/2606.11275}
-}
-
-@inproceedings{shang2025longrope2,
-  title = {{LongRoPE2}: Near-Lossless {LLM} Context Window Scaling},
-  author = {Shang, Ning and Zhang, Li Lyna and Wang, Siyuan and Zhang, Gaokai and Lopez, Gilsinia and Yang, Fan and Chen, Weizhu and Yang, Mao},
-  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
-  year = {2025},
-  url = {https://arxiv.org/abs/2502.20082}
-}
-
-@inproceedings{sun2023xpos,
-  title = {A Length-Extrapolatable Transformer},
-  author = {Sun, Yutao and Dong, Li and Patra, Barun and Ma, Shuming and Huang, Shaohan and Benhaim, Alon and Chaudhary, Vishrav and Song, Xia and Wei, Furu},
-  booktitle = {Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics},
-  year = {2023},
-  url = {https://aclanthology.org/2023.acl-long.816/}
-}
-
-@article{garnelo2023intention,
-  title = {Exploring the Space of Key-Value-Query Models with Intention},
-  author = {Garnelo, Marta and Czarnecki, Wojciech Marian},
-  journal = {arXiv preprint arXiv:2305.10203},
-  year = {2023},
-  url = {https://arxiv.org/abs/2305.10203}
-}
-
-@inproceedings{xiao2024ono,
-  title = {Improved Operator Learning by Orthogonal Attention},
-  author = {Xiao, Zipeng and Hao, Zhongkai and Lin, Bokai and Deng, Zhijie and Su, Hang},
-  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
-  series = {Proceedings of Machine Learning Research},
-  volume = {235},
-  pages = {54288--54299},
-  year = {2024},
-  publisher = {PMLR},
-  url = {https://proceedings.mlr.press/v235/xiao24c.html}
+@inproceedings{choromanski2021performer,
+  title      = {Rethinking Attention with Performers},
+  author     = {Choromanski, Krzysztof and Likhosherstov, Valerii and Dohan, David and Song, Xingyou and Gane, Andreea and Sarlos, Tamas and Hawkins, Peter and Davis, Jared and Mohiuddin, Afroz and Kaiser, Lukasz and Belanger, David and Colwell, Lucy and Weller, Adrian},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2021},
+  url        = {https://openreview.net/forum?id=Ua6zuk0WRH}
 }
 
 @inproceedings{chu2023cpe,
-  title = {Conditional Positional Encodings for Vision Transformers},
-  author = {Chu, Xiangxiang and Tian, Zhi and Zhang, Bo and Wang, Xinlong and Shen, Chunhua},
-  booktitle = {International Conference on Learning Representations},
-  year = {2023},
-  url = {https://openreview.net/forum?id=3KWnuT-R1bh}
+  title      = {Conditional Positional Encodings for Vision Transformers},
+  author     = {Chu, Xiangxiang and Tian, Zhi and Zhang, Bo and Wang, Xinlong and Shen, Chunhua},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2023},
+  url        = {https://openreview.net/forum?id=3KWnuT-R1bh}
 }
 
-@article{henry2019bfloat,
-  title = {Leveraging the bfloat16 Artificial Intelligence Datatype for Higher-Precision Computations},
-  author = {Henry, Greg and Tang, Ping Tak Peter and Heinecke, Alexander},
-  journal = {arXiv preprint arXiv:1904.06376},
-  year = {2019},
-  url = {https://arxiv.org/abs/1904.06376}
+@inproceedings{cubuk2020randaugment,
+  title      = {{RandAugment}: Practical Automated Data Augmentation with a Reduced Search Space},
+  author     = {Cubuk, Ekin D. and Zoph, Barret and Shlens, Jonathon and Le, Quoc V.},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {33},
+  pages      = {18613--18624},
+  year       = {2020},
+  url        = {https://proceedings.neurips.cc/paper/2020/hash/d85b63ef0ccb114d0a3bb7b7d808028f-Abstract.html}
 }
 
-@inproceedings{yang2025gdn,
-  title = {Gated Delta Networks: Improving {Mamba2} with Delta Rule},
-  author = {Yang, Songlin and Kautz, Jan and Hatamizadeh, Ali},
-  booktitle = {International Conference on Learning Representations},
-  year = {2025},
-  url = {https://arxiv.org/abs/2412.06464}
+@inproceedings{dao2022flashattention,
+  title      = {{FlashAttention}: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+  author     = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {35},
+  pages      = {16344--16359},
+  year       = {2022},
+  doi        = {10.52202/068431-1189},
+  url        = {https://proceedings.neurips.cc/paper/2022/hash/67d57c32e20fd0a7a302cb81d36e40d5-Abstract-Conference.html}
 }
 
-@article{kimi2025linear,
-  title = {Kimi Linear: An Expressive, Efficient Attention Architecture},
-  author = {{Kimi Team} and Zhang, Yu and Lin, Zongyu and Yao, Xingcheng and Hu, Jiaxi and Meng, Fanqing and Liu, Chengyin and Men, Xin and Yang, Songlin and others},
-  journal = {arXiv preprint arXiv:2510.26692},
-  year = {2025},
-  url = {https://arxiv.org/abs/2510.26692}
-}
-
-@article{hatamizadeh2026gdn2,
-  title = {Gated {DeltaNet-2}: Decoupling Erase and Write in Linear Attention},
-  author = {Hatamizadeh, Ali and Choi, Yejin and Kautz, Jan},
-  journal = {arXiv preprint arXiv:2605.22791},
-  year = {2026},
-  url = {https://arxiv.org/abs/2605.22791}
-}
-
-@article{xi2026videodeltanet,
-  title = {Video {DeltaNet}: A Video-Native Hybrid Attention for Livestream Video Generation},
-  author = {Xi, Haocheng and Xie, Yiming and Zhao, Hexu and Zhang, Yiwen and Liu, Michael and Creavin, Thomas and Keutzer, Kurt and Li, Xiuyu and Lv, Zhaoyang and Xu, Chenfeng and Feng, Haiwen},
-  journal = {arXiv preprint arXiv:2609.20744},
-  year = {2026},
-  url = {https://arxiv.org/abs/2609.20744}
+@inproceedings{dao2024mamba2,
+  title      = {Transformers are {SSMs}: Generalized Models and Efficient Algorithms Through Structured State Space Duality},
+  author     = {Dao, Tri and Gu, Albert},
+  booktitle  = {Proceedings of the 41st International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {235},
+  pages      = {10041--10071},
+  publisher  = {PMLR},
+  year       = {2024},
+  url        = {https://proceedings.mlr.press/v235/dao24a.html}
 }
 
 @inproceedings{devlin2019bert,
-  title = {{BERT}: Pre-training of Deep Bidirectional Transformers for Language Understanding},
-  author = {Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},
-  booktitle = {Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies},
-  volume = {1},
-  pages = {4171--4186},
-  year = {2019},
-  doi = {10.18653/v1/N19-1423},
-  url = {https://aclanthology.org/N19-1423/}
+  title      = {{BERT}: Pre-training of Deep Bidirectional Transformers for Language Understanding},
+  author     = {Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},
+  booktitle  = {Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers)},
+  pages      = {4171--4186},
+  year       = {2019},
+  doi        = {10.18653/v1/N19-1423},
+  url        = {https://aclanthology.org/N19-1423/}
+}
+
+@inproceedings{dosovitskiy2021vit,
+  title      = {An Image Is Worth {16$\times$16} Words: Transformers for Image Recognition at Scale},
+  author     = {Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander and Weissenborn, Dirk and Zhai, Xiaohua and Unterthiner, Thomas and Dehghani, Mostafa and Minderer, Matthias and Heigold, Georg and Gelly, Sylvain and Uszkoreit, Jakob and Houlsby, Neil},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2021},
+  url        = {https://openreview.net/forum?id=YicbFdNTTy}
+}
+
+@article{garcia2026rove,
+  title      = {{RoVE}: Rotary Value Embeddings Attention for Relative Position-dependent Value Pathways},
+  author     = {Garc{\'i}a-Castellanos, Alejandro and Weiler, Maurice and Bekkers, Erik J.},
+  journal    = {arXiv preprint arXiv:2606.11275},
+  year       = {2026},
+  doi        = {10.48550/arXiv.2606.11275},
+  url        = {https://arxiv.org/abs/2606.11275}
+}
+
+@article{garnelo2023intention,
+  title      = {Exploring the Space of Key-Value-Query Models with Intention},
+  author     = {Garnelo, Marta and Czarnecki, Wojciech Marian},
+  journal    = {arXiv preprint arXiv:2305.10203},
+  year       = {2023},
+  url        = {https://arxiv.org/abs/2305.10203}
+}
+
+@book{golub2013matrix,
+  title      = {Matrix Computations},
+  author     = {Golub, Gene H. and Van Loan, Charles F.},
+  edition    = {Fourth},
+  publisher  = {Johns Hopkins University Press},
+  year       = {2013},
+  url        = {https://www.press.jhu.edu/books/title/10678/matrix-computations}
+}
+
+@article{gresova2023genomicbenchmarks,
+  title      = {Genomic Benchmarks: A Collection of Datasets for Genomic Sequence Classification},
+  author     = {Gre{\v{s}}ov{\'a}, Katar{\'i}na and Martinek, Vlastimil and {\v{C}}ech{\'a}k, David and {\v{S}}ime{\v{c}}ek, Petr and Alexiou, Panagiotis},
+  journal    = {BMC Genomic Data},
+  volume     = {24},
+  number     = {1},
+  pages      = {25},
+  year       = {2023},
+  doi        = {10.1186/s12863-023-01123-8},
+  url        = {https://doi.org/10.1186/s12863-023-01123-8}
+}
+
+@inproceedings{gu2022hippo,
+  title      = {How to Train Your {HiPPO}: State Space Models with Generalized Orthogonal Basis Projections},
+  author     = {Gu, Albert and Johnson, Isys and Timalsina, Aman and Rudra, Atri and R{\'e}, Christopher},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2023},
+  url        = {https://openreview.net/forum?id=klK17OQ3KB}
+}
+
+@inproceedings{gu2022s4,
+  title      = {Efficiently Modeling Long Sequences with Structured State Spaces},
+  author     = {Gu, Albert and Goel, Karan and R{\'e}, Christopher},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2022},
+  url        = {https://openreview.net/forum?id=uYLFoz1vlAC}
+}
+
+@inproceedings{gu2024mamba,
+  title      = {Mamba: Linear-Time Sequence Modeling with Selective State Spaces},
+  author     = {Gu, Albert and Dao, Tri},
+  booktitle  = {Conference on Language Modeling},
+  year       = {2024},
+  url        = {https://openreview.net/forum?id=tEYskw1VY2}
+}
+
+@inproceedings{han2026vit3,
+  title      = {{ViT}$^3$: Unlocking Test-Time Training in Vision},
+  author     = {Han, Dongchen and Li, Yining and Li, Tianyu and Cao, Zixuan and Wang, Ziming and Song, Jun and Cheng, Yu and Zheng, Bo and Huang, Gao},
+  booktitle  = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages      = {51--61},
+  year       = {2026},
+  url        = {https://openaccess.thecvf.com/content/CVPR2026/html/Han_ViT3_Unlocking_Test-Time_Training_in_Vision_CVPR_2026_paper.html}
+}
+
+@article{hatamizadeh2026gdn2,
+  title      = {Gated {DeltaNet-2}: Decoupling Erase and Write in Linear Attention},
+  author     = {Hatamizadeh, Ali and Choi, Yejin and Kautz, Jan},
+  journal    = {arXiv preprint arXiv:2605.22791},
+  year       = {2026},
+  url        = {https://arxiv.org/abs/2605.22791}
+}
+
+@inproceedings{henry2019bfloat,
+  title      = {Leveraging the {bfloat16} Artificial Intelligence Datatype for Higher-Precision Computations},
+  author     = {Henry, Greg and Tang, Ping Tak Peter and Heinecke, Alexander},
+  booktitle  = {Proceedings of the 26th IEEE Symposium on Computer Arithmetic},
+  pages      = {69--76},
+  publisher  = {IEEE},
+  year       = {2019},
+  doi        = {10.1109/ARITH.2019.00019},
+  url        = {https://doi.org/10.1109/ARITH.2019.00019}
+}
+
+@inproceedings{heo2024ropevit,
+  title      = {Rotary Position Embedding for Vision Transformer},
+  author     = {Heo, Byeongho and Park, Song and Han, Dongyoon and Yun, Sangdoo},
+  booktitle  = {Computer Vision -- ECCV 2024},
+  series     = {Lecture Notes in Computer Science},
+  volume     = {15068},
+  pages      = {289--305},
+  publisher  = {Springer},
+  year       = {2024},
+  doi        = {10.1007/978-3-031-72684-2_17},
+  url        = {https://link.springer.com/chapter/10.1007/978-3-031-72684-2_17}
+}
+
+@inproceedings{hoffer2020augment,
+  title      = {Augment Your Batch: Improving Generalization Through Instance Repetition},
+  author     = {Hoffer, Elad and Ben-Nun, Tal and Hubara, Itay and Giladi, Niv and Hoefler, Torsten and Soudry, Daniel},
+  booktitle  = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages      = {8129--8138},
+  year       = {2020},
+  url        = {https://openaccess.thecvf.com/content_CVPR_2020/html/Hoffer_Augment_Your_Batch_Improving_Generalization_Through_Instance_Repetition_CVPR_2020_paper.html}
+}
+
+@inproceedings{huang2016stochastic,
+  title      = {Deep Networks with Stochastic Depth},
+  author     = {Huang, Gao and Sun, Yu and Liu, Zhuang and Sedra, Daniel and Weinberger, Kilian Q.},
+  booktitle  = {Computer Vision -- ECCV 2016},
+  pages      = {646--661},
+  publisher  = {Springer International Publishing},
+  year       = {2016},
+  doi        = {10.1007/978-3-319-46493-0_39},
+  url        = {https://doi.org/10.1007/978-3-319-46493-0_39}
+}
+
+@inproceedings{hwang2024hydra,
+  title      = {Hydra: Bidirectional State Space Models Through Generalized Matrix Mixers},
+  author     = {Hwang, Sukjun and Lahoti, Aakash and Puduppully, Ratish and Dao, Tri and Gu, Albert},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {37},
+  pages      = {110876--110908},
+  year       = {2024},
+  doi        = {10.52202/079017-3520},
+  url        = {https://proceedings.neurips.cc/paper_files/paper/2024/hash/c7f795dc3b4eb6ae630695d90001a2f8-Abstract-Conference.html}
+}
+
+@inproceedings{jaegle2021perceiver,
+  title      = {Perceiver {IO}: A General Architecture for Structured Inputs \& Outputs},
+  author     = {Jaegle, Andrew and Borgeaud, Sebastian and Alayrac, Jean-Baptiste and Doersch, Carl and Ionescu, Catalin and Ding, David and Koppula, Skanda and Zoran, Daniel and Brock, Andrew and Shelhamer, Evan and H{\'e}naff, Olivier and Botvinick, Matthew M. and Zisserman, Andrew and Vinyals, Oriol and Carreira, Jo{\~a}o},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2022},
+  url        = {https://openreview.net/forum?id=fILj7WpI-g}
+}
+
+@inproceedings{jin2026zipmap,
+  title      = {{ZipMap}: Linear-Time Stateful {3D} Reconstruction via Test-Time Training},
+  author     = {Jin, Haian and Wu, Rundi and Zhang, Tianyuan and Gao, Ruiqi and Barron, Jonathan T. and Snavely, Noah and Holynski, Aleksander},
+  booktitle  = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages      = {21748--21759},
+  year       = {2026},
+  url        = {https://openaccess.thecvf.com/content/CVPR2026/html/Jin_ZipMap_Linear-Time_Stateful_3D_Reconstruction_via_Test-Time_Training_CVPR_2026_paper.html}
+}
+
+@article{kassis2026skills,
+  title      = {Scientific Agent Skills: A Library of Procedural Knowledge for Research Agents},
+  author     = {Kassis, Timothy and Agarwal, Vinayak and He, Yuhuan and Patel, Darshil and Brueckner, Aubrey M.},
+  journal    = {arXiv preprint arXiv:2609.00065},
+  year       = {2026},
+  doi        = {10.48550/arXiv.2609.00065},
+  url        = {https://arxiv.org/abs/2609.00065}
+}
+
+@inproceedings{katharopoulos2020linear,
+  title      = {Transformers Are {RNNs}: Fast Autoregressive Transformers with Linear Attention},
+  author     = {Katharopoulos, Angelos and Vyas, Apoorv and Pappas, Nikolaos and Fleuret, Fran{\c{c}}ois},
+  booktitle  = {Proceedings of the 37th International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {119},
+  pages      = {5156--5165},
+  publisher  = {PMLR},
+  year       = {2020},
+  url        = {https://proceedings.mlr.press/v119/katharopoulos20a.html}
+}
+
+@inproceedings{kim2021lipschitz,
+  title      = {The Lipschitz Constant of Self-Attention},
+  author     = {Kim, Hyunjik and Papamakarios, George and Mnih, Andriy},
+  booktitle  = {Proceedings of the 38th International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {139},
+  pages      = {5562--5571},
+  publisher  = {PMLR},
+  year       = {2021},
+  url        = {https://proceedings.mlr.press/v139/kim21i.html}
+}
+
+@article{kimi2025linear,
+  title      = {Kimi Linear: An Expressive, Efficient Attention Architecture},
+  author     = {{Kimi Team} and Zhang, Yu and Lin, Zongyu and Yao, Xingcheng and Hu, Jiaxi and Meng, Fanqing and Liu, Chengyin and Men, Xin and Yang, Songlin and others},
+  journal    = {arXiv preprint arXiv:2510.26692},
+  year       = {2025},
+  url        = {https://arxiv.org/abs/2510.26692}
+}
+
+@inproceedings{lee2019settransformer,
+  title      = {Set Transformer: A Framework for Attention-based Permutation-Invariant Neural Networks},
+  author     = {Lee, Juho and Lee, Yoonho and Kim, Jungtaek and Kosiorek, Adam R. and Choi, Seungjin and Teh, Yee Whye},
+  booktitle  = {Proceedings of the 36th International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {97},
+  pages      = {3744--3753},
+  publisher  = {PMLR},
+  year       = {2019},
+  url        = {https://proceedings.mlr.press/v97/lee19d.html}
+}
+
+@inproceedings{leethorp2022fnet,
+  title      = {{FNet}: Mixing Tokens with Fourier Transforms},
+  author     = {Lee-Thorp, James and Ainslie, Joshua and Eckstein, Ilya and Ontanon, Santiago},
+  booktitle  = {Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies},
+  pages      = {4296--4313},
+  publisher  = {Association for Computational Linguistics},
+  year       = {2022},
+  doi        = {10.18653/v1/2022.naacl-main.319},
+  url        = {https://aclanthology.org/2022.naacl-main.319/}
+}
+
+@article{liao2025vig,
+  title      = {{ViG}: Linear-complexity Visual Sequence Learning with Gated Linear Attention},
+  author     = {Liao, Bencheng and Wang, Xinggang and Zhu, Lianghui and Zhang, Qian and Huang, Chang},
+  journal    = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume     = {39},
+  number     = {5},
+  pages      = {5182--5190},
+  year       = {2025},
+  doi        = {10.1609/aaai.v39i5.32550},
+  url        = {https://ojs.aaai.org/index.php/AAAI/article/view/32550}
+}
+
+@inproceedings{liu2022convnext,
+  title      = {A {ConvNet} for the 2020s},
+  author     = {Liu, Zhuang and Mao, Hanzi and Wu, Chao-Yuan and Feichtenhofer, Christoph and Darrell, Trevor and Xie, Saining},
+  booktitle  = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages      = {11976--11986},
+  year       = {2022},
+  url        = {https://openaccess.thecvf.com/content/CVPR2022/html/Liu_A_ConvNet_for_the_2020s_CVPR_2022_paper.html}
+}
+
+@inproceedings{liu2024longhorn,
+  title      = {Longhorn: State Space Models Are Amortized Online Learners},
+  author     = {Liu, Bo and Wang, Rui and Wu, Lemeng and Feng, Yihao and Stone, Peter and Liu, Qiang},
+  booktitle  = {International Conference on Learning Representations},
+  pages      = {95419--95434},
+  year       = {2025},
+  url        = {https://proceedings.iclr.cc/paper_files/paper/2025/hash/ee0e45ff4de76cbfdf07015a7839f339-Abstract-Conference.html}
+}
+
+@inproceedings{liu2026kvbinding,
+  title      = {Test-Time Training with {KV} Binding Is Secretly Linear Attention},
+  author     = {Liu, Junchen and Elflein, Sven and Litany, Or and Gojcic, Zan and Li, Ruilong},
+  booktitle  = {Proceedings of the 43rd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {306},
+  pages      = {76116--76135},
+  publisher  = {PMLR},
+  year       = {2026},
+  url        = {https://proceedings.mlr.press/v306/liu26ae.html}
+}
+
+@inproceedings{liu2026spiral,
+  title      = {Spiral {RoPE}: Rotate Your Rotary Positional Embeddings in the {2D} Plane},
+  author     = {Liu, Haoyu and Ren, Sucheng and Zhu, Tingyu and Wang, Peng and Xie, Cihang and Yuille, Alan and Zheng, Zeyu and Wang, Feng},
+  booktitle  = {Proceedings of the 43rd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {306},
+  pages      = {78124--78143},
+  publisher  = {PMLR},
+  year       = {2026},
+  url        = {https://proceedings.mlr.press/v306/liu26dj.html}
+}
+
+@inproceedings{loshchilov2019adamw,
+  title      = {Decoupled Weight Decay Regularization},
+  author     = {Loshchilov, Ilya and Hutter, Frank},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2019},
+  url        = {https://openreview.net/forum?id=Bkg6RiCqY7}
+}
+
+@inproceedings{ma2021luna,
+  title      = {Luna: Linear Unified Nested Attention},
+  author     = {Ma, Xuezhe and Kong, Xiang and Wang, Sinong and Zhou, Chunting and May, Jonathan and Ma, Hao and Zettlemoyer, Luke},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {34},
+  pages      = {2441--2453},
+  year       = {2021},
+  url        = {https://proceedings.neurips.cc/paper/2021/hash/14319d9cfc6123106878dc20b94fbaf3-Abstract.html}
+}
+
+@inproceedings{ma2023mega,
+  title      = {Mega: Moving Average Equipped Gated Attention},
+  author     = {Ma, Xuezhe and Zhou, Chunting and Kong, Xiang and He, Junxian and Gui, Liangke and Neubig, Graham and May, Jonathan and Zettlemoyer, Luke},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2023},
+  url        = {https://openreview.net/forum?id=qNLe3iq2El}
+}
+
+@inproceedings{min2026compass,
+  title      = {Compass-{RoPE}: Isotropic Rotary Position Embeddings for Vision Transformers},
+  author     = {Min, Chengxi and Wang, Wei and Zhao, Yao},
+  booktitle  = {Proceedings of the 43rd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {306},
+  pages      = {89011--89028},
+  publisher  = {PMLR},
+  year       = {2026},
+  url        = {https://proceedings.mlr.press/v306/min26f.html}
+}
+
+@article{mirallesgonzalez2025locality,
+  title      = {On the Locality Bias and Results in the Long Range Arena},
+  author     = {Miralles-Gonz{\'a}lez, Pablo and Huertas-Tato, Javier and Mart{\'i}n, Alejandro and Camacho, David},
+  journal    = {arXiv preprint arXiv:2501.14850},
+  year       = {2025},
+  url        = {https://arxiv.org/abs/2501.14850}
+}
+
+@inproceedings{ostmeier2025liere,
+  title      = {{LieRE}: Lie Rotational Positional Encodings},
+  author     = {Ostmeier, Sophie and Axelrod, Brian and Varma, Maya and Moseley, Michael and Chaudhari, Akshay S and Langlotz, Curtis},
+  booktitle  = {Proceedings of the 42nd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {267},
+  pages      = {47339--47355},
+  publisher  = {PMLR},
+  year       = {2025},
+  url        = {https://proceedings.mlr.press/v267/ostmeier25a.html}
+}
+
+@inproceedings{peng2022abc,
+  title      = {{ABC}: Attention with Bounded-memory Control},
+  author     = {Peng, Hao and Kasai, Jungo and Pappas, Nikolaos and Yogatama, Dani and Wu, Zhaofeng and Kong, Lingpeng and Schwartz, Roy and Smith, Noah A.},
+  booktitle  = {Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  pages      = {7469--7483},
+  publisher  = {Association for Computational Linguistics},
+  address    = {Dublin, Ireland},
+  year       = {2022},
+  doi        = {10.18653/v1/2022.acl-long.515},
+  url        = {https://aclanthology.org/2022.acl-long.515/}
+}
+
+@inproceedings{peng2024yarn,
+  title      = {{YaRN}: Efficient Context Window Extension of Large Language Models},
+  author     = {Peng, Bowen and Quesnelle, Jeffrey and Fan, Honglu and Shippole, Enrico},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2024},
+  url        = {https://openreview.net/forum?id=wHBfxhZu1u}
+}
+
+@inproceedings{qin2022cosformer,
+  title      = {{cosFormer}: Rethinking Softmax in Attention},
+  author     = {Qin, Zhen and Sun, Weixuan and Deng, Hui and Li, Dongxu and Wei, Yunshen and Lv, Baohong and Yan, Junjie and Kong, Lingpeng and Zhong, Yiran},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2022},
+  url        = {https://openreview.net/forum?id=Bl8CQrx2Up4}
 }
 
 @article{raffel2020t5,
-  title = {Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer},
-  author = {Raffel, Colin and Shazeer, Noam and Roberts, Adam and Lee, Katherine and Narang, Sharan and Matena, Michael and Zhou, Yanqi and Li, Wei and Liu, Peter J.},
-  journal = {Journal of Machine Learning Research},
-  volume = {21},
-  number = {140},
-  pages = {1--67},
-  year = {2020},
-  url = {https://jmlr.org/papers/v21/20-074.html}
+  title      = {Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer},
+  author     = {Raffel, Colin and Shazeer, Noam and Roberts, Adam and Lee, Katherine and Narang, Sharan and Matena, Michael and Zhou, Yanqi and Li, Wei and Liu, Peter J.},
+  journal    = {Journal of Machine Learning Research},
+  volume     = {21},
+  number     = {140},
+  pages      = {1--67},
+  year       = {2020},
+  url        = {https://jmlr.org/papers/v21/20-074.html}
+}
+
+@article{russakovsky2015imagenet,
+  title      = {{ImageNet} Large Scale Visual Recognition Challenge},
+  author     = {Russakovsky, Olga and Deng, Jia and Su, Hao and Krause, Jonathan and Satheesh, Sanjeev and Ma, Sean and Huang, Zhiheng and Karpathy, Andrej and Khosla, Aditya and Bernstein, Michael and Berg, Alexander C. and Fei-Fei, Li},
+  journal    = {International Journal of Computer Vision},
+  volume     = {115},
+  number     = {3},
+  pages      = {211--252},
+  year       = {2015},
+  doi        = {10.1007/s11263-015-0816-y},
+  url        = {https://doi.org/10.1007/s11263-015-0816-y}
+}
+
+@inproceedings{schenck2025string,
+  title      = {Learning the {RoPEs}: Better {2D} and {3D} Position Encodings with {STRING}},
+  author     = {Schenck, Connor and Reid, Isaac and Jacob, Mithun George and Bewley, Alex and Ainslie, Joshua and Rendleman, David and Jain, Deepali and Sharma, Mohit and Dubey, Kumar Avinava and Wahid, Ayzaan and Singh, Sumeet and Wagner, Ren\'{e} and Ding, Tianli and Fu, Chuyuan and Byravan, Arunkumar and Varley, Jake and Gritsenko, Alexey A. and Minderer, Matthias and Kalashnikov, Dmitry and Tompson, Jonathan and Sindhwani, Vikas and Choromanski, Krzysztof Marcin},
+  booktitle  = {Proceedings of the 42nd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {267},
+  pages      = {53295--53315},
+  publisher  = {PMLR},
+  year       = {2025},
+  url        = {https://proceedings.mlr.press/v267/schenck25a.html}
+}
+
+@inproceedings{schlag2021fastweights,
+  title      = {Linear Transformers Are Secretly Fast Weight Programmers},
+  author     = {Schlag, Imanol and Irie, Kazuki and Schmidhuber, J{\"u}rgen},
+  booktitle  = {Proceedings of the 38th International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {139},
+  pages      = {9355--9366},
+  publisher  = {PMLR},
+  year       = {2021},
+  url        = {https://proceedings.mlr.press/v139/schlag21a.html}
+}
+
+@inproceedings{shang2025longrope2,
+  title      = {{LongRoPE2}: Near-Lossless {LLM} Context Window Scaling},
+  author     = {Shang, Ning and Zhang, Li Lyna and Wang, Siyuan and Zhang, Gaokai and Lopez, Gilsinia and Yang, Fan and Chen, Weizhu and Yang, Mao},
+  booktitle  = {Proceedings of the 42nd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {267},
+  pages      = {54203--54218},
+  publisher  = {PMLR},
+  year       = {2025},
+  url        = {https://proceedings.mlr.press/v267/shang25a.html}
+}
+
+@article{shazeer2020glu,
+  title      = {{GLU} Variants Improve Transformer},
+  author     = {Shazeer, Noam},
+  journal    = {arXiv preprint arXiv:2002.05202},
+  year       = {2020},
+  url        = {https://arxiv.org/abs/2002.05202}
+}
+
+@article{su2024roformer,
+  title      = {{RoFormer}: Enhanced Transformer with Rotary Position Embedding},
+  author     = {Su, Jianlin and Ahmed, Murtadha and Lu, Yu and Pan, Shengfeng and Bo, Wen and Liu, Yunfeng},
+  journal    = {Neurocomputing},
+  volume     = {568},
+  pages      = {127063},
+  year       = {2024},
+  doi        = {10.1016/j.neucom.2023.127063},
+  url        = {https://doi.org/10.1016/j.neucom.2023.127063}
+}
+
+@inproceedings{sun2023xpos,
+  title      = {A Length-Extrapolatable Transformer},
+  author     = {Sun, Yutao and Dong, Li and Patra, Barun and Ma, Shuming and Huang, Shaohan and Benhaim, Alon and Chaudhary, Vishrav and Song, Xia and Wei, Furu},
+  booktitle  = {Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  pages      = {14590--14604},
+  publisher  = {Association for Computational Linguistics},
+  year       = {2023},
+  doi        = {10.18653/v1/2023.acl-long.816},
+  url        = {https://aclanthology.org/2023.acl-long.816/}
+}
+
+@inproceedings{sun2025ttt,
+  title      = {Learning to (Learn at Test Time): {RNNs} with Expressive Hidden States},
+  author     = {Sun, Yu and Li, Xinhao and Dalal, Karan and Xu, Jiarui and Vikram, Arjun and Zhang, Genghan and Dubois, Yann and Chen, Xinlei and Wang, Xiaolong and Koyejo, Sanmi and Hashimoto, Tatsunori and Guestrin, Carlos},
+  booktitle  = {Proceedings of the 42nd International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {267},
+  pages      = {57503--57522},
+  publisher  = {PMLR},
+  year       = {2025},
+  url        = {https://proceedings.mlr.press/v267/sun25h.html}
+}
+
+@inproceedings{tay2021lra,
+  title      = {Long Range Arena: A Benchmark for Efficient Transformers},
+  author     = {Tay, Yi and Dehghani, Mostafa and Abnar, Samira and Shen, Yikang and Bahri, Dara and Pham, Philip and Rao, Jinfeng and Yang, Liu and Ruder, Sebastian and Metzler, Donald},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2021},
+  url        = {https://openreview.net/forum?id=qVyeW-grC2k}
+}
+
+@inproceedings{tillet2019triton,
+  title      = {{Triton}: An Intermediate Language and Compiler for Tiled Neural Network Computations},
+  author     = {Tillet, Philippe and Kung, H. T. and Cox, David},
+  booktitle  = {Proceedings of the 3rd ACM SIGPLAN International Workshop on Machine Learning and Programming Languages},
+  pages      = {10--19},
+  publisher  = {ACM},
+  year       = {2019},
+  doi        = {10.1145/3315508.3329973},
+  url        = {https://doi.org/10.1145/3315508.3329973}
+}
+
+@inproceedings{touvron2021deit,
+  title      = {Training Data-Efficient Image Transformers and Distillation through Attention},
+  author     = {Touvron, Hugo and Cord, Matthieu and Douze, Matthijs and Massa, Francisco and Sablayrolles, Alexandre and J{\'e}gou, Herv{\'e}},
+  booktitle  = {Proceedings of the 38th International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {139},
+  pages      = {10347--10357},
+  publisher  = {PMLR},
+  year       = {2021},
+  url        = {https://proceedings.mlr.press/v139/touvron21a.html}
+}
+
+@inproceedings{touvron2022deit3,
+  title      = {{DeiT III}: Revenge of the {ViT}},
+  author     = {Touvron, Hugo and Cord, Matthieu and J{\'e}gou, Herv{\'e}},
+  booktitle  = {Computer Vision -- ECCV 2022},
+  series     = {Lecture Notes in Computer Science},
+  volume     = {13684},
+  pages      = {516--533},
+  publisher  = {Springer},
+  year       = {2022},
+  doi        = {10.1007/978-3-031-20053-3_30},
+  url        = {https://doi.org/10.1007/978-3-031-20053-3_30}
+}
+
+@inproceedings{vaswani2017attention,
+  title      = {Attention Is All You Need},
+  author     = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, Lukasz and Polosukhin, Illia},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {30},
+  year       = {2017},
+  url        = {https://proceedings.neurips.cc/paper_files/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html}
+}
+
+@inproceedings{vonoswald2026mesanet,
+  title      = {{MesaNet}: Sequence Modeling by Locally Optimal Test-Time Training},
+  author     = {von Oswald, Johannes and Scherrer, Nino and Kobayashi, Seijin and Versari, Luca and Yang, Songlin and Schlegel, Maximilian and Maile, Kaitlin and Schimpf, Yanick and Sieberling, Oliver and Meulemans, Alexander and Saurous, Rif A. and Lajoie, Guillaume and Frenkel, Charlotte and Pascanu, Razvan and Ag{\"u}era y Arcas, Blaise and Sacramento, Jo{\~a}o},
+  booktitle  = {International Conference on Learning Representations},
+  pages      = {26397--26447},
+  year       = {2026},
+  url        = {https://proceedings.iclr.cc/paper_files/paper/2026/hash/2c3d5a4eff20d24390a445762d61bfbb-Abstract-Conference.html}
 }
 
 @inproceedings{wang2019glue,
-  title = {{GLUE}: A Multi-Task Benchmark and Analysis Platform for Natural Language Understanding},
-  author = {Wang, Alex and Singh, Amanpreet and Michael, Julian and Hill, Felix and Levy, Omer and Bowman, Samuel R.},
-  booktitle = {International Conference on Learning Representations},
-  year = {2019},
-  url = {https://arxiv.org/abs/1804.07461}
+  title      = {{GLUE}: A Multi-Task Benchmark and Analysis Platform for Natural Language Understanding},
+  author     = {Wang, Alex and Singh, Amanpreet and Michael, Julian and Hill, Felix and Levy, Omer and Bowman, Samuel R.},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2019},
+  url        = {https://openreview.net/forum?id=rJ4km2R5t7}
 }
 
+@article{wang2020linformer,
+  title      = {Linformer: Self-Attention with Linear Complexity},
+  author     = {Wang, Sinong and Li, Belinda Z. and Khabsa, Madian and Fang, Han and Ma, Hao},
+  journal    = {arXiv preprint arXiv:2006.04768},
+  year       = {2020},
+  url        = {https://arxiv.org/abs/2006.04768}
+}
 
-@inproceedings{liao2025vig,
-  title = {{ViG}: Linear-complexity Visual Sequence Learning with Gated Linear Attention},
-  author = {Liao, Bencheng and Wang, Xinggang and Zhu, Lianghui and Zhang, Qian and Huang, Chang},
-  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
-  volume = {39},
-  number = {5},
-  pages = {5182--5190},
-  year = {2025},
-  doi = {10.1609/aaai.v39i5.32550},
-  url = {https://ojs.aaai.org/index.php/AAAI/article/view/32550}
+@inproceedings{wang2023direct,
+  title      = {Direct Parameterization of Lipschitz-Bounded Deep Networks},
+  author     = {Wang, Ruigang and Manchester, Ian R.},
+  booktitle  = {Proceedings of the 40th International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {202},
+  pages      = {36093--36110},
+  publisher  = {PMLR},
+  year       = {2023},
+  url        = {https://proceedings.mlr.press/v202/wang23v.html}
+}
+
+@article{wang2025testtimeregression,
+  title      = {Test-Time Regression: A Unifying Framework for Designing Sequence Models with Associative Memory},
+  author     = {Wang, Ke Alexander and Shi, Jiaxin and Fox, Emily B.},
+  journal    = {Journal of Machine Learning Research},
+  volume     = {27},
+  number     = {169},
+  pages      = {1--41},
+  year       = {2026},
+  url        = {https://www.jmlr.org/papers/v27/25-0903.html}
+}
+
+@inproceedings{winston2020mondeq,
+  title      = {Monotone Operator Equilibrium Networks},
+  author     = {Winston, Ezra and Kolter, J. Zico},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {33},
+  pages      = {10718--10728},
+  year       = {2020},
+  url        = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/798d1c2813cbdf8bcdb388db0e32d496-Abstract.html}
+}
+
+@article{xi2026videodeltanet,
+  title      = {Video {DeltaNet}: A Video-Native Hybrid Attention for Livestream Video Generation},
+  author     = {Xi, Haocheng and Xie, Yiming and Zhao, Hexu and Zhang, Yiwen and Liu, Michael and Creavin, Thomas and Keutzer, Kurt and Li, Xiuyu and Lv, Zhaoyang and Xu, Chenfeng and Feng, Haiwen},
+  journal    = {arXiv preprint arXiv:2609.20744},
+  year       = {2026},
+  url        = {https://arxiv.org/abs/2609.20744}
+}
+
+@inproceedings{xiao2024ono,
+  title      = {Improved Operator Learning by Orthogonal Attention},
+  author     = {Xiao, Zipeng and Hao, Zhongkai and Lin, Bokai and Deng, Zhijie and Su, Hang},
+  booktitle  = {Proceedings of the 41st International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {235},
+  pages      = {54288--54299},
+  publisher  = {PMLR},
+  year       = {2024},
+  url        = {https://proceedings.mlr.press/v235/xiao24c.html}
+}
+
+@article{xiong2021nystrom,
+  title      = {Nystr{\"o}mformer: A Nystr{\"o}m-Based Algorithm for Approximating Self-Attention},
+  author     = {Xiong, Yunyang and Zeng, Zhanpeng and Chakraborty, Rudrasis and Tan, Mingxing and Fung, Glenn and Li, Yin and Singh, Vikas},
+  journal    = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume     = {35},
+  number     = {16},
+  pages      = {14138--14148},
+  year       = {2021},
+  doi        = {10.1609/aaai.v35i16.17664},
+  url        = {https://ojs.aaai.org/index.php/AAAI/article/view/17664}
+}
+
+@inproceedings{yang2025deltanet,
+  title      = {Parallelizing Linear Transformers with the Delta Rule over Sequence Length},
+  author     = {Yang, Songlin and Wang, Bailin and Zhang, Yu and Shen, Yikang and Kim, Yoon},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  volume     = {37},
+  pages      = {115491--115522},
+  year       = {2024},
+  doi        = {10.52202/079017-3668},
+  url        = {https://proceedings.neurips.cc/paper_files/paper/2024/hash/d13a3eae72366e61dfdc7eea82eeb685-Abstract-Conference.html}
+}
+
+@inproceedings{yang2025gdn,
+  title      = {Gated Delta Networks: Improving {Mamba2} with Delta Rule},
+  author     = {Yang, Songlin and Kautz, Jan and Hatamizadeh, Ali},
+  booktitle  = {International Conference on Learning Representations},
+  pages      = {29687--29707},
+  year       = {2025},
+  url        = {https://proceedings.iclr.cc/paper_files/paper/2025/hash/4904fad153f6434a7bcf04465d4be2cc-Abstract-Conference.html}
+}
+
+@inproceedings{yu2025comrope,
+  title      = {{ComRoPE}: Scalable and Robust Rotary Position Embedding Parameterized by Trainable Commuting Angle Matrices},
+  author     = {Yu, Hao and Jiang, Tangyu and Jia, Shuning and Yan, Shannan and Liu, Shunning and Qian, Haolong and Li, Guanghao and Dong, Shuting and Yuan, Chun},
+  booktitle  = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages      = {4508--4517},
+  year       = {2025},
+  url        = {https://openaccess.thecvf.com/content/CVPR2025/html/Yu_ComRoPE_Scalable_and_Robust_Rotary_Position_Embedding_Parameterized_by_Trainable_CVPR_2025_paper.html}
+}
+
+@inproceedings{yun2019cutmix,
+  title      = {{CutMix}: Regularization Strategy to Train Strong Classifiers With Localizable Features},
+  author     = {Yun, Sangdoo and Han, Dongyoon and Oh, Seong Joon and Chun, Sanghyuk and Choe, Junsuk and Yoo, Youngjoon},
+  booktitle  = {Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages      = {6023--6032},
+  year       = {2019},
+  url        = {https://openaccess.thecvf.com/content_ICCV_2019/html/Yun_CutMix_Regularization_Strategy_to_Train_Strong_Classifiers_With_Localizable_Features_ICCV_2019_paper.html}
+}
+
+@inproceedings{zhang2018mixup,
+  title      = {{mixup}: Beyond Empirical Risk Minimization},
+  author     = {Zhang, Hongyi and Cisse, Moustapha and Dauphin, Yann N. and Lopez-Paz, David},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2018},
+  url        = {https://openreview.net/forum?id=r1Ddp1-Rb}
+}
+
+@article{zhong2020erasing,
+  title      = {Random Erasing Data Augmentation},
+  author     = {Zhong, Zhun and Zheng, Liang and Kang, Guoliang and Li, Shaozi and Yang, Yi},
+  journal    = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume     = {34},
+  number     = {7},
+  pages      = {13001--13008},
+  year       = {2020},
+  doi        = {10.1609/aaai.v34i07.7000},
+  url        = {https://ojs.aaai.org/index.php/AAAI/article/view/7000}
+}
+
+@inproceedings{zhu2024vim,
+  title      = {Vision Mamba: Efficient Visual Representation Learning with Bidirectional State Space Model},
+  author     = {Zhu, Lianghui and Liao, Bencheng and Zhang, Qian and Wang, Xinlong and Liu, Wenyu and Wang, Xinggang},
+  booktitle  = {Proceedings of the 41st International Conference on Machine Learning},
+  series     = {Proceedings of Machine Learning Research},
+  volume     = {235},
+  pages      = {62429--62442},
+  publisher  = {PMLR},
+  year       = {2024},
+  url        = {https://proceedings.mlr.press/v235/zhu24f.html}
 }

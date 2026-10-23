@@ -228,10 +228,11 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
     from experiments.train_retrieval import train as train_retrieval
     from experiments import evaluate_embeddings as evaluation
     torch.set_num_threads(2)
-    common = {"max_steps": 2, "per_device_train_batch_size": 4, "per_device_eval_batch_size": 4,
+    common = {"max_steps": 2, "per_device_train_batch_size": 4, "per_device_eval_batch_size": 3,
               "learning_rate": 1e-4, "optim": "adamw_torch", "use_cpu": True,
               "bf16": False, "report_to": "none", "dataloader_num_workers": 0,
-              "save_steps": 1, "logging_steps": 1, "disable_tqdm": True, "seed": 17}
+              "save_steps": 1, "logging_steps": 1, "disable_tqdm": True, "seed": 17,
+              "dataloader_drop_last": True}
     recipe = {"model": {"vocab_size": len(tokenizer[0]), "hidden_size": 64,
               "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 128,
               "max_position_embeddings": 32, "memsolve_rank": 16,
@@ -251,6 +252,12 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
     mlm = tmp_path / "mlm"
     metrics = train_mlm(recipe, prepared, mlm)
     assert np.isfinite(metrics["eval_masked_nll"])
+    validation, _, _ = load_prepared(prepared, splits=("validation",))
+    target_count = sum(label != -100 for row in validation["validation"] for label in row["labels"])
+    assert metrics["eval_masked_tokens"] == target_count
+    run = read_json(mlm / "run.json")["experiment"]
+    assert run["dataloader_drop_last"] is True
+    assert run["eval_dataloader_drop_last"] is False
     exported = read_json(mlm / "final" / "config.json")
     assert exported["model_type"] == "memsolve_bert"
     assert exported["architectures"] == ["MemSolveBertForMaskedLM"]
@@ -258,6 +265,7 @@ def test_offline_mlm_retrieval_and_mteb(prepared, tokenizer, tmp_path, monkeypat
     assert selection["selection"] == "best_validation"
     assert selection["best_checkpoint"] is not None
     independent = evaluate_mlm(recipe, prepared, mlm / "final", tmp_path / "mlm-eval")
+    assert independent["eval_masked_tokens"] == target_count
     assert independent["eval_masked_nll"] == pytest.approx(metrics["eval_masked_nll"], abs=1e-6)
     continued = tmp_path / "continued"
     train_mlm(recipe, prepared, continued, init_checkpoint=mlm / "final")
@@ -325,9 +333,16 @@ def test_stock_bert_baseline_evaluation(prepared, tokenizer, tmp_path):
     tokenizer[0].save_pretrained(checkpoint)
     recipe = {"model": {"memsolve_implementation": "reference"}, "train_mask_probability": .3,
               "training": {"use_cpu": True, "bf16": False, "report_to": "none",
-                           "per_device_eval_batch_size": 4, "remove_unused_columns": False}}
+                           "per_device_eval_batch_size": 3, "remove_unused_columns": False,
+                           "dataloader_drop_last": True}}
     metrics = evaluate(recipe, prepared, checkpoint, tmp_path / "baseline-eval")
     assert np.isfinite(metrics["eval_masked_nll"])
+    validation, _, _ = load_prepared(prepared, splits=("validation",))
+    target_count = sum(label != -100 for row in validation["validation"] for label in row["labels"])
+    assert metrics["eval_masked_tokens"] == target_count
+    manifest = read_json(next((tmp_path / "baseline-eval").glob("*/evaluation.json")))
+    assert manifest["dataloader_drop_last"] is False
+    assert manifest["validation_rows"] == 8
     embedding = load_sentence_model(checkpoint, 16, "reference", "cpu")
     assert embedding[0].auto_model.config.model_type == "bert"
     assert not hasattr(embedding[0].auto_model.config, "memsolve_implementation")

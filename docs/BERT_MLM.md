@@ -457,7 +457,9 @@ exports `eval_masked_nll`, `eval_masked_accuracy`, `eval_masked_perplexity` and
 target counts without gathering full vocabulary logits. Use `eval_masked_nll`
 for comparisons: ordinary Trainer `eval_loss` averages per-batch means and can
 differ with variable target counts. Masked-token perplexity is not autoregressive
-language-model perplexity. Validation is never dropped at a batch boundary.
+language-model perplexity. Validation always uses `drop_last=False`, independently
+of the training setting. This also applies to standalone checkpoint evaluation;
+its manifest records the full validation row count and drop policy.
 Training may have a partial last batch at a dataset boundary; global batch 4096
 is the full-batch target, not a claim that every update has exactly 4096 examples.
 
@@ -494,6 +496,11 @@ same frozen target positions and saves token-weighted metrics under a directory
 keyed by checkpoint, data and evaluation settings. Local HF BERT MLM baselines
 are also supported if their tokenizer/vocabulary and position capacity match.
 Different tokenizers do not produce comparable token-level NLL on these labels.
+For a run started before validation/training drop policies were separated, leave
+its active process and source snapshot unchanged. After training, evaluate the
+retained `checkpoint-*` candidates and exported `final/` with this entrypoint,
+then select the lowest full-validation `eval_masked_nll`. Preserve the original
+training selection record alongside the new evaluation results.
 
 `--init-checkpoint` loads MLM weights into a new stage with a fresh optimizer and
 schedule. It differs from exact-run `--resume`; changing the stage also requires

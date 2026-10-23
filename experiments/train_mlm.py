@@ -15,6 +15,18 @@ from experiments.nlp import (MLMCollator, accumulation_steps, check_training_pre
     record_run, tokenizer_digest, versions, write_json, prepare_mlm_graph, position_capacity)
 
 
+class MLMTrainer(Trainer):
+    """Keep the validation tail when training uses fixed-size batches."""
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        training_drop_last = self.args.dataloader_drop_last
+        self.args.dataloader_drop_last = False
+        try:
+            return super().get_eval_dataloader(eval_dataset)
+        finally:
+            self.args.dataloader_drop_last = training_drop_last
+
+
 def check_data(config, manifests, tokenizer, checkpoint=None):
     first = next(iter(manifests.values()))[0]
     if tokenizer_digest(tokenizer) != first["tokenizer_hash"]:
@@ -115,6 +127,7 @@ def train(recipe, data_root, output, resume=None, init_checkpoint=None, streamin
     record_run(output, {"experiment": {"kind": "mlm", "recipe": recipe,
                "data": manifests, "world_size": args.world_size,
                "dataloader_drop_last": args.dataloader_drop_last,
+               "eval_dataloader_drop_last": False,
                "initialization": ({"path": str(Path(init_checkpoint).resolve()),
                                     "sha256": checkpoint_digest(init_checkpoint)} if init_checkpoint else "random"),
                "gradient_accumulation_steps": args.gradient_accumulation_steps},
@@ -127,7 +140,7 @@ def train(recipe, data_root, output, resume=None, init_checkpoint=None, streamin
         model.to(args.device)
         prepare_mlm_graph(model, sample, compile_model=execution == "compile-graph")
         print(f"Rank {args.process_index}: MLM execution ready: {model._memsolve_graph_info}", flush=True)
-    trainer = Trainer(model=model, args=args, train_dataset=data["train"],
+    trainer = MLMTrainer(model=model, args=args, train_dataset=data["train"],
                       eval_dataset=data["validation"], processing_class=tokenizer,
                       data_collator=MLMCollator(tokenizer, recipe["train_mask_probability"]),
                       compute_loss_func=masked_loss if execution == "eager" else None, compute_metrics=masked_metrics,
@@ -157,10 +170,12 @@ def evaluate(recipe, data_root, checkpoint, output):
         config.memsolve_implementation = implementation
     check_data(config, manifests, tokenizer, checkpoint)
     settings = dict(recipe["training"])
+    settings["dataloader_drop_last"] = False
     check_training_precision(settings, implementation)
     manifest = {"checkpoint_sha256": checkpoint_digest(checkpoint), "data": manifests,
                 "model_type": config.model_type, "precision": "bf16_amp" if settings.get("bf16") else "fp32",
                 "per_device_eval_batch_size": settings["per_device_eval_batch_size"],
+                "dataloader_drop_last": False, "validation_rows": len(data["validation"]),
                 "world_size": int(os.environ.get("WORLD_SIZE", "1")), "versions": versions()}
     destination = Path(output) / digest(manifest)[:20]
     args = TrainingArguments(output_dir=str(destination), **settings)

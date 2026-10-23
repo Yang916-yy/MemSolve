@@ -146,7 +146,6 @@ memory, then reads this memory back as a low-rank contextual correction
 to token content. Our main contributions are as follows.
 
 \paragraph{Global Equilibrium ($\S$\ref{sec:joint-memory}, $\S$\ref{sec:readout}).}
-We jointly design the memory's error-correction equation and token readout.
 An input-dependent soft frame provides shared write--read coordinates.
 A matching regularizer reduces the memory equation to a learned compact
 core shared across inputs. An accretive parameterization guarantees a
@@ -559,7 +558,7 @@ merges, and globally conditioned coefficients define different model classes.
 The mathematical construction uses a token-sized frame $P$.
 Our algorithm avoids storing this matrix. It reduces the input to two
 compact statistics, solves in memory space, and reads out token rows
-in parallel. Both operator modes follow the same computation.
+in parallel.
 
 \subsection{Reduce, solve, and read out}
 
@@ -690,7 +689,7 @@ We train from scratch on ImageNet-1K \cite{russakovsky2015imagenet} for
 Both models use AdamW \cite{loshchilov2019adamw} and cross-entropy, with global batch 2,048 and peak learning rate
 $2\times10^{-3}$. We evaluate EMA weights with decay $0.9999$ and report
 the checkpoint with the highest validation Top-1.
-Appendix~\ref{app:vision} gives the architecture and training recipe.
+Appendix~\ref{app:vision} gives the architecture, training recipe, and Tiny-scale results.
 
 \begin{table}[!ht]
 \centering
@@ -748,7 +747,6 @@ MemSolve-ViT-S reaches $81.0\%$ with $20$M parameters, the smallest
 parameter count among the Small models in Table~\ref{tab:imagenet}.
 It exceeds DeiT-S, Vim-S, and LION-d$^\natural$-S by $1.2$, $0.7$,
 and $1.1$ percentage points, respectively.
-The gains over these baselines therefore hold at both model scales.
 
 \paragraph{Earlier gains in validation accuracy.}
 MemSolve's advantage emerges well before the end of training.
@@ -835,6 +833,64 @@ Together with the ImageNet results, these findings demonstrate that
 compact equilibrium memory supports strong representations in both
 vision and language.
 
+\subsection{Ablation study}
+\label{sec:ablations}
+
+We train the Small backbone on ImageNet-100 for 100 epochs to examine
+the learned core, skew-symmetric coupling, and memory rank.
+All variants retain the same CPE and training protocol.
+Appendix~\ref{app:vision} gives the ablation recipe.
+
+\begin{table}[!ht]
+\centering
+\small
+\captionsetup{width=.94\linewidth}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular*}{.94\linewidth}{@{\extracolsep{\fill}}lrr@{}}
+\toprule
+Configuration & Top-1 ($\%$) $\uparrow$ & CE $\downarrow$\\
+\midrule
+\rowcolor{ResultYellow}
+Equilibrium, $r=32$ & \textbf{84.48} & 0.735\\
+Complement, $r=32$ & 83.86 & 0.775\\
+Equilibrium, $r=32$, $\Omega=0$ & 84.34 & 0.747\\
+Equilibrium, $r=16$ & 84.28 & \textbf{0.728}\\
+\bottomrule
+\end{tabular*}
+\caption{\textbf{ImageNet-100 ablations.}
+Each checkpoint is selected by its highest validation Top-1;
+CE is measured at the same checkpoint.}
+\label{tab:ablations}
+\end{table}
+
+\paragraph{Learned core.}
+Equilibrium learns an additional core response on top of Complement.
+It improves accuracy by $0.62$ percentage points, reduces relative error
+by $3.8\%$, and lowers validation CE (Table~\ref{tab:ablations}).
+This benefit persists late in training.
+For a descriptive comparison of early and late training, we average
+validation error over epochs 11--30 and 81--100, respectively.
+We compute relative error reduction against each ablated variant's
+mean error in the same window.
+Against Complement, Equilibrium reduces error by $3.4\%$ early and
+$4.4\%$ late. The smaller late-stage accuracy gap therefore does not
+imply a smaller relative benefit.
+
+\paragraph{Skew-symmetric coupling.}
+Removing $\Omega$ lowers the best accuracy by $0.14$ percentage points
+and raises validation CE to $0.747$.
+The full core provides a modest gain, which is more pronounced early
+in training. Its relative error reductions in the two windows are
+$1.5\%$ and $0.9\%$, respectively.
+
+\paragraph{Memory rank.}
+Halving the rank from 32 to 16 lowers accuracy by only $0.20$
+percentage points and gives a lower validation CE at the selected
+checkpoint. A smaller memory state thus retains most of the
+classification performance.
+Increasing the rank to 32 further improves accuracy, reducing error
+relative to $r=16$ by $1.2\%$ early and $1.5\%$ late.
+
 \subsection{Computational efficiency}
 \label{sec:efficiency}
 We compare MemSolve with FlashAttention \cite{dao2024flashattention2}
@@ -851,11 +907,11 @@ FlashAttention at 512 tokens. The speedup reaches $2.3\times$ at
 At the latter length, it also outperforms the fused
 BiMamba implementation by $9.0\times$.
 The benefit extends to the 196-token visual shapes:
-MemSolve is $1.1$--$1.7\times$ faster than FlashAttention and
-$8.4$--$12.8\times$ faster than BiMamba across Tiny, Small, and Base.
+MemSolve is $1.1$--$1.4\times$ faster than FlashAttention and
+$8.4$--$12.5\times$ faster than BiMamba at Small and Base scales.
 FlashAttention leads at 128 and 196 tokens in the small-batch sweep.
 It also has a faster forward-only pass for the Small and Base visual
-shapes; Appendix~\ref{app:efficiency} reports these measurements.
+shapes; Appendix~\ref{app:efficiency} reports these measurements and the Tiny comparison.
 
 \paragraph{Memory.}
 MemSolve has the lowest peak allocated memory in every measured setting.
@@ -878,7 +934,6 @@ and lower memory use.
 Setting &ms &MiB &ms &MiB &ms &MiB\\
 \midrule
 \multicolumn{7}{l}{\emph{Visual shapes: 196 tokens}}\\
-Tiny &\textbf{0.620} &\textbf{169.2} &1.066 &193.9 &7.921 &359.6\\
 Small &\textbf{1.248} &\textbf{308.1} &1.783 &321.1 &15.565 &664.7\\
 Base &\textbf{1.900} &\textbf{329.2} &2.087 &332.1 &16.052 &680.3\\
 \midrule
@@ -895,30 +950,40 @@ Base &\textbf{1.900} &\textbf{329.2} &2.087 &332.1 &16.052 &680.3\\
 
 \section{Discussion and Limitations}
 
-MemSolve concentrates contextual changes in a learned relation span.
-Rank controls the number of modified directions and the cost of the compact
-systems. Outside that span, the operator retains a scalar content response.
-Sharing write and read coordinates supports the contraction guarantee,
-but it also ties where information is stored to where it is retrieved.
-These choices define the operator's capacity and computational tradeoff.
+MemSolve separates memory capacity from sequence length through a
+configurable rank. The ImageNet-100 ablation shows that halving the rank
+from 32 to 16 retains most of the classification accuracy.
+How the required rank changes with context length and task complexity
+remains open.
 
-The experiments show that this construction learns useful representations
-in vision and language. The language experiments train and fine-tune at
-128 tokens with learned absolute positions; task accuracy beyond that
-length remains to be measured.
+Our task evaluations focus on image classification and short-context
+language understanding. The language models reported here are pretrained
+and fine-tuned at 128 tokens. Evaluating task performance on longer inputs
+is a natural next step. RoVE and exact sequence parallelism provide
+mechanisms for studying this setting within the same operator.
 
 \section{Conclusion}
 
-MemSolve turns joint error correction into a compact equilibrium solve.
-Its frame and matched regularizer yield a shared core, while each input
-determines the memory and its token readout. The readout combines a
-content branch with a low-rank contextual correction and is contractive
-for each fixed frame. Global frame normalization allows a suffix token
-to change how prefix content reaches a fixed position. This interaction
-separates MemSolve from single bidirectional scans with local coefficients
-and linear merging. Two compact statistics support linear sequence cost
-and exact sequence parallelism at fixed rank. Results in vision and
-language demonstrate the effectiveness of this shared operator.
+MemSolve makes joint error correction over the full context compatible
+with compact memory and parallel computation. It constructs memory
+through a direct equilibrium solve. All token associations are evaluated
+against the same state. The matched write--read design guarantees a
+unique equilibrium and a contractive readout for each fixed frame.
+Compact statistics yield linear sequence complexity at fixed rank and
+support exact sequence parallelism. The same operator delivers strong
+results in simple vision and language backbones. At 8,192 tokens, its
+complete mixer is $7.5\times$ faster than FlashAttention and $7.9\times$
+faster than BiMamba in single-GPU forward--backward execution.
+
+These results establish global equilibrium as a practical design
+principle for bidirectional memory. MemSolve connects the associative
+learning of error-correcting memories with the computational advantages
+of parallel sequence processing. This combination positions it as a
+strong candidate for larger bidirectional backbones, especially for
+long-document and multimodal learning. More broadly, the work opens a
+design space for developing memory formation and token readout together.
+The goal is to combine full-context interactions, controlled response,
+and efficient computation.
 
 \FloatBarrier
 \begingroup
@@ -1123,7 +1188,7 @@ At $\Theta=0$, $L=\I_r$, $J=\I_r$, and $F=0$.
 This initialization preserves the core's training signal:
 $\delta F=-\tfrac12\delta J$ at $J=\I_r$.
 The additional response $PFP^\T C$ starts at zero, while the Complement
-map already mixes context. The core remains trainable at this initialization.
+map already mixes context.
 
 The per-head scalar is parameterized by $\eta=\tanh(\eta_{\rm raw})$ and
 initialized to $0.9$. Floating-point execution uses
@@ -1416,8 +1481,8 @@ and downstream experiments reported here.
 \label{app:vision}
 
 Table~\ref{tab:architecture} summarizes the architecture and ImageNet-1K
-training recipe for all three model sizes. The completed Small and Base
-runs provide the results in Table~\ref{tab:imagenet}.
+training recipe for all three model sizes. Small and Base results appear
+in Table~\ref{tab:imagenet}; Tiny results appear in Table~\ref{tab:imagenet-tiny}.
 
 \begin{table}[!ht]
 \centering
@@ -1461,8 +1526,7 @@ Test crop ratio & \multicolumn{3}{c}{0.875}\\
 \end{tabular*}
 \caption{\textbf{MemSolve-ViT configurations and ImageNet-1K training recipe.}
 All models use 12 blocks and $16\times16$ patches.
-Shared settings span all three columns. Stochastic depth increases
-linearly to the listed maximum.}
+Stochastic depth increases linearly to the listed maximum.}
 \label{tab:architecture}
 \end{table}
 
@@ -1471,6 +1535,17 @@ RandAugment \cite{cubuk2020randaugment} uses \texttt{rand-m9-mstd0.5-inc1}, with
 Warmup replaces the first 20 epochs of the 300-epoch cosine schedule.
 EMA uses its fixed decay from the first optimizer step.
 ImageNet training uses seed 0.
+
+\paragraph{ImageNet-100 ablation recipe.}
+The ablations in Section~\ref{sec:ablations} use a fixed 100-class subset
+with 126,689 training images and 5,000 validation images.
+They retain the Small architecture and augmentation settings in
+Table~\ref{tab:architecture}, but use 100 epochs, batch size 512,
+peak learning rate $5\times10^{-4}$, and five warmup epochs.
+Repeated augmentation and EMA are disabled.
+All runs use seed 0 and a shared initialization; the rank variants use
+nested relation projections.
+Setting $\Omega=0$ retains the learned symmetric part of the core.
 
 \paragraph{Baseline reporting.}
 Table~\ref{tab:imagenet} contains non-hierarchical models only.
@@ -1481,7 +1556,6 @@ ViT-B and Hydra-ViT-B use the EMA entries in Hydra's Table~5
 \cite{hwang2024hydra}. Vim's $\dagger$ entries include 30 additional
 epochs of long-sequence fine-tuning at $224\times224$, with patch size 16
 and extraction stride 8 \cite{zhu2024vim}.
-LION's $\natural$ entries use multiple scans \cite{afzal2025lion}.
 Parameter counts are rounded to whole millions and Top-1 to one decimal
 place. Training protocols differ across papers.
 
@@ -1494,6 +1568,38 @@ Zero-based DeiT epochs are shifted by one to denote completed epochs.
 MemSolve-S uses the ordinary-weight validation recorded during the
 same run as its EMA result in Table~\ref{tab:imagenet}.
 Every recorded epoch is plotted without smoothing; missing epochs remain gaps.
+
+\paragraph{Tiny-scale classification.}
+MemSolve-ViT-T reaches $74.7\%$ Top-1 with $5$M parameters
+(Table~\ref{tab:imagenet-tiny}). It exceeds DeiT-T by $2.5$ percentage
+points, but trails Vim-T, ViG-T, and ViT$^3$-T.
+It uses the same 300-epoch recipe as Small and Base, with the Tiny
+configuration in Table~\ref{tab:architecture}.
+
+\begin{table}[!ht]
+\centering
+\small
+\captionsetup{width=.74\linewidth}
+\renewcommand{\arraystretch}{1.08}
+\setlength{\tabcolsep}{10pt}
+\begin{tabular}{lcrr}
+\toprule
+Method & Type & \#Params & Top-1\\
+\midrule
+DeiT-T \cite{touvron2021deit} & Transformer & 5M & 72.2\\
+Vim-T \cite{zhu2024vim} & SSM & 7M & 76.1\\
+Vim-T$^\dagger$ \cite{zhu2024vim} & SSM & 7M & 78.3\\
+ViG-T \cite{liao2025vig} & Linear & 6M & 77.2\\
+ViT$^3$-T \cite{han2026vit3} & TTT & 6M & 76.5\\
+\rowcolor{ResultYellow}
+\textbf{MemSolve-ViT-T} & Equilibrium & 5M & 74.7\\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Tiny non-hierarchical models on ImageNet-1K.}
+Top-1 is in percent at $224\times224$.
+$\dagger$: additional long-sequence fine-tuning.}
+\label{tab:imagenet-tiny}
+\end{table}
 
 \FloatBarrier
 \subsection{Language pretraining}
@@ -1671,8 +1777,28 @@ We reset PyTorch's peak allocated memory after the initial warmup and
 measure through graph capture and replay.
 This includes parameters, gradients, and intermediates;
 allocator reserves and the CUDA context are excluded.
-Tables~\ref{tab:mixer-efficiency} and~\ref{tab:mixer-forward} report
-forward--backward and forward-only measurements, respectively.
+Tables~\ref{tab:mixer-efficiency} and~\ref{tab:mixer-tiny} report
+forward--backward measurements; Table~\ref{tab:mixer-forward} reports
+forward-only measurements.
+
+\begin{table}[!ht]
+\centering
+\small
+\captionsetup{width=.74\linewidth}
+\begin{tabular*}{.74\textwidth}{@{\extracolsep{\fill}}lrr@{}}
+\toprule
+Mixer & Latency (ms) & Peak memory (MiB)\\
+\midrule
+MemSolve & \textbf{0.620} & \textbf{169.2}\\
+FlashAttention & 1.066 & 193.9\\
+BiMamba & 7.921 & 359.6\\
+\bottomrule
+\end{tabular*}
+\caption{\textbf{Tiny-shape mixer forward--backward efficiency.}
+Batch 128, 196 tokens, and width 192; the measurement protocol matches
+Table~\ref{tab:mixer-efficiency}.}
+\label{tab:mixer-tiny}
+\end{table}
 
 \paragraph{Implementation provenance.}
 BiMamba comes from Vim commit \texttt{dd0358a}, with the upstream fused

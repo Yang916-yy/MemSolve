@@ -1,0 +1,65 @@
+{
+  "run": "memsolve-flash-bimamba-20261021",
+  "upstream": {
+    "vim": {
+      "repository": "hustvl/Vim",
+      "commit": "dd0358ad1e42701f22afbefa0717cc8825cf9f45",
+      "files": [
+        "mamba-1p1p1/mamba_ssm/modules/mamba_simple.py",
+        "mamba-1p1p1/mamba_ssm/ops/selective_scan_interface.py",
+        "LICENSE.txt",
+        "mamba-1p1p1/LICENSE"
+      ]
+    },
+    "selective_scan": {
+      "sha": "e9594ce1c732d97440f0332fdc43170a2294dbfa",
+      "files": [
+        "csrc/selective_scan/reverse_scan.cuh",
+        "csrc/selective_scan/selective_scan.cpp",
+        "csrc/selective_scan/selective_scan.h",
+        "csrc/selective_scan/selective_scan_bwd_bf16_complex.cu",
+        "csrc/selective_scan/selective_scan_bwd_bf16_real.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp16_complex.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp16_real.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp32_complex.cu",
+        "csrc/selective_scan/selective_scan_bwd_fp32_real.cu",
+        "csrc/selective_scan/selective_scan_bwd_kernel.cuh",
+        "csrc/selective_scan/selective_scan_common.h",
+        "csrc/selective_scan/selective_scan_fwd_bf16.cu",
+        "csrc/selective_scan/selective_scan_fwd_fp16.cu",
+        "csrc/selective_scan/selective_scan_fwd_fp32.cu",
+        "csrc/selective_scan/selective_scan_fwd_kernel.cuh",
+        "csrc/selective_scan/static_switch.h",
+        "csrc/selective_scan/uninitialized_copy.cuh"
+      ]
+    },
+    "causal_conv1d": {
+      "repository": "Dao-AILab/causal-conv1d",
+      "commit": "cd81f0413cad2fc1e6f17e785ac39f59aae690cd"
+    },
+    "model": "Official Vim Mamba bimamba_type=v2, expand=2, d_state=16, d_conv=4, shared input/output projections, averaged directions, fused inner functions",
+    "compatibility": "Redirect old causal_conv1d raw allocation API to current upstream cpp_functions wrappers; unchanged Vim math and fused autograd."
+  },
+  "validation": [
+    {
+      "operator": "bimamba",
+      "dtype": "torch.float32",
+      "output_rel_l2": 8.561298159293074e-08,
+      "max_gradient_rel_l2": 6.386107997968793e-07
+    },
+    {
+      "operator": "bimamba",
+      "dtype": "torch.bfloat16",
+      "output_rel_l2": 0.0033286658581346273,
+      "max_gradient_rel_l2": 0.011068512685596943
+    },
+    {
+      "operator": "flashattention",
+      "dtype": "bfloat16",
+      "output_rel_l2": 0.0,
+      "max_gradient_rel_l2": 1.5300769518944435e-05
+    }
+  ],
+  "aggregation": "Arithmetic mean of the two trial median_gpu_ms values (CUDA event time) (each trial: 7 repeats); same mean for peak_allocated_mib.",
+  "selection": "Three paper operators; Tiny uses the six-head rerun, replacing the original three-head shape. Both forward-only and forward-backward rows are included."
+}

@@ -88,7 +88,9 @@ specify `--config` when resuming an alternative configuration.
 Outputs include `metadata.json`, `metrics.jsonl`, `checkpoint_last.pt`,
 `checkpoint_best.pt`, and `checkpoint_best_ema.pt`. Checkpoints store both
 ordinary and EMA weights and identify the selected set. `--eval --resume PATH`
-evaluates a checkpoint without training. Run artifacts stay outside Git.
+evaluates a checkpoint without training. Published epoch logs and resolved
+configurations are in [results/imagenet](../results/imagenet/). Keep checkpoints
+and working outputs outside Git.
 
 ## ImageNet-100 ablations
 
@@ -96,6 +98,7 @@ The paper compares Equilibrium, Complement, no skew coupling, and rank 16
 using Small for 100 epochs. The fixed subset has 126,689 training and 5,000
 validation images. The recipe uses effective batch 512, LR 5e-4, five warmup
 epochs, the same augmentation policy, and no RA or EMA. The paper records the
-selection rule and results. Use the same class list and initialization across comparisons. The subset
-manifest and run-specific preparation are stored with the experiment artifacts. Trial queues,
-source snapshots, and logs are stored with the runs, not in this repository.
+selection rule and results. Use the same class list and initialization across
+comparisons. The [published ablation records](../results/imagenet100/) include
+all epoch logs, configurations, and the subset class mapping. Trial queues and
+source snapshots stay with local run artifacts.

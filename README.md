@@ -158,11 +158,13 @@ GenomicBenchmarks and LRA loaders and matched-encoder runner.
 | `experiments/` | Reusable training/data entrypoints and configurations |
 | `benchmarks/`, `tests/` | Mixer benchmarks and correctness tests |
 | `docs/` | Current implementation and experiment guides |
+| [`results/`](results/README.md) | Published training curves, evaluation metrics, configurations, and provenance |
 | `paper/` | LaTeX, bibliography, required PDF figures, and compiled paper |
 
-Datasets, checkpoints, logs, local launch queues, plotting scripts, and revision
-records belong outside the checkout. Earlier architectures and retired experiments
-remain in Git history. Model checkpoint contract: **26**; native ABI: **17**.
+Published experimental logs are tracked in `results/`. Datasets, checkpoints,
+working logs, local launch queues, plotting scripts, and personal revision notes
+belong outside the checkout. Earlier architectures and retired experiments remain
+in Git history. Model checkpoint contract: **26**; native ABI: **17**.
 
 Build the paper with `latexmk -pdf -cd paper/main.tex`. On Debian/Ubuntu,
 install `texlive-science`, `texlive-latex-extra`, and `texlive-fonts-recommended`.

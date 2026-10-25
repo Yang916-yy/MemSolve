@@ -19,7 +19,9 @@ MLM prediction head follow BERT. Import `integrations.transformers` to register
 | Parameters, absolute positions with tied MLM head | 111,517,154 |
 
 The paper's MLM/GLUE results use **learned absolute positions**, with 512
-position embeddings. The supplied `memsolve_bert_mlm.json` selects **RoVE**.
+position embeddings. Its [MLM history](../results/mlm/) and
+[GLUE histories and per-seed results](../results/glue/) are published with the
+recorded configurations. The supplied `memsolve_bert_mlm.json` selects **RoVE**.
 To reproduce the paper's architecture, copy this JSON outside the checkout and
 set `model.position_embedding_type` to `"absolute"`. Keep config and weights
 together; position mechanisms cannot be swapped when loading a checkpoint.

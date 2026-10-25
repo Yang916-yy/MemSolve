@@ -1,97 +1,63 @@
-# AI-Assisted Contribution Contract
+# Guide for AI-assisted reproduction and contributions
 
-This file defines the repository contract for contributors who use coding
-agents, large language models, or other AI-assisted development tools. It
-governs proposed changes and review evidence; it does not affect installation,
-runtime behavior, or ordinary use of MemSolve.
+Use this guide when working with MemSolve through a coding assistant. Start with
+[README.md](README.md), then read the experiment or integration guide relevant to
+your task. The paper describes the method; the published logs in
+[results/](results/README.md) connect reported results to recorded runs.
 
-The human contributor remains responsible for the scope, correctness,
-provenance, testing, and reviewability of every submitted change. AI-generated
-code, documentation, experiments, and citations must satisfy the same standards
-as human-authored work. Material use of external research or upstream code must
-be identified in the change summary with the source and the decision it
-informed.
+## Reproducing experiments
 
-## Design Principles
+- Start from a published recipe in `experiments/configs/`. Check its data,
+  model, precision, effective batch size, and evaluation settings before running.
+- Record configuration overrides and software versions. Changing a recipe is a
+  new experiment; give it a separate output directory.
+- Match weights to their model configuration. Distinguish ordinary and EMA
+  weights, checkpoint selection, and validation metrics when comparing results.
+- Collect tests and run a small smoke check before launching a long experiment.
+  Keep downloads, checkpoints, and working outputs outside the checkout.
+- Publish useful structured logs with their configurations and provenance.
+  Preserve the complete recorded curve, including unsuccessful epochs, and
+  distinguish measurements from derived summaries. Remove credentials and
+  machine-specific paths before sharing artifacts.
 
-- This repository has one current operator contract. Do not preserve legacy APIs,
-  checkpoints, imports, variants, or behavior unless the change request
-  explicitly requires it.
-- Prefer the simplest implementation that is mathematically equivalent to the
-  contract and measurably better for the intended workload.
-- Validate external inputs at their boundary; reuse those guarantees internally.
-  Comments should explain the operation or a non-obvious reason, not repeat
-  checks or recount past fixes. Keep numerical and upstream references where useful.
-- "Stable" means finite, correct, and trainable throughout the normal training
-  envelope: supported dtype, rank, sequence length, optimizer settings, and
-  realistically reachable parameter scales.
-- Do not add persistent FP64 paths, clipping, fallback branches, thresholds, or
-  extra configuration solely for astronomically pathological inputs that normal
-  training cannot reach. State the residual boundary honestly instead.
+## Finding the right code
 
-## Core Ownership
+| Area | Starting point |
+| --- | --- |
+| Operator mathematics | `memsolve/ball/reference.py` |
+| Parameters and module behavior | `memsolve/ball/model.py` |
+| Public configuration | `memsolve/ball/config.py` |
+| CUDA implementation and numerical checks | `docs/CUDA_CONTRACT.md` |
+| Training and evaluation | `experiments/` and its linked guides |
+| Verification | `tests/README.md` |
 
-- `memsolve/ball/reference.py` is the only owner of operator mathematics and the
-  canonical numerical contract.
-- `memsolve/ball/model.py` is the only owner of parameters and `nn.Module` behavior.
-- `memsolve/ball/config.py` is the only owner of public variants and validation.
-- Do not add compatibility aliases, legacy imports, duplicate model classes, or
-  a second reference implementation.
-- Do not add files under `memsolve/ball/` without maintainer approval.
+Keep operator mathematics in the core. Framework adapters should translate
+interfaces, and experiment runners should assemble models, data, and training.
+Reuse existing utilities rather than adding parallel implementations.
 
-## Equivalent Implementations
+## Making a contribution
 
-- A replacement implementation must state the algebraic equivalence to the
-  reference contract before it is adopted.
-- Choose the lowest-overhead implementation that is correct in the normal
-  training envelope. Engineering form may differ from paper notation.
-- Validate every replacement with forward and gradient comparisons against
-  `reference.py`, plus a benchmark for the intended workload.
-- Numerical guards must be fixed implementation details, never hidden model
-  variants. Add one only when normal-range evidence justifies its cost.
+Keep patches focused and explain the problem they solve. Prefer clear code and
+comments that explain a non-obvious operation or design choice. Avoid repeating
+what the code already says or preserving a history of edits in comments.
 
-## Investigation Before Invention
+For a mathematical change, explain the equation being changed. For an equivalent
+optimization, compare outputs and gradients with the reference implementation.
+Measure performance on the intended shapes and hardware, including memory use;
+report the precision and execution mode alongside timings. Consult established
+upstream implementations when useful, and retain their attribution and licenses.
 
-- First reproduce and localize a failure. For non-local questions involving
-  numerical linear algebra, optimization, CUDA, PyTorch behavior, or known
-  architectures, search prior work before inventing a new mechanism.
-- Prefer primary papers, official framework documentation, upstream source,
-  issue trackers, and established implementations.
-- Record the relevant source and the decision it changed in the change summary
-  when external research materially affects the design.
-- Do not use web search as a substitute for a local reproducer or tests.
-- Simple local bugs do not require a research detour.
+Use the tests covering the affected code; see `tests/README.md` for commands and
+optional dependencies. For package or layout changes, run:
 
-## CUDA Boundary
+```bash
+python -m pytest tests/core/test_model.py -k repository_contract
+```
 
-- CUDA supports the restored no-RankRotary accretive-equilibrium operator
-  (`equilibrium` and `complement`) at ranks 16, 32, 48 and 64; see `docs/CUDA_CONTRACT.md`.
-- Unsupported variants, layouts, dtypes, or devices must fail explicitly.
-- CUDA must not silently fall back or load a native library from an old contract.
-- Every CUDA forward result and gradient must be checked against `reference.py`.
+A contribution summary should say what changed, which checks ran, and what
+remains unverified. Skipped tests are not passing tests. Check AI-generated code,
+measurements, and references against their sources before submitting them.
 
-## Peripheral Code
-
-- Integrations adapt framework interfaces only; they must not contain model math.
-- Experiment entrypoints stay thin and share training utilities.
-- Benchmarks measure implementations; they never define model defaults.
-- Temporary scripts and generated artifacts belong outside the repository.
-
-## Change Discipline
-
-- One change scope per commit: core, CUDA, integration, experiment, or docs.
-- Reuse an existing file before proposing a new one.
-- `tests/` contains only deterministic, user-facing contract tests. Keep local
-  probes, performance exploration, downloaded fixtures, and generated outputs
-  out of Git.
-- Run the narrow test domain for the boundary changed: `tests/core`,
-  `tests/cuda`, `tests/integrations`, or `tests/experiments`.
-  Use `-m "not cuda"` when a CPU-only check is sufficient.
-- Core math changes require the relevant `tests/core` checks and CUDA oracle
-  checks when the CUDA path is affected. CUDA changes require `tests/cuda`
-  and the corresponding reference comparison. Integration and experiment
-  changes require their own domain.
-- Run `python -m pytest tests/core/test_model.py -k repository_contract`
-  after package or repository-layout changes. Run `pytest -q` only before a
-  release, a broad refactor, or a change crossing multiple domains.
-- Report residual limitations plainly instead of adding speculative machinery.
+Keep reusable code, current documentation, and published experimental evidence
+in Git. Keep temporary probes, launch queues, plotting scripts, and personal
+working notes outside it.

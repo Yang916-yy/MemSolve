@@ -1,0 +1,40 @@
+{
+  "checkpoint": "${RUNS}/imagenet300/memsolve_vit_s_r32_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261018/train/checkpoint_best_ema.pt",
+  "selected_weights": "model_ema",
+  "parameters": 55431748,
+  "backbone_adapter_parameters": 25320728,
+  "train_count": 20210,
+  "val_count": 2000,
+  "sample_labels": [
+    0,
+    3,
+    4,
+    5,
+    42,
+    43,
+    87,
+    96,
+    125,
+    149,
+    255
+  ],
+  "data_root": "${TMP}/memsolve-ade20k/ADEChallengeData2016",
+  "global_batch": 16,
+  "compile_blocks": true,
+  "precision": "bf16 autocast, fp32 parameters",
+  "source": "https://arxiv.org/html/2405.18425v2#A3",
+  "checkpoint_sha256": "357a46fbe66a8185a265bb6d4101c4cd622bc7b09141d28c16a4856df3dd8947",
+  "data_verification": {
+    "phase": "completed",
+    "pairs_checked": 22210,
+    "checks": [
+      "full image/mask decoding",
+      "matching dimensions",
+      "single-channel integer mask IDs in 0..150"
+    ],
+    "errors": [],
+    "seconds": 14.743427276611328
+  },
+  "deterministic_algorithms": false,
+  "seed": 0
+}

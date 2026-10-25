@@ -1,0 +1,9 @@
+{
+  "accuracy": 0.7733,
+  "best_validation_accuracy": 0.7734,
+  "examples": 20000.0,
+  "loss": 0.59342919921875,
+  "macro_f1": 0.7732961891089389,
+  "selected_epoch": 51,
+  "target": "test"
+}

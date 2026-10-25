@@ -1,0 +1,259 @@
+{
+  "config_digest": "65b411941cb2a2b1815a4e2f24e951415dc77203723056d15ee35215f97d757c",
+  "data_contract": {
+    "input_kind": "tokens",
+    "max_length": 2048,
+    "paired": false,
+    "value_masking": null,
+    "vocab_size": 18
+  },
+  "dataset": {
+    "source": {
+      "content_sha256": "9cec3019c8680d28188532dde32788b14487b43f2ce3ae5c590fad26c5d61531",
+      "pinned_manifest": {
+        "inputs": [
+          {
+            "file": "data/aan/new_aan_pairs.eval.tsv",
+            "path": "${WORKSPACE}/lra-data/raw/OpenNLPLab--lra/data/aan/new_aan_pairs.eval.tsv",
+            "repository": "OpenNLPLab/lra",
+            "revision": "6cb133c44f406da743661488df9e977b87d98775",
+            "sha256": "53f7008370276e26b7f1c2f74b187de76f1c6edd089d978ace7b946918fd259c",
+            "size": 1046290902
+          },
+          {
+            "file": "data/aan/new_aan_pairs.test.tsv",
+            "path": "${WORKSPACE}/lra-data/raw/OpenNLPLab--lra/data/aan/new_aan_pairs.test.tsv",
+            "repository": "OpenNLPLab/lra",
+            "revision": "6cb133c44f406da743661488df9e977b87d98775",
+            "sha256": "fef3c879f83d3e5173331dacbdd9a812a6d2af245396a1365dcb3e4b249831c9",
+            "size": 1035013913
+          },
+          {
+            "file": "data/aan/new_aan_pairs.train.tsv",
+            "path": "${WORKSPACE}/lra-data/raw/OpenNLPLab--lra/data/aan/new_aan_pairs.train.tsv",
+            "repository": "OpenNLPLab/lra",
+            "revision": "6cb133c44f406da743661488df9e977b87d98775",
+            "sha256": "0858d52d62320fa1aa07c2defb3124b86a5a6e1e5292a847f130356ea39d81d9",
+            "size": 8534323181
+          },
+          {
+            "file": "plain_text/test-00000-of-00001.parquet",
+            "path": "${WORKSPACE}/lra-data/raw/stanfordnlp--imdb/plain_text/test-00000-of-00001.parquet",
+            "repository": "stanfordnlp/imdb",
+            "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+            "sha256": "b52e26e2f872d282ffac460bf9770b25ac6f102cda0e6ca7158df98c94e8b3da",
+            "size": 20470363
+          },
+          {
+            "file": "plain_text/train-00000-of-00001.parquet",
+            "path": "${WORKSPACE}/lra-data/raw/stanfordnlp--imdb/plain_text/train-00000-of-00001.parquet",
+            "repository": "stanfordnlp/imdb",
+            "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+            "sha256": "db47d16b5c297cc0dd625e519c81319c24c9149e70e8496de5475f6fa928342c",
+            "size": 20979968
+          },
+          {
+            "file": "data/test-00000-of-00001.parquet",
+            "path": "${WORKSPACE}/lra-data/raw/fengyang0317--listops-1000/data/test-00000-of-00001.parquet",
+            "repository": "fengyang0317/listops-1000",
+            "revision": "7e315de6abf1ec966d04b68a29e83a3ae23ca646",
+            "sha256": "29b5dd305b221376849a135a92e6eee13465c8a66ae7a71b53a6e300fafb78f9",
+            "size": 4868714
+          },
+          {
+            "file": "data/train-00000-of-00002.parquet",
+            "path": "${WORKSPACE}/lra-data/raw/fengyang0317--listops-1000/data/train-00000-of-00002.parquet",
+            "repository": "fengyang0317/listops-1000",
+            "revision": "7e315de6abf1ec966d04b68a29e83a3ae23ca646",
+            "sha256": "cb8b0d0f1a83d756fd5ed7dbfd838b29c56c53350fd506b6a597a4370031f4f6",
+            "size": 116656799
+          },
+          {
+            "file": "data/train-00001-of-00002.parquet",
+            "path": "${WORKSPACE}/lra-data/raw/fengyang0317--listops-1000/data/train-00001-of-00002.parquet",
+            "repository": "fengyang0317/listops-1000",
+            "revision": "7e315de6abf1ec966d04b68a29e83a3ae23ca646",
+            "sha256": "aa9e5ee432811bf6584698cfe7f15fc7cae1053766ad11007a13e67ffa1a9e10",
+            "size": 117222048
+          },
+          {
+            "file": "data/validation-00000-of-00001.parquet",
+            "path": "${WORKSPACE}/lra-data/raw/fengyang0317--listops-1000/data/validation-00000-of-00001.parquet",
+            "repository": "fengyang0317/listops-1000",
+            "revision": "7e315de6abf1ec966d04b68a29e83a3ae23ca646",
+            "sha256": "b49c2fe7d0c1ee346b859b0ddf0a05eb82a843ee95bb5fe1fd7d90a2634cef10",
+            "size": 4861859
+          }
+        ]
+      },
+      "splits": {
+        "test": {
+          "content_sha256": "b1661eefbffb7f5d87006d9e1fc8f283ec26f011f51a88ff6613d26e3057684e",
+          "mtime_ns": 1792982821870698032,
+          "path": "${WORKSPACE}/lra-data/listops-1000/basic_test.tsv",
+          "size": 13242123
+        },
+        "train": {
+          "content_sha256": "4ef75efeb751772aaeb02e69be0b57e5e6c76766e678e005c440d4b0eb294e1d",
+          "mtime_ns": 1792982820824481002,
+          "path": "${WORKSPACE}/lra-data/listops-1000/basic_train.tsv",
+          "size": 635446911
+        },
+        "val": {
+          "content_sha256": "ddc627e9e2990002397bb3d63f1404d101609ca48616f0fc72cd1f472b55b321",
+          "mtime_ns": 1792982821550021620,
+          "path": "${WORKSPACE}/lra-data/listops-1000/basic_val.tsv",
+          "size": 13222083
+        }
+      }
+    },
+    "source_definition": "google-research/long-range-arena@cd31e5c6",
+    "split_protocol": "official-files-v1",
+    "suite": "lra",
+    "task": "listops",
+    "tokenization": "official-listops-token-stream-with-eos",
+    "vocabulary_fingerprint": "8b12b32f20af6e421349d4346f47533c3ba30015ec4c9df1e161ab71b8f03137"
+  },
+  "model": {
+    "attention_adapter": {
+      "bigbird": {
+        "block_size": 64,
+        "global_blocks": 2,
+        "pattern": "hf-training-plan-fixed-in-eval",
+        "random_blocks": 3,
+        "seed": "seed+layer",
+        "window_blocks": 3
+      },
+      "feature_map": null,
+      "features": null,
+      "landmarks": null,
+      "local_window": null,
+      "nystrom_inverse_iterations": null,
+      "projection_redraw": null,
+      "routed_keys": null,
+      "routers_per_query": null,
+      "variant": "pure-operator-no-convolution-or-extra-position-bias"
+    },
+    "attention_rotation": "rove-value-and-inverse-readout",
+    "bias": true,
+    "depth": 6,
+    "dim": 128,
+    "dropout": 0.1,
+    "heads": 4,
+    "implementation": "upstream-lra-adapter-fp32-sensitive-core",
+    "mixer": "bigbird",
+    "mlp_ratio": 2.0,
+    "parameters": 798730,
+    "pooling": "mean",
+    "position_encoding": "rove_1d",
+    "position_initialization": "fixed-base10000-unit-amplitude-no-scaling",
+    "rank": 16
+  },
+  "resolved_arguments": {
+    "allow_download": false,
+    "amp_dtype": "bfloat16",
+    "attention_backend": "sdpa",
+    "batch_size": 64,
+    "bias": true,
+    "cache_root": "${TMP}/memsolve-lra-cache",
+    "config": "${RUNS}/lra/rove_seed0_20261028/conventional_baselines_20261101/source/experiments/configs/lra_rove.toml",
+    "core_mode": "equilibrium",
+    "data_revision": null,
+    "data_root": "${WORKSPACE}/lra-data",
+    "depth": 6,
+    "device": "auto",
+    "dim": 128,
+    "dropout": 0.1,
+    "early_stop_accuracy_delta": 0.0,
+    "early_stop_loss_relative_delta": 0.0,
+    "early_stop_min_epochs": 30,
+    "epochs": 40,
+    "eval_batch_size": 64,
+    "eval_workers": 4,
+    "execution": "compile-graph",
+    "fail_on_nonfinite": true,
+    "formal": true,
+    "grad_accum": 1,
+    "grad_clip": 1.0,
+    "heads": 4,
+    "implementation": "cuda",
+    "lr": 0.001,
+    "max_eval_batches": 0,
+    "max_eval_samples": 0,
+    "max_length": 2048,
+    "max_train_batches": 0,
+    "max_train_samples": 0,
+    "min_lr_ratio": 0.01,
+    "mixer": "bigbird",
+    "mlp_ratio": 2.0,
+    "no_amp": false,
+    "output": "${RUNS}/lra/rove_seed0_20261028/conventional_baselines_20261101/bigbird_listops_seed0",
+    "pacing_file": null,
+    "pad_to_max_length": true,
+    "patience": 0,
+    "pilot_epochs": 0,
+    "pooling": "mean",
+    "position_encoding": "rove_1d",
+    "prepare_only": false,
+    "rank": 16,
+    "resume": false,
+    "seed": 0,
+    "suite": "lra",
+    "task": "listops",
+    "validation_only": false,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01,
+    "workers": 8
+  },
+  "runtime": {
+    "cuda_runtime": "13.2",
+    "device": "cuda",
+    "device_capability": [
+      8,
+      0
+    ],
+    "device_name": "NVIDIA A800-SXM4-80GB",
+    "python": "3.10.12",
+    "torch": "2.14.0+cu132"
+  },
+  "schema": 1,
+  "selection": {
+    "checkpoint": "highest validation accuracy, then lower validation loss",
+    "test_evaluation": "once after checkpoint selection",
+    "validation_only": false
+  },
+  "source_revision": {
+    "git_commit": "6471fa063c662bfc8ae4920ffc95ab75b9510f7e",
+    "git_dirty": false
+  },
+  "split_sizes": {
+    "test": 2000,
+    "train": 96000,
+    "validation": 2000
+  },
+  "training": {
+    "amp": true,
+    "amp_dtype": "bfloat16",
+    "early_stop_accuracy_delta": 0.0,
+    "early_stop_loss_relative_delta": 0.0,
+    "early_stop_min_epochs": 30,
+    "epochs": 40,
+    "execution": "compile-graph",
+    "fail_on_nonfinite": true,
+    "grad_accum": 1,
+    "grad_clip": 1.0,
+    "lr": 0.001,
+    "max_eval_batches": 0,
+    "max_train_batches": 0,
+    "min_lr_ratio": 0.01,
+    "output": "${RUNS}/lra/rove_seed0_20261028/conventional_baselines_20261101/bigbird_listops_seed0",
+    "pacing_file": null,
+    "patience": 0,
+    "pilot_epochs": 0,
+    "resume": false,
+    "seed": 0,
+    "validation_only": false,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01
+  }
+}

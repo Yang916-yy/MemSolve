@@ -1,0 +1,448 @@
+{
+  "tiny": {
+    "run": "memsolve_vit_t_r16_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261019",
+    "recorded": {
+      "run": {
+        "batching": {
+          "effective_batch_size": 2048,
+          "grad_accum": 2,
+          "physical_batch_size": 512,
+          "samples_per_epoch": 1280000,
+          "updates_per_epoch": 625,
+          "world_size": 2
+        },
+        "checkpoint_contract_digest": "98dc30d2f18648e27b21a8800f77c402a9cc48da8e9c1d53a967f0aa616ea39d",
+        "config_path": "run:imagenet300/memsolve_vit_t_r16_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261019/equilibrium_vit3_ra_300.toml",
+        "data": {
+          "format": "webdataset-v1",
+          "manifest_sha256": "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f",
+          "source": "timm/imagenet-1k-wds",
+          "streaming": {
+            "repeated_augmentation_placement": "timm-repeat-aug-3",
+            "sample_shuffle": {
+              "algorithm": "torch.randperm",
+              "seed_policy": "timm-epoch-plus-seed-v1"
+            },
+            "shard_order": "global-sample-repeat-then-rank-stride",
+            "source_views": 3,
+            "validation_partition": "worker-stride-full-per-rank",
+            "worker_rng": "epoch-rank-worker-v1"
+          },
+          "train": {
+            "samples": 1281167,
+            "shards": 1024
+          },
+          "validation": {
+            "samples": 50000,
+            "shards": 64
+          }
+        },
+        "model": {
+          "architecture": "vit3_cpe_accretive_mean_gelu_v7",
+          "class_token": false,
+          "depth": 12,
+          "drop_path_rate": 0.0,
+          "drop_path_schedule": "linear",
+          "embed_dim": 192,
+          "ffn": "gelu",
+          "image_size": 224,
+          "layer_scale": false,
+          "mlp_ratio": 4.0,
+          "norm_eps": 1e-06,
+          "num_classes": 1000,
+          "num_heads": 6,
+          "patch_size": 16,
+          "pooling": "token_ln_mean",
+          "position_encoding": "cpe",
+          "rank": 16
+        },
+        "official_vit3_recipe": "https://github.com/LeapLabTHU/ViTTT/tree/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt",
+        "operator": {
+          "bias": true,
+          "core_mode": "equilibrium",
+          "implementation": "cuda"
+        },
+        "overrides": [
+          "execution",
+          "grad_accum"
+        ],
+        "phase": "pretrain",
+        "tier": "tiny",
+        "train": {
+          "amp_dtype": "bfloat16",
+          "augmentation": "rand_augment",
+          "auto_augment": "rand-m9-mstd0.5-inc1",
+          "batch_size": 512,
+          "bce_loss": false,
+          "clip_grad": 5.0,
+          "color_jitter": 0.4,
+          "cutmix": 1.0,
+          "effective_batch": 2048,
+          "ema": true,
+          "ema_decay": 0.9999,
+          "epochs": 300,
+          "eval_crop_ratio": 0.875,
+          "execution": "compile-graph",
+          "label_smoothing": 0.1,
+          "lr": 0.002,
+          "lr_schedule": "update",
+          "min_lr": 2e-05,
+          "mixup": 0.8,
+          "mixup_mode": "batch",
+          "mixup_prob": 1.0,
+          "mixup_switch_prob": 0.5,
+          "mlp_ratio": 4.0,
+          "norm_eps": 1e-06,
+          "num_classes": 1000,
+          "optimizer": "fused_adamw",
+          "patch_size": 16,
+          "position_encoding": "cpe",
+          "repeated_aug": true,
+          "reprob": 0.25,
+          "save_every": 1,
+          "seed": 0,
+          "train_workers": 12,
+          "val_workers": 4,
+          "warmup_epochs": 20,
+          "warmup_lr": 2e-06,
+          "weight_decay": 0.05
+        }
+      },
+      "environment": {
+        "cuda": "13.2",
+        "gpu": "NVIDIA A800-SXM4-80GB",
+        "source_revision": {
+          "git_commit": null,
+          "git_dirty": null
+        },
+        "timm": "1.0.29",
+        "torch": "2.14.0+cu132"
+      },
+      "compiler": {
+        "backend": "inductor",
+        "backward_pass_autocast": "off",
+        "emulate_precision_casts": true,
+        "inductor_cuda_graphs": false,
+        "outer_cuda_graph": true
+      },
+      "model": {
+        "trainable_parameters": 5053936
+      },
+      "optimizer_resolved": "torch.adamw.fused",
+      "validation_weights": [
+        "model",
+        "model_ema"
+      ]
+    },
+    "source_origin": {
+      "git_commit": "1cda3319af46f34e9ff3f34441c0cf0f4a8106c7",
+      "repo": "repository:",
+      "baseline": "run:imagenet300/memsolve_vit_s_r32_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261018",
+      "changes": "Tiny tier of the exact frozen Small EMA implementation and recipe; r16, width192, MLP768, DropPath0. No RoVE."
+    },
+    "source_manifest_sha256": "45943ff1dd04fd84b0c33bf07e3a688c9ea7126594b5da3ba3a05507a98c3109",
+    "summary": {
+      "best_ema_epoch": 300,
+      "best_ema_top1": 74.734,
+      "best_model_top1": 74.721
+    }
+  },
+  "small": {
+    "run": "memsolve_vit_s_r32_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261018",
+    "recorded": {
+      "run": {
+        "batching": {
+          "effective_batch_size": 2048,
+          "grad_accum": 2,
+          "physical_batch_size": 512,
+          "samples_per_epoch": 1280000,
+          "updates_per_epoch": 625,
+          "world_size": 2
+        },
+        "checkpoint_contract_digest": "9a00731b437d6dcf675b059e59b6f5bd843da26111e80bbf28758c6a3a63bbb8",
+        "config_path": "run:imagenet300/memsolve_vit_s_r32_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261018/equilibrium_vit3_ra_300.toml",
+        "data": {
+          "format": "webdataset-v1",
+          "manifest_sha256": "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f",
+          "source": "timm/imagenet-1k-wds",
+          "streaming": {
+            "repeated_augmentation_placement": "timm-repeat-aug-3",
+            "sample_shuffle": {
+              "algorithm": "torch.randperm",
+              "seed_policy": "timm-epoch-plus-seed-v1"
+            },
+            "shard_order": "global-sample-repeat-then-rank-stride",
+            "source_views": 3,
+            "validation_partition": "worker-stride-full-per-rank",
+            "worker_rng": "epoch-rank-worker-v1"
+          },
+          "train": {
+            "samples": 1281167,
+            "shards": 1024
+          },
+          "validation": {
+            "samples": 50000,
+            "shards": 64
+          }
+        },
+        "model": {
+          "architecture": "vit3_cpe_accretive_mean_gelu_v7",
+          "class_token": false,
+          "depth": 12,
+          "drop_path_rate": 0.1,
+          "drop_path_schedule": "linear",
+          "embed_dim": 384,
+          "ffn": "gelu",
+          "image_size": 224,
+          "layer_scale": false,
+          "mlp_ratio": 4.125,
+          "norm_eps": 1e-06,
+          "num_classes": 1000,
+          "num_heads": 6,
+          "patch_size": 16,
+          "pooling": "token_ln_mean",
+          "position_encoding": "cpe",
+          "rank": 32
+        },
+        "official_vit3_recipe": "https://github.com/LeapLabTHU/ViTTT/tree/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt",
+        "operator": {
+          "bias": true,
+          "core_mode": "equilibrium",
+          "implementation": "cuda"
+        },
+        "overrides": [
+          "execution",
+          "grad_accum"
+        ],
+        "phase": "pretrain",
+        "tier": "small",
+        "train": {
+          "amp_dtype": "bfloat16",
+          "augmentation": "rand_augment",
+          "auto_augment": "rand-m9-mstd0.5-inc1",
+          "batch_size": 512,
+          "bce_loss": false,
+          "clip_grad": 5.0,
+          "color_jitter": 0.4,
+          "cutmix": 1.0,
+          "effective_batch": 2048,
+          "ema": true,
+          "ema_decay": 0.9999,
+          "epochs": 300,
+          "eval_crop_ratio": 0.875,
+          "execution": "compile-graph",
+          "label_smoothing": 0.1,
+          "lr": 0.002,
+          "lr_schedule": "update",
+          "min_lr": 2e-05,
+          "mixup": 0.8,
+          "mixup_mode": "batch",
+          "mixup_prob": 1.0,
+          "mixup_switch_prob": 0.5,
+          "mlp_ratio": 4.0,
+          "norm_eps": 1e-06,
+          "num_classes": 1000,
+          "optimizer": "fused_adamw",
+          "patch_size": 16,
+          "position_encoding": "cpe",
+          "repeated_aug": true,
+          "reprob": 0.25,
+          "save_every": 1,
+          "seed": 0,
+          "train_workers": 12,
+          "val_workers": 4,
+          "warmup_epochs": 20,
+          "warmup_lr": 2e-06,
+          "weight_decay": 0.05
+        }
+      },
+      "environment": {
+        "cuda": "13.2",
+        "gpu": "NVIDIA A800-SXM4-80GB",
+        "source_revision": {
+          "git_commit": null,
+          "git_dirty": null
+        },
+        "timm": "1.0.29",
+        "torch": "2.14.0+cu132"
+      },
+      "compiler": {
+        "backend": "inductor",
+        "backward_pass_autocast": "off",
+        "emulate_precision_casts": true,
+        "inductor_cuda_graphs": false,
+        "outer_cuda_graph": true
+      },
+      "model": {
+        "trainable_parameters": 19876336
+      },
+      "optimizer_resolved": "torch.adamw.fused",
+      "validation_weights": [
+        "model",
+        "model_ema"
+      ]
+    },
+    "source_origin": {
+      "git_commit": "1cda3319af46f34e9ff3f34441c0cf0f4a8106c7",
+      "repo": "repository:",
+      "baseline": "run:imagenet300/memsolve_vit_s_r32_equilibrium_vit3_ra_bs2048_acc2_seed0_20261012",
+      "changes": "Enable FP32 EMA decay 0.9999; same Small architecture and training recipe; current mathematically equivalent CUDA optimizations; compile-graph."
+    },
+    "source_manifest_sha256": "45943ff1dd04fd84b0c33bf07e3a688c9ea7126594b5da3ba3a05507a98c3109",
+    "summary": {
+      "best_ema_epoch": 297,
+      "best_ema_top1": 80.99,
+      "best_model_top1": 80.893
+    }
+  },
+  "base": {
+    "run": "memsolve_vit_b_r48_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261014",
+    "recorded": {
+      "run": {
+        "batching": {
+          "effective_batch_size": 2048,
+          "grad_accum": 2,
+          "physical_batch_size": 512,
+          "samples_per_epoch": 1280000,
+          "updates_per_epoch": 625,
+          "world_size": 2
+        },
+        "checkpoint_contract_digest": "2c8ffdc9fcc40bf6fe15e265493be8c784a70c971fdebdfaecf336c19bf6f04d",
+        "config_path": "run:imagenet300/memsolve_vit_b_r48_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261014/equilibrium_vit3_ra_300.toml",
+        "data": {
+          "format": "webdataset-v1",
+          "manifest_sha256": "092ba12f49692720b20ebcf241e416ceab77d6f079b382d5c1bb3e1227e9834f",
+          "source": "timm/imagenet-1k-wds",
+          "streaming": {
+            "repeated_augmentation_placement": "timm-repeat-aug-3",
+            "sample_shuffle": {
+              "algorithm": "torch.randperm",
+              "seed_policy": "timm-epoch-plus-seed-v1"
+            },
+            "shard_order": "global-sample-repeat-then-rank-stride",
+            "source_views": 3,
+            "validation_partition": "worker-stride-full-per-rank",
+            "worker_rng": "epoch-rank-worker-v1"
+          },
+          "train": {
+            "samples": 1281167,
+            "shards": 1024
+          },
+          "validation": {
+            "samples": 50000,
+            "shards": 64
+          }
+        },
+        "model": {
+          "architecture": "vit3_cpe_accretive_mean_gelu_v7",
+          "class_token": false,
+          "depth": 12,
+          "drop_path_rate": 0.4,
+          "drop_path_schedule": "linear",
+          "embed_dim": 768,
+          "ffn": "gelu",
+          "image_size": 224,
+          "layer_scale": false,
+          "mlp_ratio": 4.0,
+          "norm_eps": 1e-06,
+          "num_classes": 1000,
+          "num_heads": 12,
+          "patch_size": 16,
+          "pooling": "token_ln_mean",
+          "position_encoding": "cpe",
+          "rank": 48
+        },
+        "official_vit3_recipe": "https://github.com/LeapLabTHU/ViTTT/tree/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt",
+        "operator": {
+          "bias": true,
+          "core_mode": "equilibrium",
+          "implementation": "cuda"
+        },
+        "overrides": [
+          "execution",
+          "grad_accum"
+        ],
+        "phase": "pretrain",
+        "tier": "base",
+        "train": {
+          "amp_dtype": "bfloat16",
+          "augmentation": "rand_augment",
+          "auto_augment": "rand-m9-mstd0.5-inc1",
+          "batch_size": 512,
+          "bce_loss": false,
+          "clip_grad": 5.0,
+          "color_jitter": 0.4,
+          "cutmix": 1.0,
+          "effective_batch": 2048,
+          "ema": true,
+          "ema_decay": 0.9999,
+          "epochs": 300,
+          "eval_crop_ratio": 0.875,
+          "execution": "compile-graph",
+          "label_smoothing": 0.1,
+          "lr": 0.002,
+          "lr_schedule": "update",
+          "min_lr": 2e-05,
+          "mixup": 0.8,
+          "mixup_mode": "batch",
+          "mixup_prob": 1.0,
+          "mixup_switch_prob": 0.5,
+          "mlp_ratio": 4.0,
+          "norm_eps": 1e-06,
+          "num_classes": 1000,
+          "optimizer": "fused_adamw",
+          "patch_size": 16,
+          "position_encoding": "cpe",
+          "repeated_aug": true,
+          "reprob": 0.25,
+          "save_every": 1,
+          "seed": 0,
+          "train_workers": 12,
+          "val_workers": 4,
+          "warmup_epochs": 20,
+          "warmup_lr": 2e-06,
+          "weight_decay": 0.05
+        }
+      },
+      "environment": {
+        "cuda": "13.2",
+        "gpu": "NVIDIA A800-SXM4-80GB",
+        "source_revision": {
+          "git_commit": null,
+          "git_dirty": null
+        },
+        "timm": "1.0.29",
+        "torch": "2.14.0+cu132"
+      },
+      "compiler": {
+        "backend": "inductor",
+        "backward_pass_autocast": "off",
+        "emulate_precision_casts": true,
+        "inductor_cuda_graphs": false,
+        "outer_cuda_graph": true
+      },
+      "model": {
+        "trainable_parameters": 77980792
+      },
+      "optimizer_resolved": "torch.adamw.fused",
+      "validation_weights": [
+        "model",
+        "model_ema"
+      ]
+    },
+    "source_origin": {
+      "commit": "2021605541fe0cf88c98a41b975837043a17915c",
+      "worktree_clean": false,
+      "repo": "repository:",
+      "model_contract": 26,
+      "native_abi": 16,
+      "changes": "Add optional timm RepeatAugSampler to ViT3 training; default recipe and model unchanged; permit optional EMA in ViT3-derived configs, retaining independent raw/EMA validation and best checkpoints"
+    },
+    "source_manifest_sha256": "e3503ed26382a900e199bd14e9a25ccc4afad580cd66c02d4204a703c186c832",
+    "summary": {
+      "best_ema_epoch": 268,
+      "best_ema_top1": 82.706,
+      "best_model_top1": 82.552
+    }
+  }
+}

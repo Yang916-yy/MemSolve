@@ -1,0 +1,35 @@
+{
+  "source_commit": "443fc1c994b070c80779ab79e495e033d918108e",
+  "checkpoint": "${RUNS}/imagenet300/memsolve_vit_b_r48_equilibrium_vit3_ra_bs2048_acc2_ema_seed0_20261014/train/checkpoint_best_ema.pt",
+  "checkpoint_sha256": "1b5703a71d857b1f1fdb4817b584d1f6ae26e4badb4530011465971c99293cb0",
+  "checkpoint_weights": "model_ema",
+  "imagenet_best_top1": 82.706,
+  "encoder_entries_exactly_loaded": 206,
+  "parameters": 111582560,
+  "encoder_adapter_parameters": 90890864,
+  "epochs": 12,
+  "global_batch": 16,
+  "lr": 0.0001,
+  "warmup_optimizer_steps": 500,
+  "lr_milestones": [
+    8,
+    11
+  ],
+  "candidates": [
+    {
+      "per_gpu_batch": 8,
+      "accumulation": 1
+    },
+    {
+      "per_gpu_batch": 4,
+      "accumulation": 2
+    }
+  ],
+  "execution": "encoder torch.compile; BF16 autocast; fused AdamW; variable image shapes, no CUDA Graph",
+  "workers_per_gpu": 8,
+  "persistent_workers": true,
+  "native_sha256": "47245612d2f44eab46dc08b84aea42a5dbe5ee414f39408ba90146babc688203",
+  "created_utc": "2026-10-26T08:11:28.016113+00:00",
+  "previous_preflight": "${RUNS}/coco/memsolve_base_adapter_1x_seed0_20261026/preflight.json",
+  "source_unchanged_for_dense": true
+}

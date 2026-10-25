@@ -1,0 +1,205 @@
+{
+  "config_digest": "9651790fcc25c830260583a43bf13bf164553fc16385685e2b6ef19b8504ab8e",
+  "data_contract": {
+    "input_kind": "values",
+    "max_length": 1024,
+    "paired": false,
+    "value_masking": "length",
+    "vocab_size": null
+  },
+  "dataset": {
+    "resolution": 32,
+    "source": {
+      "content_sha256": "7e27812201fd13aba2fe16da88fa771736db2ce1ac4d49361864ba886a065e82",
+      "files": {
+        "test_images": {
+          "content_sha256": "e11116a81011718aef7db29b1f7a9854daa057ced8ccb69f5cabc40f3e8ede38",
+          "mtime_ns": 1792983006208464821,
+          "path": "${WORKSPACE}/lra-data/cifar10/test_images.npy",
+          "size": 10240128
+        },
+        "test_labels": {
+          "content_sha256": "fc48d9ecfdbeacce2dacf004498170f2df12e75e3485475017d2663b587a92f3",
+          "mtime_ns": 1792983006248808845,
+          "path": "${WORKSPACE}/lra-data/cifar10/test_labels.npy",
+          "size": 80128
+        },
+        "train_images": {
+          "content_sha256": "ef10722455dfc0316aa1bf4ea1ec879df9052f479e1e1997839429c35754a7ae",
+          "mtime_ns": 1792983004806999484,
+          "path": "${WORKSPACE}/lra-data/cifar10/train_images.npy",
+          "size": 51200128
+        },
+        "train_labels": {
+          "content_sha256": "9e2ee9261f6a7c6509b35aaa7161bf15d6d99673bbcac04130702d12a6da88d3",
+          "mtime_ns": 1792983004916179095,
+          "path": "${WORKSPACE}/lra-data/cifar10/train_labels.npy",
+          "size": 400128
+        }
+      },
+      "preparation": {
+        "conversion": "Pillow RGB to L grayscale, uint8, no augmentation",
+        "inputs": [
+          {
+            "file": "${WORKSPACE}/lra-data/raw/uoft-cs--cifar10/train.parquet",
+            "samples": 50000,
+            "sha256": "8428b53a88a11ac374111006708df51469e315a22ac6d66470afd9c78d2ae883"
+          },
+          {
+            "file": "${WORKSPACE}/lra-data/raw/uoft-cs--cifar10/test.parquet",
+            "samples": 10000,
+            "sha256": "841389e6f2d64f28bf17310e430aebac20ec3ba611a3c5e231dc93c645ce84de"
+          }
+        ],
+        "repository": "uoft-cs/cifar10",
+        "revision": "0b2714987fa478483af9968de7c934580d0bb9a2"
+      },
+      "transport": "local-cifar10-grayscale-arrays"
+    },
+    "source_definition": "google-research/long-range-arena@cd31e5c6",
+    "split_fingerprints": {
+      "train": "77f9b3146ad111a514cef46271c99f87355be0b2481e247615a85820d8840dff",
+      "validation": "cdad6ed8f908c0c5ce9bdb56398c7fd42ad3275c1c8a799c6ae6f0867f0dd99d"
+    },
+    "split_protocol": "stratified-validation-v1",
+    "split_seed": 2026,
+    "suite": "lra",
+    "task": "image",
+    "tokenization": "grayscale-float-0-1-raster-all-pixels",
+    "validation_fraction": 0.1
+  },
+  "model": {
+    "attention_adapter": {
+      "features": 128,
+      "landmarks": null,
+      "nystrom_inverse_iterations": null,
+      "projection_redraw": "fixed",
+      "routed_keys": null,
+      "routers_per_query": null,
+      "variant": "pure-operator-no-convolution-or-extra-position-bias"
+    },
+    "attention_rotation": "rove-value-and-inverse-readout",
+    "bias": true,
+    "depth": 6,
+    "dim": 128,
+    "dropout": 0.1,
+    "heads": 4,
+    "implementation": "upstream-lra-adapter-fp32-sensitive-core",
+    "mixer": "performer",
+    "mlp_ratio": 2.0,
+    "parameters": 796682,
+    "pooling": "mean",
+    "position_encoding": "rove_2d",
+    "position_initialization": "fixed-base10000-unit-amplitude-no-scaling",
+    "rank": 16
+  },
+  "resolved_arguments": {
+    "allow_download": false,
+    "amp_dtype": "bfloat16",
+    "attention_backend": "sdpa",
+    "batch_size": 128,
+    "bias": true,
+    "cache_root": "${TMP}/memsolve-lra-cache",
+    "config": "${RUNS}/lra/rove_seed0_20261028/formal_baselines_after_memsolve/source/experiments/configs/lra_rove.toml",
+    "core_mode": "equilibrium",
+    "data_revision": null,
+    "data_root": "${WORKSPACE}/lra-data",
+    "depth": 6,
+    "device": "auto",
+    "dim": 128,
+    "dropout": 0.1,
+    "early_stop_accuracy_delta": 0.0,
+    "early_stop_loss_relative_delta": 0.0,
+    "early_stop_min_epochs": 150,
+    "epochs": 200,
+    "eval_batch_size": 128,
+    "eval_workers": 4,
+    "execution": "compile-graph",
+    "fail_on_nonfinite": true,
+    "formal": true,
+    "grad_accum": 1,
+    "grad_clip": 1.0,
+    "heads": 4,
+    "implementation": "cuda",
+    "lr": 0.0005,
+    "max_eval_batches": 0,
+    "max_eval_samples": 0,
+    "max_length": 1024,
+    "max_train_batches": 0,
+    "max_train_samples": 0,
+    "min_lr_ratio": 0.01,
+    "mixer": "performer",
+    "mlp_ratio": 2.0,
+    "no_amp": false,
+    "output": "${RUNS}/lra/rove_seed0_20261028/formal_clip1_performer_d128_h4_ffn2/image_seed0",
+    "pacing_file": null,
+    "pad_to_max_length": true,
+    "patience": 0,
+    "pilot_epochs": 0,
+    "pooling": "mean",
+    "position_encoding": "rove_2d",
+    "prepare_only": false,
+    "rank": 16,
+    "resume": false,
+    "seed": 0,
+    "split_seed": 2026,
+    "suite": "lra",
+    "task": "image",
+    "validation_fraction": 0.1,
+    "validation_only": false,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01,
+    "workers": 8
+  },
+  "runtime": {
+    "cuda_runtime": "13.2",
+    "device": "cuda",
+    "device_capability": [
+      8,
+      0
+    ],
+    "device_name": "NVIDIA A800-SXM4-80GB",
+    "python": "3.10.12",
+    "torch": "2.14.0+cu132"
+  },
+  "schema": 1,
+  "selection": {
+    "checkpoint": "highest validation accuracy, then lower validation loss",
+    "test_evaluation": "once after checkpoint selection",
+    "validation_only": false
+  },
+  "source_revision": {
+    "git_commit": "843e0724a5928a8de5e11bce3e4a75dd77e73c8f",
+    "git_dirty": false
+  },
+  "split_sizes": {
+    "test": 10000,
+    "train": 45000,
+    "validation": 5000
+  },
+  "training": {
+    "amp": true,
+    "amp_dtype": "bfloat16",
+    "early_stop_accuracy_delta": 0.0,
+    "early_stop_loss_relative_delta": 0.0,
+    "early_stop_min_epochs": 150,
+    "epochs": 200,
+    "execution": "compile-graph",
+    "fail_on_nonfinite": true,
+    "grad_accum": 1,
+    "grad_clip": 1.0,
+    "lr": 0.0005,
+    "max_eval_batches": 0,
+    "max_train_batches": 0,
+    "min_lr_ratio": 0.01,
+    "output": "${RUNS}/lra/rove_seed0_20261028/formal_clip1_performer_d128_h4_ffn2/image_seed0",
+    "pacing_file": null,
+    "patience": 0,
+    "pilot_epochs": 0,
+    "resume": false,
+    "seed": 0,
+    "validation_only": false,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01
+  }
+}

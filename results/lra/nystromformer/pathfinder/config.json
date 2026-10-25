@@ -1,0 +1,264 @@
+{
+  "config_digest": "a6638eef997592e7ff1f92be224fc671e02ddc759e345f03ea23baf508338440",
+  "data_contract": {
+    "input_kind": "values",
+    "max_length": 1024,
+    "paired": false,
+    "value_masking": "nonzero",
+    "vocab_size": null
+  },
+  "dataset": {
+    "resolution": 32,
+    "source": {
+      "content_sha256": "072de85e19cbf46dd0f5fe2c9c09b490ba03ffdc0f31380e357148d1c5b634d0",
+      "files": {
+        "test_images": {
+          "content_sha256": "d3eecdd204b96fbdaff95437615dc4e9c05ae5b9223f3975b9ef2829713ba4be",
+          "mtime_ns": 1792991412174441650,
+          "path": "${TMP}/memsolve-lra-pathfinder-mega/pathfinder32/test_images.npy",
+          "size": 20480128
+        },
+        "test_labels": {
+          "content_sha256": "9dc5e2636ec9a3fe64934bfe418044349170cc828208f856a9fab4fe7e309ba6",
+          "mtime_ns": 1792991412183441819,
+          "path": "${TMP}/memsolve-lra-pathfinder-mega/pathfinder32/test_labels.npy",
+          "size": 160128
+        },
+        "train_images": {
+          "content_sha256": "845d11ab1a208d5f48fe1c17cdef091c5d42cbe66d19b5fc010a582e415791fd",
+          "mtime_ns": 1792991410061401952,
+          "path": "${TMP}/memsolve-lra-pathfinder-mega/pathfinder32/train_images.npy",
+          "size": 163840128
+        },
+        "train_labels": {
+          "content_sha256": "e4e2e78c46095b2a0731840db42169b8add262b8ea814baac25aeb43c9d96259",
+          "mtime_ns": 1792991410116402985,
+          "path": "${TMP}/memsolve-lra-pathfinder-mega/pathfinder32/train_labels.npy",
+          "size": 1280128
+        },
+        "validation_images": {
+          "content_sha256": "9273c6907236c363a321b44975657511e1e258494c918d8b8165df75a0975673",
+          "mtime_ns": 1792991411214423614,
+          "path": "${TMP}/memsolve-lra-pathfinder-mega/pathfinder32/validation_images.npy",
+          "size": 20480128
+        },
+        "validation_labels": {
+          "content_sha256": "0803884cce7b4fa51557f90edba4e0df2e8174b24271325ee6784accaf248f63",
+          "mtime_ns": 1792991411223423783,
+          "path": "${TMP}/memsolve-lra-pathfinder-mega/pathfinder32/validation_labels.npy",
+          "size": 160128
+        }
+      },
+      "preparation": {
+        "archive_sha256": "b141aacd5537ad6108862117597c41d9d2a67d6420c54f74c76df615073fee13",
+        "conversion": "Preserve published sample order, labels, and 0..255 raster pixels; store uint8 arrays. Model divides pixels by 255.",
+        "difficulty": "hard",
+        "members": {
+          "lra/pathfinder/input/test.src": {
+            "crc32": "5dac2528",
+            "sha256": "0f1cc4415204d1160a27dd8b53c1ce2a53eb20f20df0efc5fb2d293400c80e0b"
+          },
+          "lra/pathfinder/input/train.src": {
+            "crc32": "1456fa9e",
+            "sha256": "e571d5f8962d3ab1e9dc4a6f1c4c9cc1bb2a8fce09a675767a62c4631859b3f0"
+          },
+          "lra/pathfinder/input/valid.src": {
+            "crc32": "1efdb845",
+            "sha256": "ba3bf38c58c9aefb08a32daf940b1fd6f7988e929d1fcee9307ced6ab2af1090"
+          },
+          "lra/pathfinder/label/test.label": {
+            "crc32": "81afa76a",
+            "sha256": "a1a23bfbcb84a4d5414f428ba28fe183e07171479704bf9190361653c256f1ae"
+          },
+          "lra/pathfinder/label/train.label": {
+            "crc32": "d6845066",
+            "sha256": "4c73d45cbd8c83ef59cf1d34fb47a63febd25caea077bc5f662711c6aafbc65e"
+          },
+          "lra/pathfinder/label/valid.label": {
+            "crc32": "295819e0",
+            "sha256": "196a814589d8d4e6f319b543d5f6a3ebd6650f832aa70dd1b019728a7d8ee1da"
+          }
+        },
+        "prepared": {
+          "test": {
+            "images_sha256": "d3eecdd204b96fbdaff95437615dc4e9c05ae5b9223f3975b9ef2829713ba4be",
+            "label_counts": [
+              10115,
+              9885
+            ],
+            "labels_sha256": "9dc5e2636ec9a3fe64934bfe418044349170cc828208f856a9fab4fe7e309ba6",
+            "samples": 20000
+          },
+          "train": {
+            "images_sha256": "845d11ab1a208d5f48fe1c17cdef091c5d42cbe66d19b5fc010a582e415791fd",
+            "label_counts": [
+              79927,
+              80073
+            ],
+            "labels_sha256": "e4e2e78c46095b2a0731840db42169b8add262b8ea814baac25aeb43c9d96259",
+            "samples": 160000
+          },
+          "validation": {
+            "images_sha256": "9273c6907236c363a321b44975657511e1e258494c918d8b8165df75a0975673",
+            "label_counts": [
+              10038,
+              9962
+            ],
+            "labels_sha256": "0803884cce7b4fa51557f90edba4e0df2e8174b24271325ee6784accaf248f63",
+            "samples": 20000
+          }
+        },
+        "publisher": "facebookresearch/mega",
+        "repository_commit": "aeaa4b44592cd1d60a9a34554e359eda2a62b03b",
+        "resolution": 32,
+        "source_url": "https://dl.fbaipublicfiles.com/mega/data/lra.zip",
+        "split_protocol": "mega-author-splits-v1"
+      },
+      "transport": "local-grayscale-arrays"
+    },
+    "source_definition": "google-research/long-range-arena@cd31e5c6",
+    "split_protocol": "mega-author-splits-v1",
+    "suite": "lra",
+    "task": "pathfinder",
+    "value_masking": "nonzero-pixels"
+  },
+  "model": {
+    "attention_adapter": {
+      "features": null,
+      "landmarks": 128,
+      "nystrom_inverse_iterations": 6,
+      "projection_redraw": null,
+      "routed_keys": null,
+      "routers_per_query": null,
+      "variant": "pure-operator-no-convolution-or-extra-position-bias"
+    },
+    "attention_rotation": "rove-value-and-inverse-readout",
+    "bias": true,
+    "depth": 6,
+    "dim": 128,
+    "dropout": 0.1,
+    "heads": 4,
+    "implementation": "upstream-lra-adapter-fp32-sensitive-core",
+    "input_embedding": "learned-256-level-pixel-lookup",
+    "input_embedding_initialization": "normal-std0.02",
+    "mixer": "nystromformer",
+    "mlp_ratio": 2.0,
+    "parameters": 828162,
+    "pooling": "mean",
+    "position_encoding": "rove_2d",
+    "position_initialization": "fixed-base10000-unit-amplitude-no-scaling",
+    "rank": 16
+  },
+  "probe_source": {
+    "note": "LRA mixer control with identical pixel lookup, nonzero mask, and 2D RoVE content rotations. Retain the absolute-position constructor RNG consumption before replacing positions; 2D RoVE replaces rather than augments LPE. Original raster coordinates retained. Mean over valid pixels.",
+    "path": "${RUNS}/lra/rove_seed0_20261028/formal_baselines_after_memsolve/pathfinder.py",
+    "sha256": "c6ab5123e96d9546a68f5b7b1a669617e85965662c399e23b0902dcb2150d2a7"
+  },
+  "resolved_arguments": {
+    "allow_download": false,
+    "amp_dtype": "bfloat16",
+    "attention_backend": "sdpa",
+    "batch_size": 128,
+    "bias": true,
+    "cache_root": "${TMP}/memsolve-lra-cache",
+    "config": "${RUNS}/lra/rove_seed0_20261028/formal_baselines_after_memsolve/source/experiments/configs/lra_rove.toml",
+    "core_mode": "equilibrium",
+    "data_revision": null,
+    "data_root": "${TMP}/memsolve-lra-pathfinder-mega",
+    "depth": 6,
+    "device": "auto",
+    "dim": 128,
+    "dropout": 0.1,
+    "early_stop_accuracy_delta": 0.0,
+    "early_stop_loss_relative_delta": 0.0,
+    "early_stop_min_epochs": 150,
+    "epochs": 200,
+    "eval_batch_size": 128,
+    "eval_workers": 4,
+    "execution": "compile-graph",
+    "fail_on_nonfinite": true,
+    "formal": true,
+    "grad_accum": 1,
+    "grad_clip": 1.0,
+    "heads": 4,
+    "implementation": "cuda",
+    "lr": 0.0002,
+    "max_eval_batches": 0,
+    "max_eval_samples": 0,
+    "max_train_batches": 0,
+    "max_train_samples": 0,
+    "min_lr_ratio": 0.01,
+    "mixer": "nystromformer",
+    "mlp_ratio": 2.0,
+    "no_amp": false,
+    "output": "${RUNS}/lra/rove_seed0_20261028/formal_clip1_nystromformer_d128_h4_ffn2/pathfinder_seed0",
+    "pacing_file": null,
+    "pad_to_max_length": true,
+    "pathfinder_resolution": 32,
+    "patience": 0,
+    "pilot_epochs": 0,
+    "pooling": "mean",
+    "position_encoding": "rove_2d",
+    "prepare_only": false,
+    "rank": 16,
+    "resume": false,
+    "seed": 0,
+    "suite": "lra",
+    "task": "pathfinder",
+    "validation_only": false,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01,
+    "workers": 8
+  },
+  "runtime": {
+    "cuda_runtime": "13.2",
+    "device": "cuda",
+    "device_capability": [
+      8,
+      0
+    ],
+    "device_name": "NVIDIA A800-SXM4-80GB",
+    "python": "3.10.12",
+    "torch": "2.14.0+cu132"
+  },
+  "schema": 1,
+  "selection": {
+    "checkpoint": "highest validation accuracy, then lower validation loss",
+    "test_evaluation": "once after checkpoint selection",
+    "validation_only": false
+  },
+  "source_revision": {
+    "git_commit": "843e0724a5928a8de5e11bce3e4a75dd77e73c8f",
+    "git_dirty": false
+  },
+  "split_sizes": {
+    "test": 20000,
+    "train": 160000,
+    "validation": 20000
+  },
+  "training": {
+    "amp": true,
+    "amp_dtype": "bfloat16",
+    "early_stop_accuracy_delta": 0.0,
+    "early_stop_loss_relative_delta": 0.0,
+    "early_stop_min_epochs": 150,
+    "epochs": 200,
+    "execution": "compile-graph",
+    "fail_on_nonfinite": true,
+    "grad_accum": 1,
+    "grad_clip": 1.0,
+    "lr": 0.0002,
+    "max_eval_batches": 0,
+    "max_train_batches": 0,
+    "min_lr_ratio": 0.01,
+    "output": "${RUNS}/lra/rove_seed0_20261028/formal_clip1_nystromformer_d128_h4_ffn2/pathfinder_seed0",
+    "pacing_file": null,
+    "patience": 0,
+    "pilot_epochs": 0,
+    "resume": false,
+    "seed": 0,
+    "validation_only": false,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01
+  }
+}

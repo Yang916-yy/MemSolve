@@ -1,0 +1,4324 @@
+{
+  "selection": "final checkpoint, development set",
+  "tasks": {
+    "mnli": {
+      "seeds": [
+        19
+      ],
+      "mean": 83.02008433480745,
+      "sample_std": null
+    },
+    "qqp": {
+      "seeds": [
+        19
+      ],
+      "mean": 89.7927228568671,
+      "sample_std": null
+    },
+    "qnli": {
+      "seeds": [
+        19
+      ],
+      "mean": 88.59600951857954,
+      "sample_std": null
+    },
+    "sst2": {
+      "seeds": [
+        19,
+        8364,
+        717
+      ],
+      "mean": 91.5519877675841,
+      "sample_std": 0.3503498237733775
+    },
+    "cola": {
+      "seeds": [
+        19,
+        8364,
+        717,
+        10536
+      ],
+      "mean": 47.479255687113344,
+      "sample_std": 1.5048319176288527
+    },
+    "rte": {
+      "seeds": [
+        19,
+        8364,
+        717,
+        10536,
+        90166
+      ],
+      "mean": 74.15162454873646,
+      "sample_std": 0.7909351010904941
+    },
+    "mrpc": {
+      "seeds": [
+        19,
+        8364,
+        717,
+        10536,
+        90166
+      ],
+      "mean": 91.03546399922821,
+      "sample_std": 0.6533328119265681
+    },
+    "stsb": {
+      "seeds": [
+        19,
+        8364,
+        717,
+        10536,
+        90166
+      ],
+      "mean": 89.19932427005203,
+      "sample_std": 0.1402362706761925
+    }
+  },
+  "average_of_task_means": 81.85330912287102,
+  "runs": {
+    "mnli_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "a6046009e4aa1342",
+            "validation_matched": "ef803c326018edef",
+            "validation_mismatched": "354cffe76bd35aa3"
+          },
+          "label_names": [
+            "entailment",
+            "neutral",
+            "contradiction"
+          ],
+          "rows": {
+            "train": 392702,
+            "validation_matched": 9815,
+            "validation_mismatched": 9832
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "mnli"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "mnli",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 2300,
+          "eval_strategy": "steps",
+          "learning_rate": 5e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 48,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.1
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "qqp_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "3d97fbeafcee5beb",
+            "validation": "08fb2f88a2cabb9f"
+          },
+          "label_names": [
+            "not_duplicate",
+            "duplicate"
+          ],
+          "rows": {
+            "train": 363846,
+            "validation": 40430
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "qqp"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "qqp",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 2000,
+          "eval_strategy": "steps",
+          "learning_rate": 3e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 5,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/qqp",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.1
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "qnli_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "4e0cae603c5c288c",
+            "validation": "c44c04f287994148"
+          },
+          "label_names": [
+            "entailment",
+            "not_entailment"
+          ],
+          "rows": {
+            "train": 104743,
+            "validation": 5463
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "qnli"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "qnli",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 1000,
+          "eval_strategy": "steps",
+          "learning_rate": 5e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/qnli",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.2
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "sst2_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "3803e080879b178d",
+            "validation": "ba4be4dbc63639a6"
+          },
+          "label_names": [
+            "negative",
+            "positive"
+          ],
+          "rows": {
+            "train": 67349,
+            "validation": 872
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "sst2"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "sst2",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 500,
+          "eval_strategy": "steps",
+          "learning_rate": 3e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/sst2",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.1
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "sst2_seed8364": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "3803e080879b178d",
+            "validation": "ba4be4dbc63639a6"
+          },
+          "label_names": [
+            "negative",
+            "positive"
+          ],
+          "rows": {
+            "train": 67349,
+            "validation": 872
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "sst2"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 8364,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "sst2",
+        "training": {
+          "bf16": true,
+          "data_seed": 8364,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 500,
+          "eval_strategy": "steps",
+          "learning_rate": 3e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/sst2_seed8364",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 8364,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.1
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "sst2_seed717": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "3803e080879b178d",
+            "validation": "ba4be4dbc63639a6"
+          },
+          "label_names": [
+            "negative",
+            "positive"
+          ],
+          "rows": {
+            "train": 67349,
+            "validation": 872
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "sst2"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 717,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "sst2",
+        "training": {
+          "bf16": true,
+          "data_seed": 717,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 500,
+          "eval_strategy": "steps",
+          "learning_rate": 3e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/sst2_seed717",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 717,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.1
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "cola_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "32b758abd579db2e",
+            "validation": "8bb514dbeb575bfd"
+          },
+          "label_names": [
+            "unacceptable",
+            "acceptable"
+          ],
+          "rows": {
+            "train": 8551,
+            "validation": 1043
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "cola"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "cola",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 250,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/cola",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.0625
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "cola_seed8364": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "32b758abd579db2e",
+            "validation": "8bb514dbeb575bfd"
+          },
+          "label_names": [
+            "unacceptable",
+            "acceptable"
+          ],
+          "rows": {
+            "train": 8551,
+            "validation": 1043
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "cola"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 8364,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "cola",
+        "training": {
+          "bf16": true,
+          "data_seed": 8364,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 250,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/cola_seed8364",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 8364,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.0625
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "cola_seed717": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "32b758abd579db2e",
+            "validation": "8bb514dbeb575bfd"
+          },
+          "label_names": [
+            "unacceptable",
+            "acceptable"
+          ],
+          "rows": {
+            "train": 8551,
+            "validation": 1043
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "cola"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 717,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "cola",
+        "training": {
+          "bf16": true,
+          "data_seed": 717,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 250,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/cola_seed717",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 717,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.0625
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "cola_seed10536": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "32b758abd579db2e",
+            "validation": "8bb514dbeb575bfd"
+          },
+          "label_names": [
+            "unacceptable",
+            "acceptable"
+          ],
+          "rows": {
+            "train": 8551,
+            "validation": 1043
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "cola"
+        },
+        "init_checkpoint": "run:nlp-pretrain/memsolve_bert_base_lion_c4_128_seed17_20261016_compile_graph/training/final",
+        "init_sha256": "a90a61d52b2e6c70f1ed87bd7798f10634704c4aa66fa9cab85b613245d67dcb",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 10536,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "cola",
+        "training": {
+          "bf16": true,
+          "data_seed": 10536,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 250,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/cola_seed10536",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 10536,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.0625
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [],
+        "missing_keys": [
+          "bert.pooler.dense.bias",
+          "bert.pooler.dense.weight",
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "unexpected_keys": [
+          "cls.predictions.bias",
+          "cls.predictions.transform.LayerNorm.bias",
+          "cls.predictions.transform.LayerNorm.weight",
+          "cls.predictions.transform.dense.bias",
+          "cls.predictions.transform.dense.weight"
+        ]
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "rte_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "21775589d4bb26e8",
+            "validation": "7b0b51287e34965a"
+          },
+          "label_names": [
+            "entailment",
+            "not_entailment"
+          ],
+          "rows": {
+            "train": 2490,
+            "validation": 277
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "rte"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "rte",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 1e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/rte",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.09999999999999999
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "rte_seed8364": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "21775589d4bb26e8",
+            "validation": "7b0b51287e34965a"
+          },
+          "label_names": [
+            "entailment",
+            "not_entailment"
+          ],
+          "rows": {
+            "train": 2490,
+            "validation": 277
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "rte"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 8364,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "rte",
+        "training": {
+          "bf16": true,
+          "data_seed": 8364,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 1e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/rte_seed8364",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 8364,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.09999999999999999
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "rte_seed717": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "21775589d4bb26e8",
+            "validation": "7b0b51287e34965a"
+          },
+          "label_names": [
+            "entailment",
+            "not_entailment"
+          ],
+          "rows": {
+            "train": 2490,
+            "validation": 277
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "rte"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 717,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "rte",
+        "training": {
+          "bf16": true,
+          "data_seed": 717,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 1e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/rte_seed717",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 717,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.09999999999999999
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "rte_seed10536": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "21775589d4bb26e8",
+            "validation": "7b0b51287e34965a"
+          },
+          "label_names": [
+            "entailment",
+            "not_entailment"
+          ],
+          "rows": {
+            "train": 2490,
+            "validation": 277
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "rte"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 10536,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "rte",
+        "training": {
+          "bf16": true,
+          "data_seed": 10536,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 1e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/rte_seed10536",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 10536,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.09999999999999999
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "rte_seed90166": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "21775589d4bb26e8",
+            "validation": "7b0b51287e34965a"
+          },
+          "label_names": [
+            "entailment",
+            "not_entailment"
+          ],
+          "rows": {
+            "train": 2490,
+            "validation": 277
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "rte"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 90166,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "rte",
+        "training": {
+          "bf16": true,
+          "data_seed": 90166,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 1e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 3,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/rte_seed90166",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 16,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 90166,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.09999999999999999
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "mrpc_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "f2734b40d016e992",
+            "validation": "2e7ca590c25ef9e6"
+          },
+          "label_names": [
+            "not_equivalent",
+            "equivalent"
+          ],
+          "rows": {
+            "train": 3668,
+            "validation": 408
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "mrpc"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "mrpc",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mrpc",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 1.0
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "mrpc_seed8364": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "f2734b40d016e992",
+            "validation": "2e7ca590c25ef9e6"
+          },
+          "label_names": [
+            "not_equivalent",
+            "equivalent"
+          ],
+          "rows": {
+            "train": 3668,
+            "validation": 408
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "mrpc"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 8364,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "mrpc",
+        "training": {
+          "bf16": true,
+          "data_seed": 8364,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/mrpc_seed8364",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 8364,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 1.0
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "mrpc_seed717": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "f2734b40d016e992",
+            "validation": "2e7ca590c25ef9e6"
+          },
+          "label_names": [
+            "not_equivalent",
+            "equivalent"
+          ],
+          "rows": {
+            "train": 3668,
+            "validation": 408
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "mrpc"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 717,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "mrpc",
+        "training": {
+          "bf16": true,
+          "data_seed": 717,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/mrpc_seed717",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 717,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 1.0
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "mrpc_seed10536": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "f2734b40d016e992",
+            "validation": "2e7ca590c25ef9e6"
+          },
+          "label_names": [
+            "not_equivalent",
+            "equivalent"
+          ],
+          "rows": {
+            "train": 3668,
+            "validation": 408
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "mrpc"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 10536,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "mrpc",
+        "training": {
+          "bf16": true,
+          "data_seed": 10536,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/mrpc_seed10536",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 10536,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 1.0
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "mrpc_seed90166": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "f2734b40d016e992",
+            "validation": "2e7ca590c25ef9e6"
+          },
+          "label_names": [
+            "not_equivalent",
+            "equivalent"
+          ],
+          "rows": {
+            "train": 3668,
+            "validation": 408
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "mrpc"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 90166,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "mrpc",
+        "training": {
+          "bf16": true,
+          "data_seed": 90166,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 100,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/mrpc_seed90166",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 90166,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 1.0
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "stsb_seed19": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "cde7d273338657dd",
+            "validation": "e1da63afce7a94ba"
+          },
+          "label_names": null,
+          "rows": {
+            "train": 5749,
+            "validation": 1500
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "stsb"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 19,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "stsb",
+        "training": {
+          "bf16": true,
+          "data_seed": 19,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 200,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/stsb",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 19,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 3e-06
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "stsb_seed8364": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "cde7d273338657dd",
+            "validation": "e1da63afce7a94ba"
+          },
+          "label_names": null,
+          "rows": {
+            "train": 5749,
+            "validation": 1500
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "stsb"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 8364,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "stsb",
+        "training": {
+          "bf16": true,
+          "data_seed": 8364,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 200,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/stsb_seed8364",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 8364,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 3e-06
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "stsb_seed717": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "cde7d273338657dd",
+            "validation": "e1da63afce7a94ba"
+          },
+          "label_names": null,
+          "rows": {
+            "train": 5749,
+            "validation": 1500
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "stsb"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 717,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "stsb",
+        "training": {
+          "bf16": true,
+          "data_seed": 717,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 200,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/stsb_seed717",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 717,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 3e-06
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "stsb_seed10536": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "cde7d273338657dd",
+            "validation": "e1da63afce7a94ba"
+          },
+          "label_names": null,
+          "rows": {
+            "train": 5749,
+            "validation": 1500
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "stsb"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 10536,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "stsb",
+        "training": {
+          "bf16": true,
+          "data_seed": 10536,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 200,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/stsb_seed10536",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 10536,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 3e-06
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    },
+    "stsb_seed90166": {
+      "experiment": {
+        "data": {
+          "fingerprints": {
+            "train": "cde7d273338657dd",
+            "validation": "e1da63afce7a94ba"
+          },
+          "label_names": null,
+          "rows": {
+            "train": 5749,
+            "validation": 1500
+          },
+          "source": {
+            "dataset": "nyu-mll/glue",
+            "max_length": 128,
+            "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          },
+          "task": "stsb"
+        },
+        "init_checkpoint": "run:glue/memsolve_bert_base_lion_m2_seed19_20261018/mnli/final",
+        "init_sha256": "a3f066752f58b5cf8193945d55c22cd0100ebc3206b8404868e8d807068f3c29",
+        "recipe": {
+          "betas": [
+            0.9,
+            0.98
+          ],
+          "dataset": "nyu-mll/glue",
+          "dataset_revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+          "epsilon": 1e-06,
+          "max_length": 128,
+          "protocol": "LION Table 8 M2-BASE; single-seed validation",
+          "seed": 90166,
+          "source": "https://arxiv.org/html/2502.16249v2#S0.T8",
+          "tasks": {
+            "cola": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 250,
+              "init": "mlm",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mnli": {
+              "batch_size": 48,
+              "epochs": 3,
+              "eval_steps": 2300,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 5e-06
+            },
+            "mrpc": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 8e-05
+            },
+            "qnli": {
+              "batch_size": 16,
+              "epochs": 10,
+              "eval_steps": 1000,
+              "init": "mlm",
+              "lr": 5e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-05
+            },
+            "qqp": {
+              "batch_size": 16,
+              "epochs": 5,
+              "eval_steps": 2000,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "rte": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 100,
+              "init": "mnli",
+              "lr": 1e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 1e-06
+            },
+            "sst2": {
+              "batch_size": 16,
+              "epochs": 3,
+              "eval_steps": 500,
+              "init": "mlm",
+              "lr": 3e-05,
+              "optimizer": "composer_adamw",
+              "weight_decay": 3e-06
+            },
+            "stsb": {
+              "batch_size": 32,
+              "epochs": 10,
+              "eval_steps": 200,
+              "init": "mnli",
+              "lr": 8e-05,
+              "optimizer": "adamw",
+              "weight_decay": 3e-06
+            }
+          },
+          "train_order": "sequential",
+          "warmup_ratio": 0.06
+        },
+        "source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "task": "stsb",
+        "training": {
+          "bf16": true,
+          "data_seed": 90166,
+          "dataloader_drop_last": false,
+          "dataloader_num_workers": 2,
+          "dataloader_persistent_workers": true,
+          "disable_tqdm": true,
+          "eval_steps": 200,
+          "eval_strategy": "steps",
+          "learning_rate": 8e-05,
+          "load_best_model_at_end": false,
+          "logging_first_step": true,
+          "logging_nan_inf_filter": false,
+          "logging_steps": 50,
+          "lr_scheduler_type": "linear",
+          "max_grad_norm": 0.0,
+          "max_steps": -1,
+          "num_train_epochs": 10,
+          "output_dir": "run:glue/memsolve_bert_base_lion_m2_multiseed_20261018/stsb_seed90166",
+          "per_device_eval_batch_size": 64,
+          "per_device_train_batch_size": 32,
+          "report_to": [],
+          "save_strategy": "epoch",
+          "save_total_limit": 1,
+          "seed": 90166,
+          "torch_compile": false,
+          "torch_compile_backend": null,
+          "torch_compile_mode": null,
+          "warmup_ratio": 0.06,
+          "weight_decay": 3e-06
+        }
+      },
+      "loading": {
+        "error_msgs": [],
+        "mismatched_keys": [
+          "classifier.bias",
+          "classifier.weight"
+        ],
+        "missing_keys": [],
+        "unexpected_keys": []
+      },
+      "versions": {
+        "accelerate": "1.15.0",
+        "datasets": "4.8.5",
+        "memsolve_source_sha256": "a4d3643886a0f23b50473c906ca097f6a6882c90ca3397436ff9226c3f045c99",
+        "mteb": "2.21.6",
+        "sentence-transformers": "5.7.0",
+        "torch": "2.14.0+cu132",
+        "transformers": "4.57.6"
+      }
+    }
+  }
+}

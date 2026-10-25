@@ -35,6 +35,62 @@ CONFIG_ROOT = (
 )
 
 
+def test_initialization_sync_preserves_non_tensor_contract(monkeypatch):
+    dist = pytest.importorskip("mmengine.dist")
+    from experiments.train_openmmlab import _init_and_sync_weights
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2))
+            self.register_buffer("counter", torch.tensor(0))
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.weight.fill_(3)
+                self.counter.fill_(1)
+
+        def get_extra_state(self):
+            return {"version": 7, "mode": "equilibrium"}
+
+    synced = []
+    monkeypatch.setattr(dist, "broadcast", lambda value: synced.append(value.clone()))
+    model = Model()
+    _init_and_sync_weights(model)
+    assert len(synced) == 2
+    torch.testing.assert_close(synced[0], torch.full((2,), 3.0))
+    assert synced[1].item() == 1
+    assert model.state_dict()["_extra_state"] == model.get_extra_state()
+
+
+@pytest.mark.cuda
+def test_dense_evaluation_uses_bf16_autocast():
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    class Parent(torch.nn.Linear):
+        def forward(self, inputs, data_samples=None, mode="tensor"):
+            return super().forward(inputs)
+
+        def val_step(self, data):
+            return self(data)
+
+        def test_step(self, data):
+            return self(data)
+
+    class Model(openmmlab._MaskAwareMixin, Parent):
+        pass
+
+    model = Model(8, 4).cuda()
+    inputs = torch.randn(2, 8, device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = model(inputs)
+    for step in (model.val_step, model.test_step):
+        actual = step(inputs)
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _tiny_imagenet_checkpoint(
     source: MemSolveViT,
     *,

@@ -30,7 +30,8 @@ class MemSolveViTBackbone(MemSolveViT):
                  conv_inplane: int = 64, deform_num_heads: int = 6,
                  deform_ratio: float = 1.0, cffn_ratio: float = 0.25,
                  n_points: int = 4, with_cp: bool = False,
-                 checkpoint: str | Path | None = None, checkpoint_weights: str = "auto"):
+                 checkpoint: str | Path | None = None, checkpoint_weights: str = "auto",
+                 compile_blocks: bool = False):
         spec = vision_spec(variant)
         if spec.depth % 4:
             raise ValueError("ViT-Adapter requires four equally sized block groups")
@@ -69,6 +70,22 @@ class MemSolveViTBackbone(MemSolveViT):
         nn.init.normal_(self.level_embed)
         if checkpoint is not None:
             self.load_pretrained(checkpoint)
+        if compile_blocks:
+            from memsolve import MemSolve
+            import torch._dynamo.config as dynamo_config
+            import torch._functorch.config as functorch_config
+
+            functorch_config.backward_pass_autocast = "off"
+            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 64)
+            for module in self.encoder.modules():
+                if isinstance(module, MemSolve):
+                    module.forward = torch.compiler.disable(module.forward)
+            # Fuse the surrounding blocks while retaining the native mixer boundary.
+            # Detection batches have varying spatial shapes; do not cache CUDA graphs.
+            for block in self.encoder.blocks:
+                block.compile(dynamic=True, fullgraph=False,
+                              options={"triton.cudagraphs": False,
+                                       "emulate_precision_casts": True})
 
     @staticmethod
     def _init_adapter(module):
@@ -174,6 +191,18 @@ def _pixel_valid_mask(
 
 class _MaskAwareMixin:
     """Thread OpenMMLab's per-image shape metadata into the token mixer."""
+
+    def val_step(self, data):
+        device = next(self.parameters()).device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                            enabled=device.type == "cuda"):
+            return super().val_step(data)
+
+    def test_step(self, data):
+        device = next(self.parameters()).device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                            enabled=device.type == "cuda"):
+            return super().test_step(data)
 
     _memsolve_valid_mask: torch.Tensor | None = None
 

@@ -57,7 +57,16 @@ Defaults target **two GPUs, eight images per GPU**, with four persistent loader
 workers per GPU. This preserves the upstream global batch of 16 (originally
 eight GPUs × two images). `with_cp=True` checkpoints encoder blocks and
 injector/extractor branches if memory requires it; spatial-prior BatchNorm is
-not recomputed. No training has been launched to establish throughput yet.
+not recomputed. Runtime batch and throughput measurements are recorded with
+each run rather than changing these recipe defaults.
+
+`model.backbone.compile_blocks=True` enables dynamic-shape `torch.compile`
+for the encoder blocks. The native MemSolve implementation stays outside
+compiler tracing, and `emulate_precision_casts` preserves intermediate BF16
+rounding. CUDA Graphs are disabled for this path: the detection integration's
+graph-enabled backward crashed in the local runtime probe. The compile-only
+path passed rectangular-shape forward and gradient comparisons. This option
+does not compile the variable-length proposal and RoI pipelines.
 
 FP32 weights and **BF16 autocast** are used instead of the upstream FP16 runner.
 MemSolve keeps its own mixed-precision numerical contract. Deformable sampling
@@ -66,7 +75,10 @@ projections remain under autocast. The detection wrappers likewise use FP32
 RoIAlign and cast final RPN/box predictions to FP32 before box decoding/NMS:
 MMCV 2.1 lacks BF16 RoIAlign and requires matching NMS dtypes. Head convolutions
 and linear layers still run under BF16 autocast. BF16 gradient scaling is
-disabled. The CPU grid-sample implementation is the
+disabled. Validation and test steps explicitly use BF16 autocast as well;
+MMEngine's default FP32 evaluation loop does not supply it. Initialization
+synchronizes tensor weights and buffers across ranks while retaining the
+operator's dictionary metadata in checkpoints. The CPU grid-sample implementation is the
 upstream reference, not a silent CUDA fallback.
 
 ## Checkpoints and padding

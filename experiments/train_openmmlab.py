@@ -192,6 +192,18 @@ def _require_openmmlab_runtime(default_scope: str) -> None:
         )
 
 
+def _init_and_sync_weights(model: Any) -> None:
+    import torch
+    from mmengine.dist import broadcast
+
+    if hasattr(model, "init_weights"):
+        model.init_weights()
+        # Operator contracts stay in checkpoints; only tensors need NCCL.
+        for value in model.state_dict().values():
+            if isinstance(value, torch.Tensor):
+                broadcast(value)
+
+
 def main() -> None:
     args = parse_args()
     if str(ROOT) not in sys.path:
@@ -199,6 +211,13 @@ def main() -> None:
 
     from mmengine.config import Config
     from mmengine.runner import Runner
+
+    class TensorStateRunner(Runner):
+        def _init_model_weights(self):
+            from mmengine.model import is_model_wrapper
+
+            model = self.model.module if is_model_wrapper(self.model) else self.model
+            _init_and_sync_weights(model)
 
     config_path = args.config.expanduser().resolve()
     if not config_path.is_file():
@@ -231,7 +250,7 @@ def main() -> None:
 
     _require_openmmlab_runtime(str(cfg.default_scope))
     _load_cuda_backend(cfg)
-    runner = Runner.from_cfg(cfg)
+    runner = TensorStateRunner.from_cfg(cfg)
     if evaluation_only:
         runner.test()
     else:

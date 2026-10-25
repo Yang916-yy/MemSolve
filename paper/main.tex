@@ -70,16 +70,18 @@ However, LION's bidirectional DeltaNet recurrences and equivalent chunkwise
 form correct prefix and suffix memories separately.
 The direct full-attention form requires a sequence-sized matrix inverse,
 whose cubic cost undermines the efficiency of compact memory.
-We propose MemSolve, which directly solves a joint error-correction problem
-over all positions to build a compact equilibrium memory.
-Writing and reading this memory use the full context,
-coupling information on both sides of each token.
+We propose MemSolve, which lets association errors at all positions jointly
+determine a memory and directly solves for its equilibrium.
+All tokens contribute, but the solve stays in compact memory space:
+its dimension does not grow with sequence length.
+Memory writes and reads depend on the full context, so changing one token
+can change interactions between other tokens.
 We prove that single-layer bidirectional scans with local parameterization
 and linear merging cannot represent all such interactions.
 Our analysis also establishes a unique equilibrium and a contractive readout
 for each fixed write--read frame.
-Our hardware-aware algorithm supports exact sequence parallelism across devices
-and linear sequence complexity at fixed rank.
+Parallel reductions and readouts yield linear sequence complexity at fixed
+rank and support exact sequence parallelism across devices.
 At 8,192 tokens, its complete mixer is $7.5\times$ faster than FlashAttention
 and $7.9\times$ faster than BiMamba in single-GPU forward--backward execution.
 On ImageNet-1K, our Base model reaches $82.7\%$ Top-1 with a plain
@@ -131,26 +133,36 @@ all associations act on one
 memory state, whose equilibrium is solved directly rather than approached
 through a finite number of inner updates.
 
-The challenge is to retain the efficiency of compact memory.
-LION's bidirectional DeltaNet recurrences correct prefix and suffix
-memories separately; an equivalent chunkwise computation preserves these
-updates \cite{afzal2025lion}.
+The challenge is computational cost.
+Recurrence processes sequences efficiently by updating a compact state
+step by step. Directly solving for a memory determined by all associations
+appears more expensive.
+LION's bidirectional DeltaNet recurrences and equivalent chunkwise form
+correct prefix and suffix memories separately \cite{afzal2025lion}.
 The direct full-attention form discussed there requires a sequence-sized
-matrix inverse, whose cubic cost undermines that efficiency.
-A joint error-correction design must therefore address both how
-associations determine memory and how that memory is computed.
+matrix inverse, whose cubic cost undermines the efficiency of compact memory.
 
-We propose \textbf{MemSolve}, which jointly designs full-context error
-correction and token readout. It directly solves for a compact equilibrium
-memory, then reads this memory back as a low-rank contextual correction
-to token content. Our main contributions are as follows.
+We propose \textbf{MemSolve}, which builds memory through a joint solve
+over the full context. We design the error-correction equation and token
+readout together to keep the solve in compact memory space.
+All positions contribute associations in parallel, then read context
+from the resulting equilibrium.
+The global solve thus retains linear sequence complexity at fixed rank
+while exposing substantial parallelism.
+On long sequences, the optimized implementation delivers faster
+forward--backward execution than established attention and bidirectional-scan
+implementations (\S\ref{sec:efficiency}).
+Our main contributions are as follows.
 
 \paragraph{Global Equilibrium ($\S$\ref{sec:joint-memory}, $\S$\ref{sec:readout}).}
-An input-dependent soft frame provides shared write--read coordinates.
+We combine error corrections from all positions in one memory equation
+and jointly design its token readout.
+An input-dependent soft frame determines how associations enter memory
+and how its response returns to tokens.
 A matching regularizer reduces the memory equation to a learned compact
 core shared across inputs. An accretive parameterization guarantees a
-unique equilibrium. The same frame reads the solution back to tokens.
-The readout combines a content branch with a low-rank contextual correction.
+unique equilibrium.
+The readout adds a low-rank contextual correction to a content branch.
 For each fixed frame, we prove that the token map is contractive and
 compute its exact singular values in compact space.
 
@@ -193,8 +205,9 @@ GLUE development score of $81.9$.
 \label{sec:background}
 
 Error-correcting memories learn associations by revising their predictions.
-We first express this update as internal learning, then consider how to
-use all associations jointly when the full context is available.
+These updates can be viewed as training an internal predictor.
+When the full context is available, all associations can train the same
+memory jointly.
 
 \subsection{Learning and refining associations}
 
@@ -223,8 +236,11 @@ Equation~\eqref{eq:delta-background} is also a gradient step on
  \label{eq:association-loss}
 \end{equation}
 whose gradient is $-k_i(c_i-U^\T k_i)^\T$.
-Each token thus supplies a training example for an internal predictor.
-The sequential update evaluates its error at the state reached so far.
+Each token thus supplies an association for the memory to learn.
+Sequential updates evaluate each error at the current memory state,
+so earlier updates affect later errors.
+When the full context is available, we can instead evaluate all
+associations at the same state and solve for their joint equilibrium.
 
 \subsection{From sequential updates to full-batch learning}
 
@@ -248,10 +264,11 @@ ViT$^3$ finds full-batch updates more effective in its vision experiments.
 Further inner passes can improve accuracy, but reduce throughput and
 can introduce training instability.
 
-Full-batch updates and direct solves suggest a common direction:
-evaluate all association errors at one state and solve for their balance.
-Section~\ref{sec:method} develops this joint error-correction problem
-together with its token readout.
+Full-batch updates let all associations contribute at the same state;
+direct solves provide a way to obtain an equilibrium.
+Combining these ideas requires a memory equation determined by the full
+context yet tractable in compact space.
+Section~\ref{sec:method} designs this equation together with its token readout.
 
 \subsection{Bidirectional access and token interactions}
 
@@ -282,10 +299,12 @@ token interactions while keeping the memory solve compact.
 \label{sec:method}
 \label{sec:theory}
 
-MemSolve jointly designs the memory equation and its token readout.
-An input-dependent frame supplies their shared coordinates.
-We match the regularizer to this frame so that the equilibrium uses a
-learned compact core shared across inputs.
+MemSolve jointly designs the memory equation and token readout.
+Matching the regularizer to the write--read coordinates yields a shared
+compact system with a unique equilibrium.
+The same coordinates carry its response back to tokens.
+This construction controls the readout gain while allowing the full
+context to determine token interactions.
 All equations describe one head with $N$ valid tokens, rank $r$, and
 content width $h$. The theoretical results use exact arithmetic.
 Appendix~\ref{app:proofs} gives the full proofs.
@@ -321,12 +340,34 @@ $\Gamma_X$ and a learned skew-symmetric coupling $\Omega$:
  \dot U=P^\T(C-PU)-\Gamma_X U-\Omega U.
  \label{eq:joint-field}
 \end{equation}
-The regularizer damps the memory. The skew term couples its coordinates.
-Its contribution to the change in squared memory norm is zero:
+The regularizer damps the memory. The skew term couples its coordinates
+without directly changing the squared memory norm:
 $\langle U,\Omega U\rangle_F=0$.
 MemSolve obtains the memory by solving for the equilibrium of this field.
-The next step is to construct $P$ and $\Gamma_X$ so that this solve is
-well posed and its core can be shared across inputs.
+Setting $\dot U=0$ gives
+\begin{equation}
+ (P^\T P+\Gamma_X+\Omega)U^\star=P^\T C.
+ \label{eq:joint-equilibrium}
+\end{equation}
+The Gram term $P^\T P$ varies with the input.
+We match the regularizer to this term so that samples share the system
+matrix $\I_r+J$, while $P^\T C$ determines their individual memory states.
+Each head learns
+\begin{equation}
+ J=LL^\T+\Omega,\qquad LL^\T\succ0,\qquad\Omega^\T=-\Omega.
+ \label{eq:core}
+\end{equation}
+Its symmetric part is positive definite, so $J$ is strictly accretive.
+We use a lower triangular $L$ with positive diagonal; the unconstrained
+parameterization is given in Appendix~\ref{app:parameters}.
+Matching the coefficients in Eq.~\eqref{eq:joint-equilibrium} to
+$\I_r+J$ determines the regularizer:
+\begin{equation}
+ \Gamma_X=\I_r+LL^\T-P^\T P.
+ \label{eq:gamma}
+\end{equation}
+To keep this regularizer positive definite for every input, we construct
+the coordinates so that $P^\T P\prec\I_r$.
 
 A learned projection produces relation features $B\in\R^{N\times r}$
 and content $C$ from the input $X$. Define
@@ -340,45 +381,29 @@ and content $C$ from the input $X$. Define
 Here $R$ is the upper Cholesky factor with positive diagonal.
 Scaling by $\sqrt N$ makes $A^\T A$ an average relation second moment.
 The identity term keeps the factorization positive definite and ensures
-$\norm{P}_2<1$. We call $P$ a \emph{soft frame}: it provides shared
-write--read coordinates with bounded gain. Appendix~\ref{app:frame}
-gives its singular values and geometry.
+$P^\T P\prec\I_r$.
+It follows that $\Gamma_X\succ0$, completing the matched construction.
+The same normalization gives bounded write--read coordinates; we call
+$P$ a \emph{soft frame}.
+Appendix~\ref{app:frame} gives the frame's singular values and geometry.
 
-Each head learns a core shared across samples:
-\begin{equation}
- J=LL^\T+\Omega,\qquad LL^\T\succ0,\qquad\Omega^\T=-\Omega.
- \label{eq:core}
-\end{equation}
-Its symmetric part is positive definite, so $J$ is strictly accretive.
-We use a lower triangular $L$ with positive diagonal; the unconstrained
-parameterization is given in Appendix~\ref{app:parameters}.
-We couple the regularizer to the frame:
-\begin{equation}
- \Gamma_X=\I_r+LL^\T-P^\T P\succ0.
- \label{eq:gamma}
-\end{equation}
-Positivity follows from $P^\T P\prec\I_r$.
-This choice cancels the frame Gram term in Eq.~\eqref{eq:joint-field}:
+Substituting the matching regularizer cancels the frame Gram term:
 \begin{equation}
  \dot U=Z-(P^\T P+\Gamma_X+\Omega)U
        =Z-(\I_r+J)U.
  \label{eq:dynamics}
 \end{equation}
-The equilibrium and its reflected map are therefore
+The equilibrium is therefore
 \begin{equation}
- \begin{aligned}
- U^\star&=(\I_r+J)^{-1}Z,\\
- F&=2(\I_r+J)^{-1}-\I_r\\
-  &=(\I_r+J)^{-1}(\I_r-J).
- \end{aligned}
+ U^\star=(\I_r+J)^{-1}Z.
  \label{eq:solve}
 \end{equation}
 Here and below, inverse notation denotes a linear solve.
-This cancellation removes the input dependence from the system matrix,
-while retaining it in the memory coordinates and aggregated content.
-Each input supplies its own $P$, $Z$, and $U^\star$.
-The learned $J$ and $F$ are shared, so one core factorization serves the
-batch. The frame factorization remains input-dependent.
+The batch now shares one core system.
+Each input still determines its memory $U^\star$ through its own frame
+$P$ and aggregated content $Z$.
+The core is factored once per head; the frame normalization is computed
+for each input. Both factorizations stay in compact space.
 
 The accretive core guarantees a unique memory and bounds its response
 to perturbations.
@@ -413,9 +438,25 @@ gradient of this scalar objective.
 \label{sec:readout}
 \label{sec:stability}
 
-The readout returns memory through the same frame used for writing.
-We use the reflected response $2U^\star-Z=FZ$ and combine it with
-a complementary content response:
+To let the compact response both preserve and reverse content directions,
+we use the reflected equilibrium $2U^\star-Z=FZ$, where
+\begin{equation}
+ \begin{aligned}
+ F&=2(\I_r+J)^{-1}-\I_r\\
+  &=(\I_r+J)^{-1}(\I_r-J).
+ \end{aligned}
+ \label{eq:reflection}
+\end{equation}
+The scalar case illustrates the role of this reflection: for $j>0$,
+the solve response $(1+j)^{-1}$ lies in $(0,1)$, whereas
+$(1-j)/(1+j)$ ranges over $(-1,1)$.
+For matrices, this Cayley parameterization covers every real strict
+contraction in compact space, including nonsymmetric responses
+(Appendix~\ref{app:coverage}).
+
+Returning $FZ$ through $P$ acts only within the relation span.
+We retain a complementary content response to carry information outside
+that span and extend gain control to token space:
 \begin{align}
  Y&=\eta(\I_N-PP^\T)C+PFP^\T C\\
  &=\underbrace{\eta C}_{\text{content}}
@@ -424,14 +465,15 @@ a complementary content response:
 \end{align}
 Here $\eta=\tanh(\eta_{\rm raw})\in(-1,1)$ is learned per head.
 Equivalently, $Y=\eta C+P[2U^\star-(1+\eta)Z]$.
-The reflection produces a strict contraction $F$.
-The complementary term extends this gain bound to token space
-(Theorem~\ref{thm:contraction}). The resulting output is a content
-branch plus a contextual correction of rank at most $r$.
+The first form combines the compact and complementary responses.
+The second exposes a token-local content path and a contextual correction
+of rank at most $r$, which we exploit in Section~\ref{sec:implementation}.
+The following theorem shows that the combined readout inherits the
+compact gain bound for each fixed frame.
 
 \begin{theorem}[Contractive compact and token maps]
 \label{thm:contraction}
-The map $F$ in Eq.~\eqref{eq:solve} satisfies
+The map $F$ in Eq.~\eqref{eq:reflection} satisfies
 \begin{equation}
  \I_r-F^\T F=4(\I_r+J)^{-\T}LL^\T(\I_r+J)^{-1}\succ0.
 \end{equation}
@@ -464,9 +506,6 @@ It does not bound derivatives through $P(X)$ or the surrounding residual
 block. Within this map, the content path retains a scaled response
 outside the relation span. The contextual correction acts within that span.
 
-The shared frame permits nonsymmetric interactions through $F$.
-Indeed, the accretive Cayley parameterization covers every real strict
-contraction in $r$ dimensions (Appendix~\ref{app:coverage}).
 The token map retains its rank and shared-frame constraints.
 Its exact singular values can be recovered from a matrix of size at most
 $r$, together with the complementary content response
@@ -503,13 +542,25 @@ gain bound. Appendix~\ref{app:rove} gives the compact computation and settings.
 \subsection{Interactions beyond independent directional scans}
 \label{sec:ssm}
 
-The preceding analysis fixes the frame and studies the readout.
-We now examine the token interactions that arise as the frame changes
-with the input.
+Sharing the core does not fix the interactions between tokens.
+The full context determines the frame, so changing one token can alter
+how another token contributes to a third.
+This input dependence remains even when the learned core response is zero.
 
-We compare MemSolve with a single bidirectional state-space mixer whose
-coefficients depend on the current token and whose directional outputs
-merge linearly:
+Consider three tokens with $A=(1,1,t)^\T$,
+$C=(s,0,0)^\T$, $F=0$, and $\eta\ne0$.
+Equation~\eqref{eq:complement} gives
+\begin{equation}
+ y_2=-\frac{\eta s}{3+t^2}.
+ \label{eq:cross-context}
+\end{equation}
+The first two tokens stay fixed as $t$ varies.
+Changing only the third token changes the coefficient $-\eta/(3+t^2)$
+that carries the first token's content to the second.
+
+To formalize this distinction, consider a single bidirectional state-space
+mixer. Its coefficients depend on the current token, and its directional
+outputs merge linearly:
 \begin{equation}
  \begin{aligned}
  h_i^+&=A^+(x_i)h_{i-1}^++b^+(x_i),\\
@@ -533,17 +584,6 @@ that mixer's state dimension. The result holds for both Equilibrium and
 Complement.
 \end{theorem}
 
-The proof uses three tokens. Set $A=(1,1,t)^\T$,
-$C=(s,0,0)^\T$, $F=0$, and $\eta\ne0$.
-Equation~\eqref{eq:complement} gives
-\begin{equation}
- y_2=-\frac{\eta s}{3+t^2}.
- \label{eq:cross-context}
-\end{equation}
-The first two tokens stay fixed as $t$ varies.
-Changing only the third token changes the coefficient $-\eta/(3+t^2)$
-that carries the first token's content to the second.
-
 For the four choices $(s,t)\in\{0,1\}^2$, the mixed finite difference
 $y_2(1,1)-y_2(1,0)-y_2(0,1)+y_2(0,0)$ is $\eta/12$ for
 Eq.~\eqref{eq:cross-context} and zero for every additive prefix--suffix
@@ -555,10 +595,10 @@ merges, and globally conditioned coefficients define different model classes.
 \section{Hardware-Aware Parallel Computation}
 \label{sec:implementation}
 
-The mathematical construction uses a token-sized frame $P$.
-Our algorithm avoids storing this matrix. It reduces the input to two
-compact statistics, solves in memory space, and reads out token rows
-in parallel.
+Equation~\eqref{eq:readout} separates a token-local content path from a
+low-rank contextual correction. We evaluate the latter through two
+compact statistics, eliminating explicit frame storage.
+Their additive structure also leads directly to exact sequence parallelism.
 
 \subsection{Reduce, solve, and read out}
 
@@ -572,10 +612,12 @@ Substituting $P=AR^{-1}$ into Eq.~\eqref{eq:readout} gives
  \end{aligned}
  \label{eq:nop}
 \end{equation}
-The Gram statistic $G$ determines the frame normalization, while $H$
-aggregates relation--content associations.
-Together they determine $W$. Once $W$ is available, each output row
-uses only its local rows of $A$ and $C$.
+The statistic $G$ collects relation second moments and determines the
+frame normalization; $H$ collects relation--content associations.
+Together they determine the compact readout matrix $W$.
+The full context thus enters the solve through these statistics.
+Each token then needs only its own relation and content rows to read
+out the result.
 Algorithm~\ref{alg:compact-forward} gives this computation.
 Equilibrium and Complement use the same steps; Complement takes $F=0$.
 
@@ -598,6 +640,9 @@ Equilibrium and Complement use the same steps; Complement takes $F=0$.
 The learned $F$ is evaluated once per head in each forward pass.
 Each sample then requires $O(Nr^2+Nrh+r^3+r^2h)$ arithmetic and
 $O(r^2+rh)$ compact storage per head. Token storage is linear in $N$.
+Longer sequences increase the work in reductions and readouts without
+enlarging the compact systems. The cost is therefore linear in sequence
+length at fixed rank and width.
 Input and output projections also have linear sequence cost at fixed width.
 For physical length $N\le r$, an equivalent token-space solve avoids
 subtraction in the complementary term. Its dimension is at most $r$.
@@ -657,6 +702,13 @@ BF16 residual word \cite{henry2019bfloat}. Both products accumulate in FP32
 before output rounding. This improves coefficient precision while retaining
 Tensor Core products. Appendix~\ref{app:precision} specifies precision,
 scheduling, and the surrounding compilation and CUDA Graph execution.
+
+The optimized global solve also accelerates training computation on short
+visual sequences. At the 196-token Small and Base visual shapes,
+complete-mixer forward--backward execution is $1.1$--$1.4\times$ faster
+than FlashAttention and $8.4$--$12.5\times$ faster than BiMamba on one GPU.
+Section~\ref{sec:efficiency} compares latency and memory across model
+shapes and sequence lengths.
 
 \begin{figure*}[t]
 \centering
@@ -1009,9 +1061,8 @@ experimental protocols. It is organized as follows:
 \section{Proofs and Structural Details}
 \label{app:proofs}
 
-We first establish the frame geometry. It gives the positive regularizer
-used in the memory equation. We then prove existence, contraction, and
-the compact spectrum, followed by the bidirectional-scan separation.
+The soft-frame bound $P^\T P\prec\I_r$ ensures that the matched regularizer
+is positive definite and underlies the token contraction proof.
 
 \subsection{Soft-frame geometry}
 \label{app:frame}
@@ -1167,10 +1218,9 @@ by Eq.~\eqref{eq:ssm-class}.
 \section{Algorithms and Numerical Details}
 \label{app:implementation}
 
-This appendix gives the core parameterization, the masked forward pass,
-and the analytic backward. It then specifies sequence-parallel reductions
-and floating-point execution. The pseudocode describes exact arithmetic;
-Section~\ref{app:precision} explains how the GPU kernels evaluate it.
+The algorithms below describe MemSolve in exact arithmetic, including
+masking and sequence-parallel reductions.
+Section~\ref{app:precision} specifies their floating-point GPU implementation.
 
 \subsection{Core parameters and initialization}
 \label{app:parameters}
@@ -1433,7 +1483,7 @@ complementary readout.
 The completed training runs used NVIDIA A800-SXM4-80GB GPUs, PyTorch
 2.14.0 with CUDA 13.2, and timm 1.0.29. Compilation fuses surrounding
 operations; CUDA Graph replay reduces launch overhead. These execution
-choices do not alter Eqs.~\eqref{eq:frame}--\eqref{eq:readout}.
+choices do not alter the operator in Section~\ref{sec:method}.
 
 \subsection{Optional rotary value encoding}
 \label{app:rove}

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import ast
 import copy
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import memsolve
 from memsolve import CoreMode, MemSolve, MemSolveConfig
+from memsolve.ball import CoreMode as BallCoreMode
+from memsolve.ball import MemSolve as BallMemSolve
+from memsolve.ball import MemSolveConfig as BallConfig
 from memsolve.ball.reference import (
     accretive_equilibrium_mix,
     accretive_generator,
@@ -20,6 +26,37 @@ from memsolve.ball.reference import (
 
 
 pytestmark = pytest.mark.core
+
+
+def test_public_api_is_narrow() -> None:
+    assert CoreMode is BallCoreMode
+    assert MemSolve is BallMemSolve
+    assert MemSolveConfig is BallConfig
+    assert set(memsolve.__all__) == {
+        "CoreMode",
+        "MemSolve",
+        "MemSolveConfig",
+        "__version__",
+    }
+    assert memsolve.__version__ == "0.15.0"
+
+
+@pytest.mark.repository
+def test_repository_contract() -> None:
+    package = Path(memsolve.__file__).resolve().parent
+    assert {p.name for p in package.iterdir() if p.name != "__pycache__"} == {
+        "__init__.py", "ball", "py.typed",
+    }
+    assert {p.name for p in (package / "ball").iterdir() if p.name != "__pycache__"} == {
+        "__init__.py", "config.py", "cuda.py", "model.py", "reference.py",
+    }
+    owners = [
+        p.relative_to(package).as_posix()
+        for p in package.rglob("*.py")
+        for node in ast.walk(ast.parse(p.read_text()))
+        if isinstance(node, ast.ClassDef) and node.name == "MemSolve"
+    ]
+    assert owners == ["ball/model.py"]
 
 
 def _reference_unmasked_output(layer: MemSolve, x: torch.Tensor) -> torch.Tensor:

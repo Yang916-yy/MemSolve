@@ -1,7 +1,23 @@
 # Tests
 
+The suite has 11 files grouped into four domains. Parametrized ranks, modes,
+shapes, and dtypes create multiple test cases within each file.
+
+Use pytest directly; no separate test launcher is needed:
+
+```bash
+# Collect case names without executing tests.
+python -m pytest --collect-only -q
+# CPU checks across installed integrations.
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 python -m pytest -q -m 'not cuda'
+# One numerical behavior across its parameter combinations.
+python -m pytest tests/cuda -k 'inverse_factor' -q
+```
+
 Run the smallest scope covering the change. Optional integrations need their
-matching dependencies; use `-rs` to inspect skipped checks.
+matching dependencies; use `-rs` to inspect skipped checks. Public API and
+package ownership checks live in `core/test_model.py`; GLUE checks live in
+`experiments/test_nlp.py`. Retrieval extras are only required by retrieval tests.
 
 | Scope | Command | Coverage |
 | --- | --- | --- |
@@ -9,13 +25,11 @@ matching dependencies; use `-rs` to inspect skipped checks.
 | CUDA | `python -m pytest tests/cuda` | Native math, masks, ranks, gradients, Graphs, sequence parallelism |
 | Integrations | `python -m pytest tests/integrations -m "not cuda"` | timm, BERT, OpenMMLab adapters |
 | Experiments | `python -m pytest tests/experiments -m "not cuda"` | Data, losses, training, evaluation, resume |
-| Repository | `python -m pytest tests/repository` | Package layout and operator ownership |
 
 For CPU-only checks while training is active:
 
 ```bash
-CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 python -m pytest -q tests/core tests/repository -m 'not cuda'
-python tools/check_repository.py
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=2 python -m pytest -q tests/core -m 'not cuda'
 git diff --check
 ```
 

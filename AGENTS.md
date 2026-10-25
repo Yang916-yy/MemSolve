@@ -85,13 +85,13 @@ informed.
   probes, performance exploration, downloaded fixtures, and generated outputs
   out of Git.
 - Run the narrow test domain for the boundary changed: `tests/core`,
-  `tests/cuda`, `tests/integrations`, `tests/experiments`, or
-  `tests/repository`. Use `-m "not cuda"` when a CPU-only check is sufficient.
+  `tests/cuda`, `tests/integrations`, or `tests/experiments`.
+  Use `-m "not cuda"` when a CPU-only check is sufficient.
 - Core math changes require the relevant `tests/core` checks and CUDA oracle
   checks when the CUDA path is affected. CUDA changes require `tests/cuda`
   and the corresponding reference comparison. Integration and experiment
   changes require their own domain.
-- Run `python tools/check_repository.py` after package or repository-layout
-  changes. Run `pytest -q` only before a release, a broad refactor, or a change
-  crossing multiple domains.
+- Run `python -m pytest tests/core/test_model.py -k repository_contract`
+  after package or repository-layout changes. Run `pytest -q` only before a
+  release, a broad refactor, or a change crossing multiple domains.
 - Report residual limitations plainly instead of adding speculative machinery.

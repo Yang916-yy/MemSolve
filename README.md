@@ -144,7 +144,8 @@ BiMamba requires its upstream package and compiled kernels. Use
 `--bimamba-module` for an alternate installation module, `--mode forward`
 for inference, and `--profile` for kernel inspection.
 
-The [test guide](tests/README.md) lists focused correctness checks.
+The [test guide](tests/README.md) groups 11 test files into four domains;
+`python -m pytest -q` is the common verification entrypoint.
 [Sequence experiments](docs/SEQUENCE_EXPERIMENTS.md) retain the reusable
 GenomicBenchmarks and LRA loaders and matched-encoder runner.
 

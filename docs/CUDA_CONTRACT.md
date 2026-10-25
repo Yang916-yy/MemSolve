@@ -1,6 +1,6 @@
 # CUDA contract
 
-The current no-RankRotary operator supports `equilibrium` (default) and
+The operator supports `equilibrium` (default) and
 `complement`. Model contract **26**, native ABI **17**, and the installed
 PyTorch build must match. The source equations are owned by
 [`reference.py`](../memsolve/ball/reference.py); CUDA never changes the model or
@@ -61,8 +61,7 @@ Y = eta C + A W
 
 This is exactly the reference with `P=A R^-1`. F is rebuilt every forward,
 shared across samples, and never cached across optimizer updates. Complement
-omits core construction and LU entirely. No content-conditioned generator or
-materialized-frame CUDA implementation remains.
+omits core construction and LU entirely. Neither mode materializes the token-sized frame.
 
 For physical `N <= r`, the base uses the smaller token system
 `eta solve(I+A A^T, C)`. It avoids subtracting nearly equal terms when strong
@@ -181,12 +180,9 @@ Without RoVE, the input VJP at ranks 16/32 uses 128-token by 32-channel tiles;
 ranks 48/64 use 128-token by 16-channel tiles. RoVE uses 128-token by 16-channel
 tiles at all four ranks. Its three BF16 products reuse one FP32 accumulator.
 This reduces the register spills introduced by fused rotations, without changing
-the mathematical terms or their precision. RoVE's direct relation-gradient term
-is computed before loading the content
-and cross-adjoint operands. This shortens their overlapping live ranges: on
-SM80, r48/r64 token-VJP spill counts drop from 66/62 to 26/24 at 128 tokens,
-64 content channels and four warps. Remaining spills are measured rather than
-eliminated by indiscriminately increasing warp count. Nonmultiple tails are masked. Compact shared-map
+the mathematical terms or their precision. RoVE's direct relation-gradient term is computed before loading content and
+cross-adjoint operands to shorten live ranges. Nonmultiple tails are masked.
+Compact shared-map
 products fuse the subtraction of eta times state into their FP32 epilogue.
 The shared-map adjoint reduces the already-needed H across samples. Its
 [B,H,r,r] storage is temporary and reused for the Cholesky adjoint. The
@@ -209,9 +205,7 @@ training retains it unchanged.
 The fused Cholesky adjoint accumulates its two products serially with 16-wide
 inner tiles, four warps and one stage. This shortens operand lifetimes; SM80
 resource checks at ranks 16/32/48/64 show no register spills in this kernel or
-the tested compact GEMMs. Larger warp counts were slower in module benchmarks
-and are not retained. Other architectures still need resource/performance
-validation.
+the tested compact GEMMs. Other architectures require resource/performance validation.
 
 The CUDA projection fuses weight and bias gradients when both consume the same
 BF16 upstream tensor and both parameters require gradients. FP16/FP32 upstream
@@ -222,8 +216,7 @@ workspace is allocator-owned and CUDA Graph compatible. Host plans are cached
 per thread/device/shape/input alignment, with a bounded 256-entry cache. Each
 call refreshes the bias pointer; captured graphs retain their own launch
 arguments, and the cache owns no tensor storage. The workspace limit remains
-32 MiB; allocation uses the selected algorithm's actual requirement. Reducing
-that limit did not preserve performance across tested layouts.
+32 MiB; allocation uses the selected algorithm's actual requirement.
 Reference projections remain independent of this native optimization. Forward
 projection bias fusion follows the
 [Triton matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html).
@@ -303,18 +296,12 @@ Tests cover all supported ranks, masks, short/long shapes, nonzero learned
 cores, and Graph replay after input/parameter updates. These fixture budgets
 are not universal bounds on arbitrarily ill-conditioned problems.
 
-An existing extended high-amplitude fixture has a 1% forward budget, predating
-this mode cleanup. Tolerances are not loosened by removing the generator or
-renaming the retained modes.
+The extended high-amplitude fixture uses a 1% forward budget.
 
-TODO: when physical N exceeds rank but only a few tokens are valid, strong
-relations can cause cancellation in the rank-space complement. A historical
-BF16 probe with N=197, r=32, one valid token and relation scale 64 had 9.93%
-relative output error but maximum absolute error 5.97e-7; at scale 8 the relative
-error was 0.187%. This applies to the shared base in both modes. Revisit its
-stable evaluation and gradients before very sparse-mask workloads. Current
-224px mean-pooling image models use 196 valid patches. No sparse-mask threshold,
-FP64 production path, or fallback has been introduced.
+When physical N exceeds rank but only a few tokens are valid, strong relations
+can amplify relative error through cancellation in the rank-space complement.
+Both modes share this boundary. Very sparse-mask workloads need their own
+forward and gradient checks; the dense-image setting uses 196 valid patches.
 
 ## Build and runtime artifacts
 
@@ -333,126 +320,39 @@ list; the build script defaults to all seven targets when it is unset.
 
 Device LTO builds one executable image per target. The loader chooses
 `memsolve_equilibrium_sm<arch>.so` and enforces a matching architecture per
-process. Targets are SM80/86/87/89/90/100/120 (SM121 selects SM120); this update
-was built and exercised on SM80/A800. Other targets require hardware validation.
+process. Targets are SM80/86/87/89/90/100/120 (SM121 selects SM120); the implementation
+has been built and exercised on SM80/A800. Other targets require hardware validation.
 Mixed architectures in one process are rejected. Native kernels verify the
 compiled architecture before launch.
 
 `tools/package_cuda_runtime.py` requires all seven artifacts and records exact
 source/native versions, Torch/CUDA versions, and the C++ ABI. Packaged artifacts
 must match these checks. It removes build-host RPATH/RUNPATH and rejects GLIBC
-requirements above 2.31. All earlier native artifacts must be rebuilt for ABI 17;
-historical training source snapshots keep their own binaries and remain separate.
+requirements above 2.31. Build artifacts must match ABI 17.
 
-## Upstream sources and precision decisions
+## Upstream implementations
 
-- [Selective triangular inversion (IPDPS 2017)](https://arxiv.org/abs/1612.01855):
-  reuse an inverse factor to expose parallel GEMMs instead of repeatedly
-  traversing triangular dependencies. Both modes use this organization.
-- [Cholesky differentiation (Murray)](https://arxiv.org/abs/1602.07527):
-  organize the compact VJP around the symmetric lower projection. MemSolve's
-  reuse of H across core, eta, and Gram adjoints follows its own algebra.
-- [cuBLASDx dependent GEMM fusion](https://docs.nvidia.com/cuda/cublasdx/examples.html):
-  informed a larger compact-chain fusion prototype. It regressed wide ranks
-  on SM80, so only profitable local fusion is retained.
-- [TSQR](https://arxiv.org/abs/0806.2159): an equivalent positive-diagonal tree QR
-  of the relation blocks, adding the identity regularizer once, was tested.
-  The mature PyTorch QR prototype was slower than the tiled Gram/inverse path;
-  it is not a second production algorithm.
+- [cuSOLVERDx](https://docs.nvidia.com/cuda/cusolverdx/get_started/posv.html):
+  compact Cholesky, LU, and triangular solves with shared-memory factor reuse.
+- [cuBLASLt epilogues](https://docs.nvidia.com/cuda/cublas/index.html#cublasltepilogue-t):
+  fused projection weight/bias gradients and reusable GEMM plans.
+- [FLA chunk output](https://github.com/fla-org/flash-linear-attention/blob/78a39922d56562336e22e5a429b039f34ef2bf7f/fla/ops/common/chunk_o.py):
+  selective fusion, bounded tiles, and independent CTA scheduling.
+- [Mamba SSD chunk statistics](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/ssd_chunk_state.py):
+  chunk-local accumulation for long-sequence statistics.
+- [Selective triangular inversion](https://arxiv.org/abs/1612.01855) and
+  [Cholesky differentiation](https://arxiv.org/abs/1602.07527):
+  inverse-factor reuse and the compact symmetric adjoint.
+- [Triton matmul](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html)
+  and PyTorch Inductor: tiled Tensor Core products, grouped scheduling,
+  contiguous loads, and fused epilogues.
+- [PyTorch AOTAutograd](https://github.com/pytorch/pytorch/blob/main/torch/_functorch/_aot_autograd/runtime_wrappers.py):
+  release saved-tensor ownership while honoring repeated backward.
+- [Multiword BF16](https://arxiv.org/abs/1904.06376) and
+  [Mesa precision work](https://github.com/fla-org/flash-linear-attention/pull/1152):
+  precision selected by numerical role. Unbounded relation/content streams use
+  BF16; sensitive compact factors and maps remain FP32. Bounded magnitude alone
+  does not justify reducing precision in cancellation-sensitive expressions.
 
-- [NVIDIA cuSOLVERDx Cholesky composition](https://docs.nvidia.com/cuda/cusolverdx/get_started/posv.html):
-  factor once and solve RHS panels in the same shared-memory lifetime.
-- [cuBLASLt plan reuse](https://docs.nvidia.com/cuda/cublas/index.html#heuristics-cache):
-  query an algorithm once and refresh runtime pointers at execution.
-- [NVIDIA cuBLASLt epilogues](https://docs.nvidia.com/cuda/cublas/index.html#cublasltepilogue-t):
-  BGRADB computes projection bias gradients alongside the weight-gradient GEMM.
-  The implementation calls the library API rather than copying its GEMM kernels.
-- [NVIDIA cuSOLVERDx TRSM](https://docs.nvidia.com/cuda/cusolverdx/get_started/functions/trsm.html)
-  and the installed MathDx 26.06.1 `07_BLAS/trsm_batched_block.cu` example:
-  library-owned triangular arithmetic with cooperative load/solve/store and
-  implicit identity RHS panels. Both modes use the resulting inverse factor
-  for forward and backward products. No hand-written triangular solver is
-  introduced; the superseded standalone solve/adjoint interfaces were removed.
-- [FLA chunk output](https://github.com/fla-org/flash-linear-attention/blob/78a39922d56562336e22e5a429b039f34ef2bf7f/fla/ops/common/chunk_o.py)
-  and [compact triangular products](https://github.com/fla-org/flash-linear-attention/blob/78a39922d56562336e22e5a429b039f34ef2bf7f/fla/ops/utils/solve_tril.py):
-  bounded tiles, independent CTA scheduling, selective local fusion and explicit
-  product precision. The kernel organization is adapted to MemSolve's global
-  statistics; its noncausal operator is not replaced by an FLA recurrence.
-- [Mamba SSD chunk-state](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/ssd_chunk_state.py):
-  informed the chunk-local K-loop for long-sequence statistics. The implementation
-  is independently written for MemSolve's Gram/cross/eta equations; it does not
-  import Mamba's decay, causality or low-precision state storage.
-  FLA-inspired separate relation/content VJPs and channel-tiled readout were also
-  tested. Their additional scheduling did not give a consistent full-operator
-  gain, so the fused VJP and readout remain. Narrower fused VJP channel tiles
-  improved wide ranks without adding a kernel.
-- [Inductor shared-A BMM](https://github.com/pytorch/pytorch/blob/main/torch/_inductor/kernel/templates/triton_bmm_shared_a.py.jinja):
-  packing several samples behind a shared core improved individual wide-rank
-  products but regressed r32. Full-operator gains were small, so this prototype
-  is not retained. Shared maps continue to be loaded without batch expansion.
-- [PyTorch AOTAutograd lifecycle](https://github.com/pytorch/pytorch/blob/main/torch/_functorch/_aot_autograd/runtime_wrappers.py)
-  and [autograd's conditional release](https://github.com/pytorch/pytorch/blob/main/torch/csrc/autograd/python_function.cpp):
-  release saved-tensor ownership during ordinary backward, while honoring
-  `retain_graph`. No unconditional clear-on-access or donated saved buffer is used.
-- Low-word-first and four-product BF16 compensation were compared against FP64.
-  The former gave negligible accuracy benefit and more spills; the latter reduced
-  internal FP32 error but slowed the token VJP with almost no change after BF16
-  output rounding. Neither replaces the existing three-product rotated dot.
-  Direct reciprocal-count normalization compiled to the same tested result;
-  no additional precision gain is claimed from that rewrite.
-- [Triton matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html):
-  tiled Tensor Core products with FP32 accumulators and fused epilogues.
-- [Triton libdevice integration](https://triton-lang.org/main/getting-started/tutorials/07-extern-functions.html):
-  use mature tanh/log1p primitives for compact scalar maps. Their SM80 module
-  forward/backward benchmarks changed latency by less than 0.7% in either
-  direction and did not change peak allocated memory. Explicitly rounded
-  normalization and deferred readout compensation were also tested; neither
-  consistently improved full-operator error, so neither is adopted.
-- [Mesa precision repair](https://github.com/fla-org/flash-linear-attention/pull/1152)
-  and [small-gradient issue](https://github.com/fla-org/flash-linear-attention/issues/1283):
-  precision follows each tensor's range and numerical role. Mesa's normalized
-  Q/K can use FP16, while V-containing state and small gradients need the BF16
-  exponent range, and sensitive systems stay FP32. MemSolve has no normalized
-  Q/K and does not materialize bounded P. Its BF16 relation/content/gradient
-  streams are unbounded, while its bounded compact maps already use FP32.
-  No BF16-to-FP16 conversion is adopted merely by analogy. Regression tests
-  include loss scales from 2^-24 to 2^12 without relaxing error tolerances.
-  FP16 inverse-factor storage passed ordinary full-operator checks but failed
-  the existing tighter compact-system oracle. FP32 storage is retained.
-
-The unrotated model retains its equations, initialization, parameter counts and
-checkpoint contract 26. RoVE adds explicit transport settings to that contract
-without changing the native ABI. Artifacts older than ABI 17 must be rebuilt.
-Measurements and register-resource checks cover SM80/A800 only.
-
-
-## Measured memory and resource changes
-
-On 2026-10-18, A800/SM80 tests used Torch 2.14.0+cu132 and Triton 3.8.0,
-BF16 inputs and FP32 parameters. The following are **incremental peak allocated
-memory for one full MemSolve module forward/backward**, including both
-projections, not whole-Transformer memory. B=512, N=128, width=768, heads=12;
-all rows use equilibrium. The comparison isolates the lifecycle/scratch-reuse
-pass after the projection and long-statistics optimizations were already present.
-
-| Rank | RoVE | Before | After |
-| ---: | --- | ---: | ---: |
-| 32 | off | 676 MiB | 604 MiB |
-| 32 | on | 772 MiB | 700 MiB |
-| 64 | off | 1062 MiB | 966 MiB |
-| 64 | on | 1158 MiB | 1062 MiB |
-
-Complement showed similar savings. Across 24 module cases, outputs were bitwise
-unchanged; unrotated gradients were also bitwise unchanged. With RoVE, maximum
-input/parameter-gradient relative L2 change was 0.0037%, within the existing
-FP64 oracle limits. Graph timing used 60 warmup replays and seven alternating
-20-replay rounds. RoVE cases reduced module training latency by roughly
-0.6–3.3%; these measurements are not whole-network throughput claims.
-The corresponding r48/r64 RoVE token-VJP spill counts fell from 66/62 to 26/24.
-
-The preceding long-statistics pass reduced Gram/cross partial buffers fourfold
-when the 512-token schedule applies. For B=8, N=4096, heads=12, rank=32 and
-64 content channels, those forward partials decreased from 36 to 9 MiB.
-Other stages can still determine the full-module peak. No storage dtype or
-compensation term was removed to obtain these savings. Detailed probes and
-raw training artifacts remain outside the repository.
+Source adaptation and license boundaries are in [NOTICE](../NOTICE) and
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).

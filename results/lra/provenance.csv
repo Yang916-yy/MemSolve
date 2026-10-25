@@ -1,5 +1,0 @@
-task,dataset_content_sha256,max_length,train_examples,validation_examples,test_examples,dim,depth,heads,rank,position_encoding,pooling,physical_batch,grad_accum,lr,epochs
-listops,b538cdf4adcadbb12c89005f8f47b3749172ae58ef47f9918eb0bea20443b2d2,2048,96000,2000,2000,128,6,8,32,learned-absolute-plus-rank-rotary,mean,25,2,0.0005,40
-text,4b3c0c8624ebbd52a32b681e0ab08f30926ae20ce4bc5185a5e9483c0aace295,4096,22500,2500,25000,256,6,8,32,learned-absolute-plus-rank-rotary,mean,16,2,0.0005,32
-retrieval,35aa3878121a9ae717dbe9faec2d54dbde0caf74097d0da0f30e1aca28f0c225,4000,147086,18090,17437,128,6,8,32,learned-absolute-plus-rank-rotary,mean,16,4,0.0005,20
-pathfinder,7d0e430517c680147576fe0159ea8debcf122e092b7c4eed093b1b964eb98753,1024,160000,20000,20000,256,6,4,32,factorized-grid-absolute-plus-flat-rank-rotary,meanmax,64,2,0.0002,200

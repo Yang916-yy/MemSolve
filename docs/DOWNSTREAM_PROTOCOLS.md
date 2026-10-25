@@ -18,7 +18,6 @@ implementation details taken from [Vision-RWKV](https://github.com/OpenGVLab/Vis
 and [ViT-Adapter](https://github.com/czczup/ViT-Adapter/tree/fd64a5190f9f4530e8e5961cc87b2a3ad591190b).
 They are not claimed to be an exact reproduction of an unpublished ViG config.
 Code attribution and Apache-2.0 notices are in [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md).
-No downstream accuracy results have been produced yet.
 
 | Scale | Width / depth / heads | Rank | MLP ratio | Adapter heads / value ratio | DropPath |
 | --- | --- | ---: | ---: | --- | ---: |
@@ -63,10 +62,8 @@ each run rather than changing these recipe defaults.
 `model.backbone.compile_blocks=True` enables dynamic-shape `torch.compile`
 for the encoder blocks. The native MemSolve implementation stays outside
 compiler tracing, and `emulate_precision_casts` preserves intermediate BF16
-rounding. CUDA Graphs are disabled for this path: the detection integration's
-graph-enabled backward crashed in the local runtime probe. The compile-only
-path passed rectangular-shape forward and gradient comparisons. This option
-does not compile the variable-length proposal and RoI pipelines.
+rounding. This path uses compile without CUDA Graph capture. It does not compile the
+variable-length proposal and RoI pipelines.
 
 FP32 weights and **BF16 autocast** are used instead of the upstream FP16 runner.
 MemSolve keeps its own mixed-precision numerical contract. Deformable sampling
@@ -154,24 +151,3 @@ choose per-GPU batch so global batch remains 16, or explicitly request
 `--resume /path/checkpoint.pth` for a specific checkpoint, and
 `--test /path/checkpoint.pth` for evaluation; omit `--backbone-checkpoint` for
 resume/test. `--cfg-options model.backbone.with_cp=True` enables checkpointing.
-
-## Validation (2026-10-17)
-
-The dedicated local environment is `/cywang/memsolve-dense-venv` (Torch
-2.14.0+cu132 / MMCV 2.1.0 rebuilt with C++20). Verification covers:
-
-- 31 CPU tests across the dense adapter and timm integration, including real
-  MMDetection/MMSegmentation data preprocessors, task heads, loss backward,
-  and prediction under FP32 and BF16 autocast.
-- Rectangular CPE, padded pixel invariance, sliding-window mask handling,
-  EMA selection, layer LR decay and activation-checkpoint gradient/BN parity.
-- The actual pretrained Base best-EMA checkpoint loads successfully. Backbone
-  plus adapter has 90,890,864 parameters before task heads.
-- A native Tiny CUDA adapter BF16 forward/backward, including MemSolve's fast
-  path and MMCV deformable sampling, with finite gradients for all parameters.
-  The configured MMEngine BF16 optimizer wrapper also completes an AdamW step.
-- MMCV CUDA sampling forward/gradients against the upstream CPU oracle.
-
-These are synthetic correctness checks, not full-resolution throughput,
-distributed training, COCO AP or ADE20K mIoU measurements. Formal downstream
-training and dataset downloads have not been started.

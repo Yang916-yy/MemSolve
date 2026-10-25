@@ -1,6 +1,6 @@
 # MemSolve architecture
 
-MemSolve uses the shared-frame accretive-equilibrium operator, without RankRotary.
+MemSolve uses a shared-frame accretive-equilibrium operator.
 See [the exact equations](CORE_CONTRACT.md).
 
 The operator projects one relation stream and one content stream, constructs a
@@ -25,12 +25,9 @@ The source is `vittt/models/vittt.py`, Block.forward and forward_features, at
 Masked pooling averages only valid patches. timm's post-pooling fc_norm is
 Identity, so normalization happens before the mean, not after it.
 
-Default stochastic depth increases linearly by depth. S retains the historical
+Default stochastic depth increases linearly by depth. S uses
 MLP width 1584 (ratio 4.125), width 384, 12 blocks, 6 heads and rank 32.
-With a 1,000-class head it has 19,876,336 parameters. This shell differs from
-historical LSSO Small by removing CLS and LayerScale; results must retain their
-original architecture and recipe. No RankRotary, RoPE, Q/K short convolution,
-readout gate or operator RMSNorm is present in the visual configuration.
+With a 1,000-class head it has 19,876,336 parameters.
 Classification uses its configured patch grid; dense prediction supplies an
 explicit rectangular grid through `VisionTokenLayout`. ViT-Adapter adds spatial
 features around the same pretrained blocks; see the
@@ -49,5 +46,4 @@ window, with unit amplitude. This is approximately parameter-matched to
 The [NLP guide](BERT_MLM.md) separates training, resume, continued pretraining,
 checkpoint selection and evaluation. Completed MLM/GLUE experiments used the
 explicit absolute-position configuration (111,517,154 parameters, 512 learned
-positions). Those results do not validate the new RoVE configuration; it still
-needs a training comparison.
+positions). RoVE is a separate experiment setting.

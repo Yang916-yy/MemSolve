@@ -1,8 +1,0 @@
-mode,length,pytorch_reference_ms,native_lsso_ms,mha_ms,reference_over_native,mha_over_native
-forward,1024,110.216,2.539,2.131,43.41,0.84
-forward,2048,133.940,5.577,5.888,24.02,1.06
-forward,4096,169.549,10.135,18.173,16.73,1.79
-forward_backward,1024,118.858,7.512,8.487,15.82,1.13
-forward_backward,2048,153.955,15.260,22.940,10.09,1.50
-forward_backward,4096,211.268,29.160,67.195,7.25,2.30
-

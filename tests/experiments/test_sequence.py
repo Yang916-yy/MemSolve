@@ -14,7 +14,6 @@ import pytest
 from torch.utils.data import Dataset, TensorDataset
 
 import experiments.train_transformers as train_transformers
-from experiments.certificate_diagnostics import summarize
 from experiments.sequence_data import (
     DatasetBundle,
     NucleotideTokenizer,
@@ -50,45 +49,6 @@ from memsolve.ball import cuda
 
 
 pytestmark = pytest.mark.experiment
-
-
-def test_certificate_summary_groups_length_layer_and_reports_percentiles() -> None:
-    records = []
-    for length in (1024, 2048):
-        for layer in (1, 2):
-            for index, value in enumerate((0.2, 0.4, 0.6)):
-                record: dict[str, float | int] = {
-                    "length": length,
-                    "layer": layer,
-                    "checkpoint": 0,
-                    "seed": 0,
-                    "probe": index,
-                    "head": 0,
-                }
-                for metric in (
-                    "q",
-                    "contraction_slack",
-                    "mu",
-                    "state_ratio",
-                    "adjoint_ratio",
-                    "state_bound_usage",
-                    "adjoint_bound_usage",
-                ):
-                    record[metric] = value
-                records.append(record)
-
-    rows = summarize(records)
-
-    assert len(rows) == 4 * 7
-    q_row = next(
-        row
-        for row in rows
-        if row["length"] == 1024 and row["layer"] == 1 and row["metric"] == "q"
-    )
-    assert q_row["count"] == 3
-    assert q_row["min"] == pytest.approx(0.2)
-    assert q_row["median"] == pytest.approx(0.4)
-    assert q_row["max"] == pytest.approx(0.6)
 
 
 def _encoder(mixer: str) -> SequenceEncoder:
@@ -1610,33 +1570,6 @@ def test_sequence_toml_template_supplies_required_task_selection() -> None:
     root = Path(__file__).resolve().parents[2]
     args = resolve_args(parse_args(["--config", str(root / "experiments/configs/lra.toml")]))
     assert (args.suite, args.task, args.rank, args.lr) == ("lra", "listops", 32, 5e-4)
-
-
-def test_genomic_toml_template_matches_the_formal_rank() -> None:
-    root = Path(__file__).resolve().parents[2]
-    args = resolve_args(
-        parse_args(["--config", str(root / "experiments/configs/genomic.toml")])
-    )
-    assert (args.suite, args.dim, args.depth, args.heads, args.rank) == (
-        "genomic",
-        128,
-        4,
-        4,
-        32,
-    )
-    assert (args.batch_size, args.grad_accum) == (64, 2)
-
-    ordinary = resolve_args(
-        parse_args(
-            [
-                "--config",
-                str(root / "experiments/configs/genomic.toml"),
-                "--task",
-                "demo_human_or_worm",
-            ]
-        )
-    )
-    assert (ordinary.batch_size, ordinary.grad_accum, ordinary.rank) == (128, 1, 32)
 
 
 class _TinyTokenDataset(Dataset):

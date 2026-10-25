@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler, TensorDatas
 import experiments.imagenet as imagenet
 from experiments.imagenet import (
     BatchingPlan,
-    VIT3_CONFIG,
+    DEFAULT_CONFIG,
     DistributedState,
     ImageNetRun,
     LoaderRandomGenerators,
@@ -57,11 +57,23 @@ def test_direct_imagenet_launcher_imports_repository_modules() -> None:
     assert callable(namespace["main"])
 
 
+def _fixture_config(tmp_path: Path) -> Path:
+    # A smaller non-RA/non-EMA fixture isolates loader and optimizer behavior.
+    text = DEFAULT_CONFIG.read_text().replace("effective_batch = 2048", "effective_batch = 1024")
+    text = text.replace("lr = 0.002", "lr = 0.001").replace("warmup_lr = 2.0e-6", "warmup_lr = 1.0e-6")
+    text = text.replace("min_lr = 2.0e-5", "min_lr = 1.0e-5")
+    text = text.replace("ema = true", "ema = false").replace("repeated_aug = true", "repeated_aug = false")
+    text = text.replace('execution = "compile-graph"', 'execution = "graph"')
+    path = tmp_path / "fixture.toml"
+    path.write_text(text)
+    return path
+
+
 def _args(tmp_path: Path, *extra: str):
     return parse_args(
         [
             "--config",
-            str(VIT3_CONFIG),
+            str(_fixture_config(tmp_path)),
             "--tier",
             "small",
             "--data-root",
@@ -829,9 +841,9 @@ def test_scheduler_uses_optimizer_updates_and_restores_exactly(tmp_path):
 
 
 def test_recipe_fidelity_marks_diagnostic_duration(tmp_path):
-    for extra, expected in [((), "vit3-derived"), (("--epochs", "30"), "explicitly-modified")]:
-        run = load_run(_args(tmp_path, *extra))
-        assert _recipe_fidelity(run, batching_plan=_checkpoint_batching_plan(),
+    for extra, expected in [((), "memsolve-imagenet300"), (("--epochs", "30"), "explicitly-modified")]:
+        run = load_run(_args(tmp_path, "--config", str(DEFAULT_CONFIG), *extra))
+        assert _recipe_fidelity(run, batching_plan=resolve_batching_plan(run, _cpu_state(world_size=2), dataset_size=1_281_167, requested_grad_accum=None),
                                resolved_optimizer="torch.adamw.fused") == expected
 
 
@@ -909,7 +921,7 @@ def test_gradient_accumulation_matches_one_effective_batch(
         model={},
         operator={},
         train={"bce_loss": False, "clip_grad": 0.1, "optimizer": "sgd",
-               "ema": True, "ema_decay": 0.99996},
+               "ema": True, "ema_decay": 0.9999},
         overrides=(),
     )
     batching_plan = BatchingPlan(
@@ -948,7 +960,7 @@ def test_gradient_accumulation_matches_one_effective_batch(
     assert scheduler.updates == 1
     assert len(ema_updates) == 1
     torch.testing.assert_close(model_ema.module.weight,
-        initial_weight.lerp(model.weight.detach(), 1 - .99996), rtol=0, atol=0)
+        initial_weight.lerp(model.weight.detach(), 1 - .9999), rtol=0, atol=0)
 
 
 def test_checkpoint_model_state_preserves_memsolve_contract_entries() -> None:
@@ -1023,7 +1035,7 @@ def test_main_selects_independent_raw_and_ema_best(tmp_path, monkeypatch):
     monkeypatch.setattr(imagenet, 'initialize_distributed', lambda: state)
     monkeypatch.setattr(imagenet, 'prepare_operator_backend', lambda *args: None)
     monkeypatch.setattr(imagenet, 'build_loaders', lambda *args, **kwargs:
-        ([], [], None, plan, _loader_generators(), _data_contract(source_views=3, group_size=256)))
+        ([], [], None, plan, _loader_generators(), _data_contract(source_views=3)))
     monkeypatch.setattr(imagenet, 'build_model', lambda run: torch.nn.Linear(2, 2))
     def prepare(model, *args):
         # Simulate compile's bound forward closure. EMA must be copied before it.
@@ -1032,7 +1044,7 @@ def test_main_selects_independent_raw_and_ema_best(tmp_path, monkeypatch):
         return model
     monkeypatch.setattr(imagenet, 'prepare_training_model', prepare)
     monkeypatch.setattr(imagenet, 'build_optimizer', lambda model, run:
-        (torch.optim.SGD(model.parameters(), lr=.1), 'apex.lamb.fused'))
+        (torch.optim.SGD(model.parameters(), lr=.1), 'torch.adamw.fused'))
     monkeypatch.setattr(torch.cuda, 'get_device_name', lambda *args: 'test-cpu')
     def train(model, *args, epoch, model_ema, **kwargs):
         with torch.no_grad():
@@ -1157,12 +1169,12 @@ def test_checkpoint_round_trip_has_no_ema(
         )
 
 
-def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
+def test_ema_preserves_contract_and_restores_shadow(tmp_path):
     from integrations.timm import create_memsolve_vit
 
-    run = load_run(parse_args(['--tier', 'base', '--data-root', str(tmp_path),
+    run = load_run(parse_args(['--config', str(imagenet.DEFAULT_CONFIG), '--tier', 'base', '--data-root', str(tmp_path),
                               '--output', str(tmp_path / 'run')]))
-    assert run.train['ema'] is True and run.train['ema_decay'] == .99996
+    assert run.train['ema'] is True and run.train['ema_decay'] == .9999
     model = create_memsolve_vit(image_size=192, num_classes=2, embed_dim=32,
         depth=1, num_heads=2, rank=16, mlp_ratio=4., bias=True)
     initial = copy.deepcopy(model)
@@ -1175,13 +1187,13 @@ def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
             parameter.add_(.125)
     ema.update(model)
     for shadow, before, current in zip(ema.module.parameters(), initial.parameters(), model.parameters()):
-        torch.testing.assert_close(shadow, before.detach().lerp(current.detach(), 1 - .99996),
+        torch.testing.assert_close(shadow, before.detach().lerp(current.detach(), 1 - .9999),
                                    rtol=0, atol=0)
     optimizer = torch.optim.SGD(model.parameters(), lr=.1)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3)
     state, generators = _cpu_state(), _loader_generators(23)
     plan = resolve_batching_plan(run, state, dataset_size=1_281_167, requested_grad_accum=None)
-    data = _data_contract(source_views=3, group_size=256)
+    data = _data_contract(source_views=3)
     payload = _checkpoint(epoch=4, model=model, optimizer=optimizer, scheduler=scheduler,
         run=run, batching_plan=plan, data_contract=data, best_acc1=73.5,
         rng=_capture_resume_rng_state(state, generators), model_ema=ema, best_ema_acc1=72.0)
@@ -1203,33 +1215,8 @@ def test_ropevit_ema_preserves_contract_and_restores_shadow(tmp_path):
             assert restored == value  # Non-tensor operator/architecture contracts.
     for a, b in zip(target.parameters(), model.parameters()):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
-    # Finetuning starts EMA from the loaded ordinary weights, not the old shadow.
-    ft = load_run(parse_args(['--tier', 'base', '--phase', 'finetune', '--finetune', str(path),
-                             '--data-root', str(tmp_path), '--output', str(tmp_path / 'ft')]))
-    fresh = copy.deepcopy(initial)
-    imagenet._load_finetune(path, model=fresh, run=ft)
-    fresh_ema = imagenet.build_model_ema(fresh, ft)
-    for shadow, current in zip(fresh_ema.module.parameters(), model.parameters()):
-        torch.testing.assert_close(shadow, current, rtol=0, atol=0)
     payload['selected_weights'] = 'model_ema'
     torch.save(payload, path)
-    source = imagenet._load_finetune(path, model=fresh, run=ft)
-    assert source['source_weights'] == 'model_ema'
-    for loaded, shadow in zip(fresh.parameters(), ema.module.parameters()):
-        torch.testing.assert_close(loaded, shadow, rtol=0, atol=0)
-    # The resolution transition reuses CPE weights for both ordinary and EMA models.
-    larger = create_memsolve_vit(image_size=224, num_classes=2, embed_dim=32,
-        depth=1, num_heads=2, rank=16, mlp_ratio=4., bias=True)
-    for selection, owner in [('model', model), ('model_ema', ema.module)]:
-        payload['selected_weights'] = selection
-        torch.save(payload, path)
-        imagenet._load_finetune(path, model=larger, run=ft)
-        assert owner.encoder.pos_embed is None and larger.encoder.pos_embed is None
-        torch.testing.assert_close(larger.blocks[0].cpe.weight, owner.blocks[0].cpe.weight)
-        torch.testing.assert_close(larger.encoder.patch_embed.proj.weight,
-                                   owner.encoder.patch_embed.proj.weight)
-    assert 'encoder.cls_token' not in imagenet._no_weight_decay(larger)
-    assert 'encoder.pos_embed' not in imagenet._no_weight_decay(larger)
     # Resume always restores raw optimizer-owned weights, even from EMA best.
     assert _load_resume(path, **kwargs) == (5, 73.5, 72.0)
     for loaded, raw in zip(target.parameters(), model.parameters()):
@@ -1388,7 +1375,6 @@ def test_adamw_parameters_and_weight_decay_exclusions(tmp_path):
             assert group["weight_decay"] == (0 if parameter is model.bias else .05)
 
 
-
 def test_imagenet_optimizer_uses_plain_fused_adamw_with_delta_weight_decay(tmp_path):
     from memsolve import MemSolve, MemSolveConfig
     model = MemSolve(MemSolveConfig(16, 2, rank=4))
@@ -1404,7 +1390,6 @@ def test_imagenet_optimizer_uses_plain_fused_adamw_with_delta_weight_decay(tmp_p
     assert torch.count_nonzero(model.core_base_raw) == 0
 
 
-
 def test_custom_recipe_is_not_mislabeled_as_vit3(tmp_path):
     run = load_run(_args(tmp_path))
     run.train["lr"] = .002
@@ -1414,8 +1399,8 @@ def test_custom_recipe_is_not_mislabeled_as_vit3(tmp_path):
 
 def test_vit3_optional_ema_is_explicitly_modified(tmp_path):
     config = tmp_path / "vit3_ema.toml"
-    config.write_text(imagenet.VIT3_CONFIG.read_text().replace(
-        "ema = false", "ema = true\nema_decay = 0.9999"))
+    config.write_text(_fixture_config(tmp_path).read_text().replace(
+        "ema = false", "ema = true"))
     run = load_run(_args(tmp_path, "--config", str(config)))
     assert run.train["ema"] is True and run.train["ema_decay"] == .9999
     assert _recipe_fidelity(run, batching_plan=_checkpoint_batching_plan(),
@@ -1441,7 +1426,7 @@ def test_vit3_repeated_augmentation_uses_timm_and_fixed_updates(tmp_path, monkey
     from timm.data.distributed_sampler import RepeatAugSampler
 
     config = tmp_path / "vit3_ra.toml"
-    config.write_text(imagenet.VIT3_CONFIG.read_text().replace(
+    config.write_text(_fixture_config(tmp_path).read_text().replace(
         "repeated_aug = false", "repeated_aug = true"))
     run = load_run(_args(tmp_path, "--config", str(config),
                          "--train-workers", "0", "--val-workers", "0"))
@@ -1529,159 +1514,10 @@ def test_graph_step_rejects_invalid_accumulation(accum):
         imagenet.ImageNetGraphStep(torch.nn.Linear(2, 2), torch.nn.CrossEntropyLoss(), grad_accum=accum)
 
 
-@pytest.mark.parametrize('recipe,epochs,decay,droppath', [
-    ('deit3_400', 400, .02, .1), ('deit3_800', 800, .05, .2),
-])
-def test_deit3_and_finetune_batching(tmp_path, recipe, epochs, decay, droppath):
-    def selected(phase):
-        flags = ['--finetune', str(tmp_path / 'pretrain.pt')] if phase == 'finetune' else []
-        return load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIGS[recipe]), '--tier', 'base',
-            '--phase', phase, '--data-root', str(tmp_path), '--output', str(tmp_path / phase), *flags]))
-    pretrain, finetune = selected('pretrain'), selected('finetune')
-    state = _cpu_state(world_size=2)
-    p = resolve_batching_plan(pretrain, state, dataset_size=1_281_167, requested_grad_accum=None)
-    f = resolve_batching_plan(finetune, state, dataset_size=1_281_167, requested_grad_accum=None)
-    assert (p.physical_batch_size, p.grad_accum, p.effective_batch_size, p.updates_per_epoch) == (512, 2, 2048, 625)
-    assert (f.physical_batch_size, f.grad_accum, f.effective_batch_size, f.updates_per_epoch) == (256, 1, 512, 2502)
-    assert (p.augmentation_group_size, f.augmentation_group_size) == (256, 64)
-    assert (pretrain.model['image_size'], pretrain.train['epochs'], pretrain.train['weight_decay']) == (192, epochs, decay)
-    assert (finetune.model['image_size'], finetune.train['epochs'], finetune.train['weight_decay']) == (224, 20, .1)
-    assert pretrain.model['drop_path_schedule'] == finetune.model['drop_path_schedule'] == 'constant'
-    assert pretrain.model['drop_path_rate'] == finetune.model['drop_path_rate'] == droppath
-    assert pretrain.train['bce_loss'] and not finetune.train['bce_loss']
-    assert _recipe_fidelity(pretrain, batching_plan=p, resolved_optimizer='apex.lamb.fused') == 'deit3-derived'
-    assert _recipe_fidelity(finetune, batching_plan=f, resolved_optimizer='torch.adamw.fused') == 'deit3-derived'
-
-
-@pytest.mark.parametrize('tier', ['tiny', 'small'])
-def test_default_ts_lamb_recipe_batches_augments_and_records_provenance(tmp_path, tier):
-    from PIL import Image
-    run = load_run(parse_args(['--tier', tier, '--data-root', str(tmp_path),
-                              '--output', str(tmp_path / tier)]))
-    plan = resolve_batching_plan(run, _cpu_state(world_size=2),
-                                dataset_size=1_281_167, requested_grad_accum=None)
-    assert run.config_path == imagenet.ROPEVIT_CONFIG
-    assert run.train['ema'] is True and run.train['ema_decay'] == .99996
-    assert (run.train['epochs'], run.train['lr'], run.train['weight_decay']) == (400, .004, .03)
-    assert run.model['drop_path_rate'] == 0 and run.model['drop_path_schedule'] == 'constant'
-    assert (plan.physical_batch_size, plan.effective_batch_size, plan.grad_accum) == (512, 2048, 2)
-    assert (plan.augmentation_group_size, plan.updates_per_epoch) == (256, 625)
-    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer='apex.lamb.fused') == 'ropevit-derived'
-    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer='torch.adamw.fused') == 'explicitly-modified'
-    transform = imagenet.build_train_transform(run)
-    assert transform(Image.new('RGB', (300, 280))).shape == (3, 224, 224)
-    mixup, loss = imagenet.build_mixup_and_loss(run)
-    _, targets = mixup(torch.zeros(256, 3, 4, 4), torch.arange(256))
-    assert (targets > 0).sum(1).max() <= 2  # No smoothing before membership BCE.
-    assert isinstance(loss, imagenet.DeiTBinaryCrossEntropy)
-    assert torch.isfinite(loss(torch.zeros(256, 1000), targets))
-    metadata = run.as_dict(plan, _data_contract(source_views=3, group_size=256))
-    assert metadata['official_ropevit_recipe'] == imagenet.OFFICIAL_ROPEVIT_URL
-    assert 'official_vit3_recipe' not in metadata and 'official_deit3_recipe' not in metadata
-    run.train['epochs'] = 30
-    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer='apex.lamb.fused') == 'explicitly-modified'
-
-
-@pytest.mark.parametrize('phase', ['pretrain', 'finetune'])
-def test_default_base_ropevit_recipe_changes_resolution_and_regularization(tmp_path, phase):
-    flags = ['--finetune', str(tmp_path / 'pretrain.pt')] if phase == 'finetune' else []
-    run = load_run(parse_args(['--tier', 'base', '--phase', phase, '--data-root', str(tmp_path),
-                              '--output', str(tmp_path / phase), *flags]))
-    plan = resolve_batching_plan(run, _cpu_state(world_size=2),
-                                dataset_size=1_281_167, requested_grad_accum=None)
-    assert run.config_path == imagenet.ROPEVIT_CONFIG
-    if phase == 'pretrain':
-        assert run.train['warmup_epochs'] == 5
-        assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (192, 400, .003)
-        assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.1, .03)
-        assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (512, 2, 2048)
-        assert (plan.augmentation_group_size, plan.updates_per_epoch) == (256, 625)
-        assert run.train['bce_loss'] and run.train['label_smoothing'] == 0
-        assert run.train['repeated_aug'] and run.train['augmentation'] == 'three_augment'
-        optimizer = 'apex.lamb.fused'
-    else:
-        assert run.train['warmup_epochs'] == 5
-        assert (run.model['image_size'], run.train['epochs'], run.train['lr']) == (224, 20, 1e-5)
-        assert (run.model['drop_path_rate'], run.train['weight_decay']) == (.2, .1)
-        assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (256, 1, 512)
-        assert (plan.augmentation_group_size, plan.updates_per_epoch) == (64, 2502)
-        assert not run.train['bce_loss'] and run.train['label_smoothing'] == .1
-        assert not run.train['repeated_aug'] and run.train['augmentation'] == 'rand_augment'
-        assert 'drop_path_rate' not in run.train  # The phase override belongs to the model.
-        optimizer = 'torch.adamw.fused'
-    assert run.model['drop_path_schedule'] == 'constant'
-    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer=optimizer) == 'ropevit-derived'
-    run.model['drop_path_rate'] = .3
-    assert _recipe_fidelity(run, batching_plan=plan, resolved_optimizer=optimizer) == 'explicitly-modified'
-
-
-@pytest.mark.parametrize('tier', ['tiny', 'small', 'base'])
-def test_default_schedule_matches_upstream_epoch_end_trajectory_and_resume(tmp_path, tier):
-    import math
-
-    run = load_run(parse_args(['--tier', tier, '--data-root', str(tmp_path),
-                              '--output', str(tmp_path / tier)]))
-    assert run.train['warmup_epochs'] == 5
-    assert run.train['lr_schedule'] == 'epoch'
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(()))], lr=run.train['lr'])
-    scheduler = build_scheduler(optimizer, run, 625)
-    restored_opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(()))], lr=run.train['lr'])
-    # Physical batching/update count must not alter the epoch-based schedule.
-    restored = build_scheduler(restored_opt, run, 1250)
-    for epoch in range(400):
-        # Upstream calls step(epoch) AFTER the preceding training epoch.
-        t = max(0, epoch - 1)
-        if t < 5:
-            expected = 1e-6 + (run.train['lr'] - 1e-6) * t / 5
-        else:
-            expected = 1e-5 + (run.train['lr'] - 1e-5) * (1 + math.cos(math.pi * t / 400)) / 2
-        assert optimizer.param_groups[0]['lr'] == pytest.approx(expected)
-        assert restored_opt.param_groups[0]['lr'] == optimizer.param_groups[0]['lr']
-        scheduler.step_update((epoch + 1) * 625)  # No per-update LR change.
-        assert optimizer.param_groups[0]['lr'] == pytest.approx(expected)
-        scheduler.step(epoch)
-        if epoch in (0, 3, 5, 199):
-            restored = build_scheduler(restored_opt, run, 1250)
-            restored_opt.load_state_dict(optimizer.state_dict())
-            restored.load_state_dict(scheduler.state_dict())
-        else:
-            restored.step(epoch)
-
-
-@pytest.mark.parametrize('grad_accum', [1, 2])
-def test_training_keeps_epoch_lr_constant_and_steps_after_last_update(tmp_path, grad_accum):
-    run = load_run(parse_args(['--tier', 'small', '--data-root', str(tmp_path),
-                              '--output', str(tmp_path / 'run')]))
-    # Exercise the actual training loop without image-model or CUDA dependencies.
-    run.train.update(bce_loss=False, clip_grad=0., optimizer='sgd')
-    model = torch.nn.Linear(2, 5)
-    optimizer = torch.optim.SGD(model.parameters(), lr=run.train['lr'])
-    scheduler = build_scheduler(optimizer, run, 2)
-    def unexpected_update(*args, **kwargs):
-        raise AssertionError('epoch schedule must not advance per update')
-    scheduler.step_update = unexpected_update
-    seen = []
-    hook = optimizer.register_step_pre_hook(lambda opt, args, kwargs: seen.append(opt.param_groups[0]['lr']))
-    plan = BatchingPlan(world_size=1, physical_batch_size=2,
-        effective_batch_size=2 * grad_accum, grad_accum=grad_accum,
-        samples_per_epoch=4 * grad_accum, updates_per_epoch=2)
-    batch = (torch.zeros(2, 2), torch.tensor([0, 1]))
-    for epoch in range(7):
-        used_lr = optimizer.param_groups[0]['lr']
-        train_epoch(model, [batch] * plan.microbatches_per_epoch, None,
-                    torch.nn.CrossEntropyLoss(), optimizer, None, scheduler,
-                    epoch=epoch, state=_cpu_state(), run=run, batching_plan=plan, print_freq=0)
-        assert seen[-2:] == [used_lr, used_lr]
-        expected_next = (1e-6 + (.004 - 1e-6) * epoch / 5 if epoch < 5 else
-            1e-5 + (.004 - 1e-5) * (1 + __import__('math').cos(__import__('math').pi * epoch / 400)) / 2)
-        assert optimizer.param_groups[0]['lr'] == pytest.approx(expected_next)
-    assert seen[:4] == [1e-6] * 4  # First two complete epochs retain the initial LR.
-    hook.remove()
-
-
 def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tmp_path):
-    run = load_run(parse_args(['--config', str(imagenet.DEIT3_CONFIG), '--tier', 'base',
+    run = load_run(parse_args(['--config', str(imagenet.DEFAULT_CONFIG), '--tier', 'base',
                               '--data-root', str(tmp_path), '--output', str(tmp_path / 'run')]))
+    run.train['augmentation_group_size'] = 256
     plan = resolve_batching_plan(run, _cpu_state(world_size=2),
                                 dataset_size=1_281_167, requested_grad_accum=None)
     contract = run.checkpoint_contract(plan, _data_contract(source_views=3, group_size=256))
@@ -1698,36 +1534,6 @@ def test_virtual_augmentation_checkpoint_contract_rejects_inconsistent_groups(tm
     changed['data']['streaming']['augmentation_group_size'] = 128
     with pytest.raises(ValueError, match='inconsistent'):
         imagenet.validate_checkpoint_contract(envelope(changed))
-
-
-@pytest.mark.cuda
-@pytest.mark.parametrize('tier,config', [('base', imagenet.DEIT3_CONFIG), ('small', imagenet.ROPEVIT_CONFIG)])
-def test_fused_lamb_matches_mature_reference_and_updates_zero_delta(tmp_path, tier, config):
-    if not torch.cuda.is_available():
-        pytest.skip('CUDA required')
-    pytest.importorskip('apex.optimizers')
-    from timm.optim import param_groups_weight_decay
-    from timm.optim.lamb import Lamb
-    torch.manual_seed(17)
-    actual = torch.nn.Module()
-    actual.core_base_raw = torch.nn.Parameter(torch.zeros(2, 4, 4, device='cuda'))
-    actual.linear = torch.nn.Linear(8, 16, device='cuda')
-    reference = copy.deepcopy(actual)
-    run = load_run(parse_args(['--config', str(config), '--tier', tier,
-        '--data-root', str(tmp_path), '--output', str(tmp_path / 'out')]))
-    optimizer, name = build_optimizer(actual, run)
-    expected = Lamb(param_groups_weight_decay(reference, weight_decay=run.train['weight_decay']),
-                    lr=run.train['lr'], eps=1e-8, max_grad_norm=1., decoupled_decay=False)
-    assert name == 'apex.lamb.fused'
-    for _ in range(3):
-        for a, b in zip(actual.parameters(), reference.parameters()):
-            gradient = torch.randn_like(a)
-            a.grad, b.grad = gradient.clone(), gradient.clone()
-        optimizer.step()
-        expected.step()
-        for a, b in zip(actual.parameters(), reference.parameters()):
-            torch.testing.assert_close(a, b, rtol=3e-5, atol=2e-7)
-    assert actual.core_base_raw.abs().sum() > 0
 
 
 @pytest.mark.cuda
@@ -1841,3 +1647,21 @@ def test_graph_step_preserves_warmup_rng_updates_inputs_and_reuses_gradients(bce
         graphed.train()
     with pytest.raises(ValueError, match="shape/dtype/device"):
         engine(images[:8], targets[:8])
+
+
+@pytest.mark.parametrize("tier", ["tiny", "small", "base"])
+def test_default_recipe_uses_paper_ra_ema_protocol(tmp_path, tier):
+    run = load_run(parse_args(["--tier", tier, "--data-root", str(tmp_path),
+                              "--output", str(tmp_path / tier)]))
+    plan = resolve_batching_plan(run, _cpu_state(world_size=2),
+                                dataset_size=1_281_167, requested_grad_accum=None)
+    assert run.config_path == imagenet.DEFAULT_CONFIG
+    assert (run.model["image_size"], run.train["epochs"]) == (224, 300)
+    assert (run.train["optimizer"], run.train["lr"]) == ("fused_adamw", .002)
+    assert (run.train["warmup_lr"], run.train["min_lr"]) == (2e-6, 2e-5)
+    assert run.train["ema"] and run.train["ema_decay"] == .9999
+    assert run.train["repeated_aug"] and not run.train["bce_loss"]
+    assert run.train["lr_schedule"] == "update"
+    assert run.train["execution"] == "compile-graph"
+    assert (plan.physical_batch_size, plan.grad_accum, plan.effective_batch_size) == (512, 2, 2048)
+    assert plan.augmentation_group_size is None

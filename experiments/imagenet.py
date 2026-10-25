@@ -1,4 +1,4 @@
-"""Distributed ImageNet-1K training with RoPE-ViT, ViT³ and DeiT III recipes.
+"""Distributed ImageNet training with the MemSolve 300-epoch recipe.
 
 Builds the shared ``integrations.timm`` backbone and handles data, distributed
 training, evaluation, and checkpoints.
@@ -39,23 +39,13 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, get_
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VIT3_CONFIG = ROOT / "experiments" / "configs" / "imagenet_vit3.toml"
-ROPEVIT_CONFIG = ROOT / "experiments" / "configs" / "imagenet_ropevit_400.toml"
-DEFAULT_CONFIG = ROPEVIT_CONFIG
-DEIT3_CONFIG = ROOT / "experiments" / "configs" / "imagenet_deit3_400.toml"
-DEIT3_CONFIGS = {
-    "deit3_400": DEIT3_CONFIG,
-    "deit3_800": ROOT / "experiments" / "configs" / "imagenet_deit3_800.toml",
-}
-RECIPE_CONFIGS = {"vit3": VIT3_CONFIG, "ropevit_400": ROPEVIT_CONFIG, **DEIT3_CONFIGS}
+DEFAULT_CONFIG = ROOT / "experiments" / "configs" / "imagenet300.toml"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 OFFICIAL_VIT3_URL = (
     "https://github.com/LeapLabTHU/ViTTT/tree/"
     "e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt"
 )
-OFFICIAL_DEIT3_URL = "https://github.com/facebookresearch/deit/blob/main/README_revenge.md"
-OFFICIAL_ROPEVIT_URL = "https://github.com/naver-ai/rope-vit/blob/main/deit/README.md"
 IMAGENET_CHECKPOINT_FORMAT = 13
 IMAGENET_WDS_SOURCE = "timm/imagenet-1k-wds"
 IMAGENET_WDS_MANIFEST_SHA256 = (
@@ -217,11 +207,7 @@ class ImageNetRun:
             "operator": self.operator,
             "train": self.train,
             "overrides": list(self.overrides),
-            **({"official_ropevit_recipe": OFFICIAL_ROPEVIT_URL}
-               if self.train.get("recipe") == "ropevit_400"
-               else {"official_deit3_recipe": OFFICIAL_DEIT3_URL}
-               if self.train.get("recipe") in DEIT3_CONFIGS
-               else {"official_vit3_recipe": OFFICIAL_VIT3_URL}),
+            "official_vit3_recipe": OFFICIAL_VIT3_URL,
             "batching": batching_plan.as_dict(),
             "data": dict(data_contract),
             "checkpoint_contract_digest": self.checkpoint_contract_digest(
@@ -233,11 +219,11 @@ class ImageNetRun:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train MemSolve with RoPE-ViT, ViT³ or DeiT III recipes on ImageNet-1K with torchrun."
+        description="Train MemSolve on ImageNet with torchrun."
     )
     parser.add_argument("--config", type=Path,
                         default=DEFAULT_CONFIG,
-                        help="defaults to RoPE-ViT-derived 400e training for T/S/B")
+                        help="defaults to the MemSolve 300e RA/EMA recipe for T/S/B")
     parser.add_argument("--tier", choices=("tiny", "small", "base"), required=True)
     parser.add_argument(
         "--phase",
@@ -434,9 +420,6 @@ def _validate_run(
     operator: Mapping[str, Any],
     train: Mapping[str, Any],
 ) -> None:
-    recipe = train.get("recipe", "vit3")
-    if recipe not in RECIPE_CONFIGS:
-        raise ValueError(f"recipe must be one of {', '.join(RECIPE_CONFIGS)}")
     _require_keys(
         model,
         (
@@ -517,7 +500,7 @@ def _validate_run(
     MemSolveConfig(dim=embed_dim, num_heads=heads, rank=model["rank"],
                    core_mode=operator["core_mode"])
     if operator["bias"] is not True:
-        raise ValueError("the restored scaffold requires qkv/projection bias")
+        raise ValueError("the visual scaffold requires projection bias")
     if operator["implementation"] not in {"cuda", "reference"}:
         raise ValueError("operator.implementation must be 'cuda' or 'reference'")
 
@@ -556,28 +539,12 @@ def _validate_run(
         decay = _probability(train.get("ema_decay"), "ema_decay")
         if decay >= 1:
             raise ValueError("ema_decay must be less than one")
-    if recipe == "vit3":
-        if train["optimizer"] != "fused_adamw":
-            raise ValueError("plain ViT³ uses fused AdamW")
-        if train["augmentation"] != "rand_augment":
-            raise ValueError("plain ViT³ uses RandAugment")
-        if model["drop_path_schedule"] != "linear":
-            raise ValueError("plain ViT³ requires linear DropPath")
-    else:
-        family = "RoPE-ViT" if recipe == "ropevit_400" else "DeiT III"
-        group_size = _positive_int(train.get("augmentation_group_size"), "augmentation_group_size")
-        if group_size % 2 or int(train["batch_size"]) % group_size:
-            raise ValueError(f"{family} physical batch_size must be divisible by an even augmentation_group_size")
-        if model["drop_path_schedule"] != "constant":
-            raise ValueError(f"{family} requires constant DropPath across layers")
-        expected_optimizer = "fused_lamb" if phase == "pretrain" else "fused_adamw"
-        expected_augmentation = "three_augment" if phase == "pretrain" else "rand_augment"
-        if train["optimizer"] != expected_optimizer or train["augmentation"] != expected_augmentation:
-            raise ValueError(f"{family} {phase} requires {expected_optimizer} and {expected_augmentation}")
-        if train["repeated_aug"] is not (phase == "pretrain"):
-            raise ValueError(f"{family} repeats augmentation only in pretraining")
-        if recipe in DEIT3_CONFIGS and train["ema"] is not False:
-            raise ValueError("the explicit DeiT III adaptations disable EMA")
+    if train["optimizer"] != "fused_adamw":
+        raise ValueError("ImageNet training uses fused AdamW")
+    if train["augmentation"] != "rand_augment":
+        raise ValueError("ImageNet training uses RandAugment")
+    if model["drop_path_schedule"] != "linear":
+        raise ValueError("ImageNet training uses linear DropPath")
     if not isinstance(train["bce_loss"], bool):
         raise ValueError("bce_loss must be a boolean")
     if train["bce_loss"] and float(train["label_smoothing"]) != 0:
@@ -591,12 +558,8 @@ def _validate_run(
     actual = (model["embed_dim"], model["depth"], model["num_heads"], model["rank"])
     if actual != expected:
         raise ValueError(f"{tier} geometry must be {expected}, got {actual}")
-    low_resolution_pretrain = phase == "pretrain" and (
-        recipe in DEIT3_CONFIGS or (recipe == "ropevit_400" and tier == "base")
-    )
-    expected_size = 192 if low_resolution_pretrain else 224
-    if image_size != expected_size or (recipe == "vit3" and phase != "pretrain"):
-        raise ValueError(f"{recipe}/{phase} requires input size {expected_size}")
+    if image_size != 224:
+        raise ValueError("ImageNet training requires input size 224")
 
 
 def _validate_batching_contract(value: object) -> None:
@@ -881,33 +844,9 @@ def _restore_resume_rng_state(
         raise ValueError("resume checkpoint has an invalid RNG state") from error
 
 
-class DeiTGaussianBlur:
-    """PIL radius sampling from facebookresearch/deit augment.py (Apache-2.0)."""
-
-    def __call__(self, image: Any) -> Any:
-        from PIL import ImageFilter
-
-        return image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 2.0)))
-
-
 def build_train_transform(run: ImageNetRun) -> Any:
     train = run.train
     image_size = int(run.model["image_size"])
-    if train["augmentation"] == "three_augment":
-        from torchvision import transforms
-        from timm.data.transforms import RandomResizedCropAndInterpolation
-
-        # Official DeiT III augment.py: RRC, flip, one of grayscale /
-        # solarization / PIL blur, then color jitter and ImageNet normalization.
-        return transforms.Compose([
-            RandomResizedCropAndInterpolation(image_size, scale=(0.08, 1.0), interpolation="bicubic"),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomChoice([
-                transforms.Grayscale(3), transforms.RandomSolarize(128, p=1.0), DeiTGaussianBlur(),
-            ]),
-            transforms.ColorJitter(*([float(train["color_jitter"])] * 3)),
-            transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
     from timm.data import create_transform
 
     return create_transform(
@@ -1875,7 +1814,7 @@ def build_model(run: ImageNetRun) -> nn.Module:
     except ImportError as error:
         raise RuntimeError(
             "ImageNet training requires integrations.timm.create_memsolve_vit; "
-            "the shared restored backbone adapter is not available."
+            "the shared backbone adapter is not available."
         ) from error
 
     model = run.model
@@ -2013,18 +1952,6 @@ def build_optimizer(model: nn.Module, run: ImageNetRun) -> tuple[torch.optim.Opt
         model, weight_decay=float(run.train["weight_decay"]),
         no_weight_decay_list=_no_weight_decay(model),
     )
-    if run.train["optimizer"] == "fused_lamb":
-        try:
-            from apex.optimizers import FusedLAMB
-        except ImportError as error:
-            raise RuntimeError("fused_lamb requires NVIDIA Apex with CUDA extensions; see docs/IMAGENET_DEIT3.md") from error
-        if any(p.device.type != "cuda" or p.dtype != torch.float32 for p in model.parameters()):
-            raise ValueError("fused LAMB requires CUDA FP32 parameters; BF16 autocast activations are supported")
-        return FusedLAMB(
-            groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8,
-            bias_correction=True, adam_w_mode=True, grad_averaging=True,
-            max_grad_norm=float(run.train["clip_grad"]), use_nvlamb=False,
-        ), "apex.lamb.fused"
     return (
         torch.optim.AdamW(
             groups, lr=float(run.train["lr"]), betas=(0.9, 0.999), eps=1e-8, fused=True,
@@ -2370,8 +2297,8 @@ def train_epoch(
                 _assert_finite_loss(data_loss, epoch=epoch, step=step)
                 loss.backward()
         if update_boundary:
-            # Fused LAMB clips once internally after accumulation and DDP sync.
-            if run.train["optimizer"] != "fused_lamb" and float(run.train["clip_grad"]) > 0:
+            # Clip once after accumulation and DDP synchronization.
+            if float(run.train["clip_grad"]) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(run.train["clip_grad"]))
             optimizer.step()
             if model_ema is not None:
@@ -2566,10 +2493,10 @@ def _recipe_fidelity(
         "execution",
     }
     # A custom TOML can alter hyperparameters without creating CLI overrides.
-    recipe = run.train.get("recipe", "vit3")
-    is_deit = recipe in DEIT3_CONFIGS
-    with RECIPE_CONFIGS[recipe].open("rb") as handle:
+    with DEFAULT_CONFIG.open("rb") as handle:
         canonical = tomllib.load(handle)
+    if run.phase not in canonical["tiers"][run.tier]:
+        return "explicitly-modified"
     canonical_train = {
         **canonical["defaults"],
         **canonical["tiers"][run.tier][run.phase],
@@ -2590,11 +2517,9 @@ def _recipe_fidelity(
         matches_recipe
         and not (set(run.overrides) - non_semantic_overrides)
         and batching_plan.effective_batch_size == int(run.train["effective_batch"])
-        and resolved_optimizer == ("apex.lamb.fused" if canonical_train["optimizer"] == "fused_lamb" else "torch.adamw.fused")
+        and resolved_optimizer == "torch.adamw.fused"
     ):
-        if recipe == "ropevit_400":
-            return "ropevit-derived"
-        return "deit3-derived" if is_deit else "vit3-derived"
+        return "memsolve-imagenet300"
     return "explicitly-modified"
 
 

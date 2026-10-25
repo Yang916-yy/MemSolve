@@ -36,11 +36,14 @@ The tested native stack is Torch `2.14.0+cu132`, CUDA 13.2, MathDx 26.06.1,
 and CMake >=3.25 on SM80/A800.
 
 ```bash
-git clone https://github.com/Yang916-yy/MemSolve.git
+git clone --depth 1 https://github.com/Yang916-yy/MemSolve.git
 cd MemSolve
 python -m pip install -e '.[vision]'
 PYTHON=python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
 ```
+
+The shallow clone includes the current code, paper, and published experiment
+logs. Use `git fetch --unshallow --tags` when you need historical revisions.
 
 Use `.[nlp]` for language workflows or `.[sequence]` for genomic/LRA experiments.
 Dense vision requires `.[vision,openmmlab]` and compiled MMCV; see the

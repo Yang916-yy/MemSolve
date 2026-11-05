@@ -15,7 +15,7 @@ The Hugging Face integration replaces BERT's self-attention layer with MemSolve 
 | Parameters (RoVE, tied MLM head) | 111,123,938 |
 | Parameters (learned absolute positions, tied MLM head) | 111,517,154 |
 
-- **Position Encoding**: The paper's MLM and GLUE experiments use **learned absolute position embeddings** (max 512 positions). Their logs and configs are in [`results/mlm/`](../results/mlm/) and [`results/glue/`](../results/glue/). The default template in `experiments/configs/memsolve_bert_mlm.json` uses **RoVE**; to match the paper's absolute-position model, set `"position_embedding_type": "absolute"` in the config.
+- **Position Encoding**: The paper evaluates both **learned absolute position embeddings** (`MemSolve-BERT`, max 512 positions, with step-by-step logs in [`results/mlm/`](../results/mlm/) and [`results/glue/`](../results/glue/)) and parameter-free **RoVE** (`MemSolve-BERT (RoVE)`). The default template in `experiments/configs/memsolve_bert_mlm.json` uses **RoVE** (`"position_embedding_type": "rove"`); to train the learned-position model, set `"position_embedding_type": "absolute"` in the config.
 - **Short Convolution**: Set `memsolve_short_conv_kernel=0` to disable the depthwise convolution. When enabled (`kernel=3`), padded tokens are zeroed before and after the convolution, and its weights are zero-initialized so the branch starts as an exact identity.
 - **Initialization**: Projection weights and BERT layers use $\mathcal{N}(0, 0.02^2)$ with zero bias; the MemSolve core starts at $J = I$ ($F = 0$) and $\eta = 0.9$.
 

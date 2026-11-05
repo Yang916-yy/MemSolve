@@ -30,4 +30,4 @@ For detection and segmentation, the pretrained backbone connects to a standard `
 
 - **Backbone**: width 768, 14 layers, 12 heads, rank 32, Post-LayerNorm residuals, SwiGLU feed-forward networks (branch width 2048), and a tied masked-LM output head.
 - **Local context**: a centered $3 \times 1$ depthwise residual convolution before each MemSolve layer (zero-initialized so each block starts as an identity residual). Padding tokens are masked before and after the convolution.
-- **Position encoding**: supports either learned absolute position embeddings (`111,517,154` parameters with 512 positions, used in the paper's C4 MLM and GLUE experiments) or parameter-free Rotary Value Encoding (`RoVE`, `111,123,938` parameters). See [BERT_MLM.md](BERT_MLM.md) for training and fine-tuning details.
+- **Position encoding**: supports both learned absolute position embeddings (`111,517,154` parameters with 512 positions) and parameter-free Rotary Value Encoding (`RoVE`, `111,123,938` parameters); both variants are evaluated in the paper's C4 MLM and GLUE experiments. See [BERT_MLM.md](BERT_MLM.md) for training and fine-tuning details.

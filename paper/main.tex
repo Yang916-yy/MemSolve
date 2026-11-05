@@ -90,10 +90,11 @@ Directional recurrences correct prefix and suffix memories separately, while a
 direct full-context solve inverts a sequence-sized matrix at cubic cost.
 We propose MemSolve, a sequence mixer in which all tokens jointly determine one
 shared memory and the model solves directly for its equilibrium.
-Matching the memory regularizer to an input-dependent write--read frame turns
-this global correction into a well-posed compact linear system with a strictly
-contractive readout, and it lets tokens interact in ways that locally
-parameterized bidirectional scans cannot represent.
+Normalizing token write--read coordinates by their $r\times r$ second-moment
+factor and matching the memory regularizer to this frame reduces global
+correction to a batch-shared accretive linear system with a strictly
+contractive readout, letting tokens interact in ways that locally parameterized
+bidirectional scans cannot represent.
 Two additive token reductions give linear complexity at fixed rank and exact
 sequence parallelism, and our implementation runs $7.8\times$ faster than
 FlashAttention at $8{,}192$ tokens in single-GPU forward--backward execution.
@@ -108,9 +109,9 @@ Range Arena tasks under a controlled backbone.
 
 \section{Introduction}
 
-Gated Delta Networks (GDNs) have advanced causal sequence modeling by writing
-prediction errors back into memory
-\cite{yang2025gdn,kimi2025linear,hatamizadeh2026gdn2}.
+Delta-rule memories have advanced causal sequence modeling by pairing
+error-correcting writes with adaptive gating
+\cite{yang2025deltanet,yang2025gdn,kimi2025linear,hatamizadeh2026gdn2}.
 Self-attention keeps every token for retrieval \cite{vaswani2017attention},
 whereas linear attention and state-space models (SSMs) compress the context
 into a fixed-size state in which stored associations interfere as they
@@ -119,7 +120,8 @@ The delta rule reduces this interference by predicting content from the
 current memory and writing back only the error
 \cite{schlag2021fastweights,yang2025deltanet}, so each update can revise what
 is already stored.
-GDNs add adaptive forgetting and write controls on top of this rule.
+Gated Delta Networks (GDNs) add adaptive forgetting and write controls on top
+of this rule.
 
 Error-correcting updates can also be read as training an internal predictor on
 the context.
@@ -132,24 +134,25 @@ order, and ViT$^3$ finds that full-batch updates over all visual tokens
 outperform sequential mini-batches \cite{han2026vit3}.
 These results suggest letting every association act on one memory state at
 once and solving for its equilibrium directly, instead of approximating it
-with a few inner steps.
+with one or a few gradient steps.
 
 The obstacle is cost.
 Recurrent models stay cheap because they update a compact state
 incrementally, whereas a memory coupled across all tokens seems to require a
 global solve.
-LION keeps bidirectional DeltaNet tractable by correcting prefix and suffix
-memories separately, and the direct full-attention form it discusses needs a
-sequence-sized inverse whose cubic cost cancels the benefit of a compact state
-\cite{afzal2025lion}.
+When LION extends DeltaNet to bidirectional contexts, it corrects prefix and
+suffix memories in separate scans, because the parallel full-attention form
+requires a sequence-sized matrix inverse whose cubic cost undermines fast
+training \cite{afzal2025lion}.
 
 We propose \textbf{MemSolve}, an operator that builds full-context associative
 memory through one compact equilibrium solve.
-We design the error-correction dynamics and the token readout together so that
-the solve never leaves rank space.
-All positions contribute association statistics in parallel and read context
-back from the resulting equilibrium, which keeps the cost linear in sequence
-length at fixed rank.
+All positions contribute rank-$r$ association statistics in parallel through a
+Cholesky-normalized write--read frame, and matching the memory regularizer to
+this frame reduces the equilibrium solve to one learned accretive core shared
+across the batch.
+Reading context back through the same frame keeps the entire mixer in rank
+space and linear in sequence length.
 Our contributions are as follows.
 
 \paragraph{Global Equilibrium ($\S$\ref{sec:joint-memory}, $\S$\ref{sec:readout}).}
@@ -212,16 +215,15 @@ against one shared state.
 TTT treats the hidden state as an inner model trained on the sequence
 \cite{sun2025ttt}, and test-time regression unifies many memory mechanisms
 under this view \cite{wang2025testtimeregression}.
-Some methods solve the regression directly.
-Intention fits a regularized key--value regression and evaluates it at query
-embeddings \cite{garnelo2023intention}, and MesaNet runs conjugate gradients
-over the causal context \cite{vonoswald2026mesanet}.
-In the bidirectional setting, ViT$^3$ shows that full-batch inner updates beat
-sequential mini-batches for visual recognition, although extra inner passes
-cost throughput and stability \cite{han2026vit3}.
-These solvers treat each sample separately.
-MemSolve keeps the regression view but arranges the system so that its learned
-part is shared across the batch (Appendix~\ref{app:related}).
+Some methods solve this regression directly: Intention fits a regularized
+key--value system per sample and evaluates it at separate query embeddings
+\cite{garnelo2023intention}, while MesaNet runs conjugate gradients at each
+causal step \cite{vonoswald2026mesanet}.
+In the bidirectional setting, ViT$^3$ shows that a full-batch inner gradient
+step beats sequential mini-batches for visual recognition, although extra
+inner passes cost throughput and stability \cite{han2026vit3}.
+MemSolve keeps the regression view but shares a single write--read frame per
+sample and a single learned core across the batch (Appendix~\ref{app:related}).
 
 \paragraph{Bidirectional mixers.}
 BiMamba, Hydra, and LION let each token gather information from both
@@ -270,30 +272,9 @@ MemSolve takes the memory to be the equilibrium of this field ($\dot U=0$):
  (P^\T P+\Gamma_X+\Omega)U^\star=P^\T C.
  \label{eq:joint-equilibrium}
 \end{equation}
-With a fixed regularizer, the Gram matrix $P^\T P$ would change from sample to
-sample, and every input would need its own non-Hermitian $r\times r$
-factorization.
-We avoid this by matching $\Gamma_X$ to the frame Gram matrix so that all
-samples share one learned system matrix $\I_r+J$, while the right-hand side
-$P^\T C$ carries each input's associations.
-Each head learns a compact core
-\begin{equation}
- J=LL^\T+\Omega,\qquad LL^\T\succ0,\qquad\Omega^\T=-\Omega,
- \label{eq:core}
-\end{equation}
-built from a lower-triangular $L$ with positive diagonal and a skew-symmetric
-$\Omega$ (Appendix~\ref{app:parameters}).
-Its symmetric part $LL^\T$ is positive definite, so $J$ is strictly accretive.
-Setting the system matrix in Eq.~\eqref{eq:joint-equilibrium} equal to
-$\I_r+J$ fixes the regularizer as
-\begin{equation}
- \Gamma_X=\I_r+LL^\T-P^\T P,
- \label{eq:gamma}
-\end{equation}
-and keeping $\Gamma_X\succ0$ for every input only requires $P^\T P\prec\I_r$.
-
 A learned projection maps tokens $X$ to relation features
-$B\in\R^{N\times r}$ and content $C$, and we set
+$B\in\R^{N\times r}$ and content $C$, and we normalize the relation coordinates
+through a unit-shifted Cholesky factorization:
 \begin{equation}
  \begin{aligned}
  A&=B/\sqrt{N}, & R^\T R&=\I_r+A^\T A,\\
@@ -302,16 +283,37 @@ $B\in\R^{N\times r}$ and content $C$, and we set
  \label{eq:frame}
 \end{equation}
 where $R$ is the upper Cholesky factor with positive diagonal.
-Scaling by $\sqrt N$ turns $A^\T A$ into an average second-moment matrix, so
-the eigenvalues $g_i/(1+g_i)$ of $P^\T P=A^\T(\I_r+AA^\T)^{-1}A$ stay strictly
-below one and do not drift toward one as more tokens write into the memory.
+Scaling by $\sqrt N$ turns $A^\T A$ into an average second-moment matrix with
+eigenvalues $g_i\ge0$, so the eigenvalues $g_i/(1+g_i)$ of
+$P^\T P=R^{-\T}A^\T AR^{-1}=\I_r-R^{-\T}R^{-1}$ stay strictly below one and do
+not drift toward one as more tokens write into the memory.
 The contrast between strong and weak relation directions therefore does not
-depend on sequence length.
-Hence $\Gamma_X\succ0$, and we call the bounded coordinates $P$ a
+depend on sequence length, and we call the bounded coordinates $P$ a
 \emph{soft frame} (Appendix~\ref{app:frame}).
 
-Substituting Eq.~\eqref{eq:gamma} cancels the sample-dependent Gram term and
-gives a closed-form equilibrium:
+Because $P=AR^{-1}$ already normalizes each sample's relation second moments up
+to the positive-definite defect $\I_r-P^\T P=R^{-\T}R^{-1}\succ0$, a fixed
+regularizer in Eq.~\eqref{eq:joint-equilibrium} would apply redundant
+sample-dependent damping and require a separate non-Hermitian $r\times r$
+factorization for every input.
+Instead, each head learns a compact accretive core
+\begin{equation}
+ J=LL^\T+\Omega,\qquad LL^\T\succ0,\qquad\Omega^\T=-\Omega,
+ \label{eq:core}
+\end{equation}
+built from a lower-triangular $L$ with positive diagonal and a skew-symmetric
+$\Omega$ (Appendix~\ref{app:parameters}), and matches $\Gamma_X$ to supply the
+complementary damping $\I_r-P^\T P$ alongside $LL^\T$:
+\begin{equation}
+ \Gamma_X=(\I_r-P^\T P)+LL^\T=R^{-\T}R^{-1}+LL^\T\succ0.
+ \label{eq:gamma}
+\end{equation}
+Substituting Eq.~\eqref{eq:gamma} into Eq.~\eqref{eq:joint-equilibrium}
+decouples per-sample second-moment normalization from cross-coordinate mixing:
+the soft frame $P$ carries the sample-specific Gram inverse
+$(\I_r+A^\T A)^{-1}$ across writing ($Z=P^\T C$) and readout, while the
+equilibrium solve itself shares one learned system matrix $\I_r+J$ across all
+samples:
 \begin{equation}
  \dot U=Z-(\I_r+J)U,\qquad U^\star=(\I_r+J)^{-1}Z.
  \label{eq:dynamics}
@@ -329,7 +331,7 @@ equilibrium $U^\star$, with
  \norm{(\I_r+J)^{-1}}_2\le\mu^{-1},\qquad
  \norm{(\I_r+J)^{-\T}}_2\le\mu^{-1},
 \end{equation}
-and every trajectory contracts exponentially as
+and every trajectory $U(t)$ contracts to $U^\star$ with Frobenius error
 $\norm{U(t)-U^\star}_F\le e^{-\mu t}\norm{U(0)-U^\star}_F$.
 \end{proposition}
 
@@ -395,8 +397,8 @@ satisfies $\norm{K_X}_2\le\max\{|\eta|,\norm{F}_2\}<1$ and has rank bound
 $\rank(K_X-\eta\I_N)\le r$, with $K_Xv=\eta v$ for all $v\in\ker(P^\T)$.
 \end{theorem}
 
-The token bound holds because $K_X$ is an isometric compression of the
-block-diagonal contraction $\diag(\eta\I_N,F)$ (Appendix~\ref{app:spectrum}).
+This token-space bound follows because $K_X$ is an isometric compression of
+the block-diagonal contraction $\diag(\eta\I_N,F)$ (Appendix~\ref{app:spectrum}).
 It concerns the linear map $C\mapsto K_XC$ at a fixed frame and does not bound
 derivatives through $P(X)$ or the surrounding residual block.
 All singular values of the $N\times N$ operator $K_X$ also follow exactly from
@@ -417,10 +419,12 @@ projection, so both mix context in an input-dependent way.
 Head outputs are concatenated and passed through a linear projection.
 
 \paragraph{Optional rotary value encoding.}
-RoVE \cite{garcia2026rove} injects relative position into the content path
-without separating write and read coordinates.
-It rotates each content vector $c_i$ by $O_i=O(t_i)$ before aggregation and
-applies $O_i^\T$ to the contextual correction at readout:
+Whereas RoVE was introduced on top of RoPE attention \cite{garcia2026rove},
+applying its rotary transport solely to the content path injects relative
+position into MemSolve while keeping the relation Gram matrix $A^\T A$ and
+shared frame $P$ position-invariant.
+Each content vector $c_i$ is rotated by $O_i=O(t_i)$ before aggregation and
+$O_i^\T$ is applied to the contextual correction at readout:
 \begin{equation}
  y_i=\eta c_i+\sum_j D_{ij}O_i^\T O_j c_j,
  \qquad D=P(F-\eta\I_r)P^\T.
@@ -430,7 +434,7 @@ With a fixed frequency scale, $O_i^\T O_j=O(t_j-t_i)$ encodes relative offsets
 in 1D sequences or axial offsets in 2D grids, adds no learned parameters, and
 leaves the fixed-frame contraction bound intact (Appendix~\ref{app:rove}).
 
-\subsection{Interactions beyond independent directional scans}
+\subsection{Beyond independent directional scans}
 \label{sec:ssm}
 
 The core $J$ is shared across inputs, yet token interactions still depend on
@@ -768,9 +772,10 @@ MiTA \cite{wen2026mita} & 40.05 & 66.21 & 83.90 & 65.16 & 80.82 & 67.23\\
 \end{table*}
 
 \paragraph{Encoder and protocol.}
-We replace self-attention with MemSolve in a 14-layer BERT-style encoder with
-SwiGLU FFNs \cite{shazeer2020glu}, post-LayerNorm residuals, and a centered
-width-3 depthwise convolution before each relation--content projection.
+We substitute MemSolve for self-attention in a 14-layer BERT-style encoder
+using SwiGLU FFNs \cite{shazeer2020glu}, post-LayerNorm residuals, and a
+centered width-3 depthwise convolution before each relation--content
+projection.
 \textbf{MemSolve-BERT} (112M parameters with the tied MLM head) keeps BERT's
 512 learned absolute positions, and \textbf{MemSolve-BERT (RoVE)} (111M) drops
 the position table and encodes relative offsets through parameter-free RoVE
@@ -969,23 +974,22 @@ and experiments. It is organized as follows:
 Internal learning can be formulated by solving for an internal state on
 context tokens and reading predictions back from that state.
 Intention makes this paradigm explicit in the key--value--query setting
-\cite{garnelo2023intention}: it fits a regularized regression model to
-embedded key--value pairs, optionally applies a learned transformation to the
-fitted state, and evaluates the resulting predictor at query embeddings,
-turning the regression solve into a composable neural module.
-MemSolve shares this regression view and fixes two of its choices.
-Reads reuse the write frame, and the ridge shift grows with the number of
-tokens, since in raw relation features $PP^\T=B(N\I_r+B^\T B)^{-1}B^\T$.
-These two choices keep the token-space gain below one, and the matched
-regularizer then leaves a single learned core shared across the batch.
+\cite{garnelo2023intention}: it fits a regularized least-squares model
+$(E_K^\T E_K+\alpha\I)^{-1}E_K^\T E_V$ to embedded keys and values, optionally
+applies a learned map to the fitted state, and evaluates the predictor at
+separate query embeddings $E_Q$.
+Because the inverse sits entirely on the key side while queries are
+unnormalized and $\alpha$ is fixed, the resulting token operator is neither
+symmetric nor uniformly contractive as sequence length grows.
 
-MemSolve co-designs the equilibrium memory equation and its token readout
-around a shared, input-dependent soft frame that both writes associations
-into memory and reads the response back to tokens.
-By matching the regularizer to this frame, the linear system matrix becomes
-shared across inputs while the right-hand side aggregates each sample's
-associations, allowing the full context to govern both the memory coordinates
-and the content stored within them.
+MemSolve shares this regression view but co-designs the memory equation and
+readout around a symmetric write--read soft frame $P=AR^{-1}$ whose ridge
+shift scales with token count ($PP^\T=B(N\I_r+B^\T B)^{-1}B^\T$).
+Splitting $(\I_r+A^\T A)^{-1}=R^{-1}R^{-\T}$ across writing ($Z=R^{-\T}A^\T C$)
+and readout ($AR^{-1}\cdot$) keeps $P^\T P\prec\I_r$ at every sequence length,
+and matching the regularizer to this frame places a single batch-shared
+Cayley core $F=(\I_r+J)^{-1}(\I_r-J)$ between the two triangular solves while
+guaranteeing a strictly contractive token map (Theorem~\ref{thm:contraction}).
 
 \subsection{Deep equilibrium models}
 \label{app:deq}
@@ -1045,9 +1049,12 @@ Structured state-space models (SSMs) provide hardware-efficient sequence maps
 \cite{gu2022s4,gu2024mamba,dao2024mamba2} that have been adapted to
 bidirectional vision and language modeling through selective scans in Vim,
 bidirectional matrix mixers in Hydra, and unified recurrent/chunkwise/attention
-formulations in LION \cite{zhu2024vim,hwang2024hydra,afzal2025lion}, as well
-as frame-local bidirectional memory updates in Video DeltaNet
-\cite{xi2026videodeltanet}.
+formulations in LION \cite{zhu2024vim,hwang2024hydra,afzal2025lion}.
+In video generation, Video DeltaNet \cite{xi2026videodeltanet} resolves
+spatial token writes jointly within each frame through a frame-level ridge
+inverse $(\I+A_t)^{-1}$, while still scanning forward and backward across
+frames and relying on a parallel local softmax branch for fine-grained
+interactions.
 
 From the standpoint of token interactions, the central question is how
 forward and backward contexts combine: under local parameterization,
@@ -1072,22 +1079,22 @@ contraction proof.
 \subsection{Soft-frame geometry}
 \label{app:frame}
 
-From $R^\T R=\I+A^\T A$ and $P=AR^{-1}$, we have
+From $R^\T R=\I_r+A^\T A$ and $P=AR^{-1}$, we have
 \begin{equation}
- PP^\T=A(\I+A^\T A)^{-1}A^\T,
+ PP^\T=A(\I_r+A^\T A)^{-1}A^\T,
 \end{equation}
 so the singular value decomposition of $A$ immediately yields
 \begin{equation}
  \sigma_i(P)=\frac{\sigma_i(A)}{\sqrt{1+\sigma_i(A)^2}}<1.
  \label{eq:soft-singular}
 \end{equation}
-In particular, $P^\T P\prec\I_r$ and $PP^\T\prec\I_N$ even when $A$ is
-rank-deficient, and applying the Woodbury identity gives
+In particular, $P^\T P\prec\I_r$ (so $\I_r-P^\T P=R^{-\T}R^{-1}\succ0$, which
+ensures $\Gamma_X\succ0$) and $PP^\T\prec\I_N$ even when $A$ is
+rank-deficient, while applying the Woodbury identity gives
 \begin{equation}
  \I_N-PP^\T=(\I_N+AA^\T)^{-1}\succ0,
 \end{equation}
-which establishes both Eq.~\eqref{eq:complement} and the strict positive
-definiteness of $\Gamma_X$.
+which establishes Eq.~\eqref{eq:complement}.
 Moreover, because the reduced QR factorization of the augmented matrix
 $[A^\T,\I_r]^\T$ (with positive-diagonal upper triangular factor $R$) has top
 block $P=AR^{-1}$, the QR reference implementation and the compact Cholesky
@@ -1096,7 +1103,7 @@ formulation agree in exact arithmetic.
 Scaling by $\sqrt N$ also bounds the conditioning of the Gram matrix
 independently of sequence length: writing $b_i^\T$ for row $i$ of $B$, if the
 average relation energy satisfies $N^{-1}\sum_i\norm{b_i}_2^2\le c$, then
-$\norm{A}_2^2\le\norm{A}_F^2\le c$ and hence $\kappa_2(\I+A^\T A)\le1+c$ for
+$\norm{A}_2^2\le\norm{A}_F^2\le c$ and hence $\kappa_2(\I_r+A^\T A)\le1+c$ for
 all $N$ (though length extrapolation accuracy remains a separate empirical
 question).
 Finally, without a positional module, the core operator is permutation
@@ -1130,18 +1137,18 @@ the same exponential contraction.
 \subsection{Cayley contraction and coverage}
 \label{app:coverage}
 
-Because $M=\I+J$ commutes with $\I-J$, we have
+Because $M=\I_r+J$ commutes with $\I_r-J$, we have
 \begin{align}
- \I-F^\T F
- &=M^{-\T}\left[M^\T M-(\I-J)^\T(\I-J)\right]M^{-1}\\
+ \I_r-F^\T F
+ &=M^{-\T}\left[M^\T M-(\I_r-J)^\T(\I_r-J)\right]M^{-1}\\
  &=2M^{-\T}(J+J^\T)M^{-1}
  =4M^{-\T}LL^\T M^{-1}\succ0.
 \end{align}
 Conversely, for any real strict contraction $F_0$ ($\norm{F_0}_2<1$),
-$\I+F_0$ is invertible and its inverse Cayley transform satisfies
+$\I_r+F_0$ is invertible and its inverse Cayley transform satisfies
 \begin{equation}
- J_0=(\I-F_0)(\I+F_0)^{-1},\qquad
- \sym(J_0)=(\I+F_0)^{-\T}(\I-F_0^\T F_0)(\I+F_0)^{-1}\succ0.
+ J_0=(\I_r-F_0)(\I_r+F_0)^{-1},\qquad
+ \sym(J_0)=(\I_r+F_0)^{-\T}(\I_r-F_0^\T F_0)(\I_r+F_0)^{-1}\succ0.
 \end{equation}
 Cholesky-factoring $\sym(J_0)=LL^\T$ and setting $\Omega=(J_0-J_0^\T)/2$ shows
 that our triangular/softplus parameterization represents every such $L$ and
@@ -1239,7 +1246,7 @@ scan coefficients cannot reproduce.
 
 The algorithms below specify MemSolve in exact arithmetic, covering padding
 masks, short-sequence branches, and sequence-parallel reductions, followed by
-their mixed-precision GPU realization in Section~\ref{app:precision}.
+their mixed-precision GPU realization in Appendix~\ref{app:precision}.
 
 \subsection{Core parameters and initialization}
 \label{app:parameters}
@@ -1420,9 +1427,9 @@ $\overline\eta=\langle E,C\rangle_F-\tr(V)$.
 \subsection{Shared-core and scalar gradients}
 \label{app:core-backward}
 
-Writing $M=\I_r+J$, differentiating $F=M^{-1}(\I-J)$ gives
+Writing $M=\I_r+J$, differentiating $F=M^{-1}(\I_r-J)$ gives
 \begin{equation}
- dF=-M^{-1}(dJ)(\I+F).
+ dF=-M^{-1}(dJ)(\I_r+F).
  \label{eq:core-differential}
 \end{equation}
 Because the core is shared across the batch, its sample-level adjoints
@@ -1531,8 +1538,8 @@ Section~\ref{sec:method}.
 \subsection{Optional rotary value encoding}
 \label{app:rove}
 
-Let $\mathcal O$ apply planar rotations to each content row,
-$(\mathcal O C)_i^\T=O_i c_i$, across all $h$ channels in adjacent pairs
+Let $\mathcal O$ apply planar rotations to each content row $c_i^\T$,
+$(\mathcal O C)_i^\T=(O_i c_i)^\T$, across all $h$ channels in adjacent pairs
 ($h$ even).
 In compact form, RoVE modifies only the content reduction and final readout:
 \begin{equation}
@@ -1649,9 +1656,21 @@ and all recorded epochs are plotted directly without smoothing.
 
 \paragraph{Tiny-scale classification.}
 At the $5$M-parameter Tiny scale (Table~\ref{tab:imagenet-tiny}),
-MemSolve-ViT-T reaches $74.7\%$ Top-1 accuracy under the same 300-epoch
-recipe, outperforming DeiT-T by $2.5$ percentage points while trailing the
-slightly larger Vim-T ($7$M), ViG-T ($6$M), and ViT$^3$-T ($6$M) models.
+MemSolve-ViT-T uses a compact rank of $r=16$ per head and has the smallest
+parameter budget ($5.1$M, rounded to $5$M in Table~\ref{tab:imagenet-tiny},
+matching DeiT-T and using $16\%$ to $28\%$ fewer parameters than the
+$6$M--$7$M ViG-T, ViT$^3$-T, and Vim-T models).
+Under the same single-pass 300-epoch recipe, it reaches $74.7\%$ Top-1
+accuracy---gaining $+2.5$ percentage points over the matched-size DeiT-T
+baseline while running $2.1\times$ faster than FlashAttention and $15.3\times$
+faster than BiMamba with $25\%$ and $60\%$ lower peak memory in Tiny
+forward--backward execution (Table~\ref{tab:mixer-tiny}).
+Whereas the $6$M--$7$M recurrent and test-time-training baselines invest extra
+parameters in bidirectional scan projections or inner-loop adaptation layers to
+lead at Tiny scale, scaling the compact equilibrium state to $r=32$ (Small,
+$20$M) and $r=48$ (Base, $78$M) closes this gap and surpasses ViG-B and
+ViT$^3$-B while retaining the lowest parameter count across all three scales
+(Table~\ref{tab:imagenet}).
 
 \begin{table}[!ht]
 \centering
@@ -1683,24 +1702,24 @@ long-sequence fine-tuning.}
 To evaluate dense transfer in Table~\ref{tab:dense}, we wrap the 300-epoch
 ImageNet-1K EMA checkpoints of MemSolve-ViT-S and MemSolve-ViT-B in a standard
 ViT-Adapter \cite{chen2023vitadapter,duan2025vrwkv} (\texttt{conv\_inplane}
-$=64$, \texttt{deform\_ratio} $=1.0$, \texttt{cffn\_ratio} $=0.25$, 4 sampling
-points, and 6 or 12 deformable attention heads for Small and Base across four
-3-layer interaction blocks).
+$=64$, \texttt{cffn\_ratio} $=0.25$, 4 sampling points, and
+$(\texttt{deform\_num\_heads},\texttt{deform\_ratio})=(6,1.0)$ for Small and
+$(12,0.5)$ for Base across four 3-layer interaction blocks).
 At arbitrary feature-map resolutions $H\times W$, each MemSolve layer applies
 its residual $3\times3$ depthwise CPE on the 2D grid and normalizes its
 relation coordinates by $\sqrt{HW}$ in Eq.~\eqref{eq:frame}.
 On COCO 2017 \cite{lin2014coco}, we train Mask R-CNN \cite{he2017maskrcnn} on
 \texttt{train2017} for 12 epochs ($1\times$ schedule) with a global batch size
-of 16, AdamW ($\text{lr}=10^{-4}$, weight decay $0.05$, 500-step linear
-warmup, and $10\times$ step decays at epochs 8 and 11), and stochastic depth
-rates of $0.2$ (Small) and $0.3$ (Base), evaluating box and mask AP on
-\texttt{val2017}.
+of 16, AdamW ($\text{lr}=10^{-4}$, weight decay $0.05$, layer-wise
+learning-rate decay $0.85$, 500-step linear warmup, and $10\times$ step decays
+at epochs 8 and 11), and stochastic depth rates of $0.2$ (Small) and $0.3$
+(Base), evaluating box and mask AP on \texttt{val2017}.
 On ADE20K \cite{zhou2017ade20k}, we train UPerNet \cite{xiao2018upernet} for
 160,000 iterations at $512\times512$ crop size with a global batch size of 16,
 AdamW ($\text{lr}=6\times10^{-5}$, weight decay $0.01$, 1,500-step linear
 warmup, polynomial decay of power $1.0$, and layer-wise learning-rate decay
-$0.8$ for Small and $0.9$ for Base), and stochastic depth rates of $0.2$
-(Small) and $0.4$ (Base), reporting single-scale validation mIoU.
+$0.85$ for Small and $0.8$ for Base), and stochastic depth rates of $0.2$
+(Small) and $0.3$ (Base), reporting single-scale validation mIoU.
 Baseline scores for ViT-S/B (DeiT-S/B with ViT-Adapter) and VRWKV-S/B in
 Table~\ref{tab:dense} are cited from \cite{chen2023vitadapter,duan2025vrwkv}.
 Table~\ref{tab:dense-detail} reports the complete parameter breakdown and all

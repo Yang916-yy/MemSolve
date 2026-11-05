@@ -10,19 +10,19 @@
 
 Sequential test-time memory layers update their state one token at a time, making parallel training reliant on prefix scans and forcing bidirectional models to run separate forward and backward passes. **MemSolve** reformulates associative memory over a full token set as a simultaneous equilibrium problem.
 
-For each head, an input-dependent soft frame $P = A(I + A^\top A)^{-1/2}$ gathers token relations and content into a compact rank-$r$ sufficient statistic. A learned accretive core $J = I + L L^\top + \Omega \succeq I$ determines the global equilibrium response via a bounded Cayley map $F = (I + J)^{-1}(I - J)$, and the updated memory is read back to all tokens through the same frame:
+For each head, an input-dependent soft frame $P = A R^{-1}$ (with upper Cholesky factor $R^\top R = I_r + A^\top A$) gathers token relations and content into compact rank-$r$ sufficient statistics. A learned accretive core $J = L L^\top + \Omega$ ($LL^\top \succ 0, \Omega^\top = -\Omega$) determines the global equilibrium response via a contractive Cayley map $F = (I_r + J)^{-1}(I_r - J)$, and the updated memory is read back to all tokens through the same frame:
 
 $$
-Y = \eta C + P (F - \eta I) P^\top C.
+Y = \eta C + P (F - \eta I_r) P^\top C.
 $$
 
-Because $I + A^\top A$ and $I + J$ are strictly positive/accretive ($r \times r$ with $r \ll N$), the entire layer reduces to compact $r \times r$ Cholesky and LU solves—never materializing an $N \times N$ attention matrix or the $N \times r$ orthonormal frame $P$ in GPU memory.
+Because $I_r + A^\top A$ and $I_r + J$ are strictly positive/accretive ($r \times r$ with $r \ll N$), the entire layer reduces to compact $r \times r$ Cholesky and LU solves—never materializing an $N \times N$ attention matrix or the $N \times r$ soft frame $P$ in GPU memory.
 
 ## Highlights
 
-- **Vision Backbone & Dense Prediction**: With a plain non-hierarchical 12-layer ViT backbone, **MemSolve-ViT** reaches **74.7%** (Tiny, 5M), **81.0%** (Small, 20M), and **82.7%** (Base, 78M) Top-1 accuracy on ImageNet-1K. Paired with ViT-Adapter, it achieves **46.9 box AP / 41.8 mask AP** on COCO (Mask R-CNN 1×) and **48.5 mIoU** on ADE20K (UPerNet 160k).
-- **Bidirectional Language Pretraining**: Pretrained on C4 and fine-tuned on GLUE under the LION M2-BERT budget, **MemSolve-BERT** (110M) achieves an average GLUE score of **81.9**.
-- **Long Range Arena (LRA)**: Across all 5 LRA tasks under a controlled encoder with Rotary Value Encoding (RoVE), MemSolve reaches **74.9%** mean accuracy—outperforming softmax attention (72.1%) and every tested linear, kernel, and token-routing baseline.
+- **Vision Backbone & Dense Prediction**: With a plain non-hierarchical 12-layer ViT backbone, **MemSolve-ViT** reaches **74.7%** (Tiny, 5M), **81.0%** (Small, 20M), and **82.7%** (Base, 78M) Top-1 accuracy on ImageNet-1K. Paired with ViT-Adapter, it achieves **44.7 / 40.6** (Small) and **46.6 / 41.8** (Base) box / mask AP on COCO (Mask R-CNN 1×), and **47.2** (Small) / **48.3** (Base) mIoU on ADE20K (UPerNet 160k).
+- **Bidirectional Language Pretraining**: Pretrained on C4 and fine-tuned on GLUE under the LION M2-BERT budget, **MemSolve-BERT** (112M) achieves an average GLUE score of **81.9** (**81.5** with parameter-free RoVE, 111M).
+- **Long Range Arena (LRA)**: Across all 5 LRA tasks under a controlled encoder with Rotary Value Encoding (RoVE), MemSolve reaches **67.35%** mean accuracy—outperforming softmax attention (66.71%) and every tested linear, kernel, and token-routing baseline.
 - **Hardware Efficiency**: On an NVIDIA A800-80GB GPU under BF16 autocast and CUDA Graphs, full forward+backward execution at 8,192 tokens is **7.8× faster than FlashAttention-2** and **8.1× faster than BiMamba** (and **28.9×** / **9.2×** faster at 32,768 tokens).
 
 ## Installation

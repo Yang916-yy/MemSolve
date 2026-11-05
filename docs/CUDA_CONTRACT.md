@@ -44,7 +44,7 @@ Let $L = R^\top = T^{-1}$, $M = F - \eta I$, and let $E = A^\top \mathrm{d}Y$ (o
   dG   = T^T sym_lower(-M H^T - M^T H) T
 ```
 
-where $\operatorname{sym\_lower}(X) = \operatorname{tril}(X) + \operatorname{tril}(X, -1)^\top - \frac{1}{2}\operatorname{diag}(X)$ (combined with the $\frac{1}{2}$ factor in $-M H^\top - M^\top H$). For `equilibrium`, the shared core adjoint sums $H$ across the batch and reuses the saved partial-pivot LU factors of $I + J$ in a single transposed solve: $U_{\text{core}} = (I + J)^{-\top} \mathrm{d}F$ and $\mathrm{d}J = -U_{\text{core}} (F + I)^\top$.
+where $\operatorname{sym\_lower}(X) = \frac{1}{2}\bigl(\operatorname{tril}(X) + \operatorname{tril}(X, -1)^\top\bigr)$, matching $\operatorname{sym}_\ell$ in Eq. (28) of the paper. For `equilibrium`, the shared core adjoint sums $H$ across the batch and reuses the saved partial-pivot LU factors of $I + J$ in a single transposed solve: $U_{\text{core}} = (I + J)^{-\top} \mathrm{d}F$ and $\mathrm{d}J = -U_{\text{core}} (F + I)^\top$.
 
 ## Kernel Architecture & Numerical Precision
 
@@ -55,7 +55,7 @@ where $\operatorname{sym\_lower}(X) = \operatorname{tril}(X) + \operatorname{tri
 
 2. **Fused Triton Compact Chains (`memsolve/ball/cuda.py`)**:
    - **Forward (`_compact_chain`)**: Computes $Z = T Q$, applies $F - \eta I$ (by subtracting $\eta$ directly from the diagonal of $F$ in IEEE FP32 before the dot product for $r \le 32$, avoiding subtraction cancellation), and multiplies by $T^\top$ in a single kernel launch. In inference mode (`requires_grad=False`) at $r \le 32$, `STORE_FIRST=False` skips writing $Z$ to global memory altogether.
-   - **Backward (`_compact_chain_bwd_r32` / `_compact_Scale_bwd_r64`)**: At $r \in \{16, 32\}$, fuses all four compact matrix products ($U = T E$, $H = U Z^\top$, $\mathrm{d}Z = (F^\top - \eta I) U$, and $\mathrm{d}Q = T^\top \mathrm{d}Z$) in registers without materializing $U$ in global memory, and fuses the symmetric lower projection with both $T^\top (\cdot) T$ conjugation products into `_cholesky_adjoint_r32`.
+   - **Backward (`compact_chain_bwd_r32` / `compact_chain`)**: At $r \in \{16, 32\}$, fuses all four compact matrix products ($U = T E$, $H = U Z^\top$, $\mathrm{d}Z = (F^\top - \eta I) U$, and $\mathrm{d}Q = T^\top \mathrm{d}Z$) in registers without materializing $U$ in global memory, while `cholesky_product` and `compact_conjugate_tiled` evaluate the symmetric lower projection and $T^\top (\cdot) T$ conjugation products.
    - **Zero Register Spills**: Tile sizes and warp counts (`num_warps=4` or `8`) are tuned across all 12 Triton kernels so that every compiled specialization at $r \in \{16, 32, 48, 64\}$ compiles with **0 register spills** on SM80.
 
 3. **Precision Design**:
@@ -90,4 +90,4 @@ Requires PyTorch 2.14 (`+cu132`), CUDA 13.2, NVIDIA MathDx 26.06.1, C++20, and C
 PYTHON=python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
 ```
 
-Set `CUDA_HOME` and `MATHDX_ROOT` if your toolkit or MathDx headers are installed in non-default locations. `MEMSOLVE_CUDA_ARCHITECTURES` accepts a semicolon-separated list of SM targets (`80;86;89;90;100;120`).
+Set `CUDA_HOME` and `MATHDX_ROOT` if your toolkit or MathDx headers are installed in non-default locations. `MEMSOLVE_CUDA_ARCHITECTURES` accepts a semicolon-separated list of SM targets (`80;86;87;89;90;100;120`).

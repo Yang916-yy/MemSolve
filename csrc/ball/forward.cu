@@ -9,6 +9,7 @@ namespace {
 
 template <int rank>
 struct GenericCoreFactorMathDx {
+    static constexpr int kLuThreads = (rank == 32 || rank == 64) ? 128 : kThreads;
     using Getrf = decltype(
         cusolverdx::Size<rank, rank>() +
         cusolverdx::Precision<float>() +
@@ -16,14 +17,14 @@ struct GenericCoreFactorMathDx {
         cusolverdx::Function<cusolverdx::function::getrf_partial_pivot>() +
         cusolverdx::Arrangement<cusolverdx::arrangement::row_major>() +
         cusolverdx::Block() +
-        cusolverdx::BlockDim<kThreads>() +
+        cusolverdx::BlockDim<kLuThreads>() +
         cusolverdx::BatchesPerBlock<1>() +
         cusolverdx::SM<kCompiledSm>());
 };
 
 // Compact-only boundaries reuse MathDx LU without a token/frame tape.
 template<int rank>
-__global__ __launch_bounds__(kThreads) void compact_lu_kernel(
+__global__ __launch_bounds__(GenericCoreFactorMathDx<rank>::kLuThreads) void compact_lu_kernel(
     const float* input, float* output, int* pivots, int* status) {
     using Solver = typename GenericCoreFactorMathDx<rank>::Getrf;
     extern __shared__ __align__(16) unsigned char storage[];
@@ -43,7 +44,7 @@ __global__ __launch_bounds__(kThreads) void compact_lu_kernel(
 }
 
 template<int rank, bool transpose>
-__global__ __launch_bounds__(kRhsTile) void compact_getrs_kernel(
+__global__ __launch_bounds__(128) void compact_getrs_kernel(
     const float* factors, const int* pivots, const float* input,
     float* output, int64_t columns) {
     using Solver = decltype(
@@ -52,7 +53,7 @@ __global__ __launch_bounds__(kRhsTile) void compact_getrs_kernel(
         cusolverdx::Function<cusolverdx::function::getrs_partial_pivot>() +
         cusolverdx::TransposeMode<transpose ? cusolverdx::transpose::transposed : cusolverdx::transpose::non_transposed>() +
         cusolverdx::Arrangement<cusolverdx::arrangement::row_major,cusolverdx::arrangement::row_major>() +
-        cusolverdx::Block() + cusolverdx::BlockDim<kRhsTile>() +
+        cusolverdx::Block() + cusolverdx::BlockDim<128>() +
         cusolverdx::BatchesPerBlock<1>() + cusolverdx::SM<kCompiledSm>());
     __shared__ float lu[rank*Solver::lda];
     __shared__ float rhs[rank*Solver::ldb];
@@ -77,8 +78,9 @@ __global__ __launch_bounds__(kRhsTile) void compact_getrs_kernel(
 template<int rank>
 void launch_compact_lu(const at::Tensor& a, at::Tensor& lu, at::Tensor& pivot, at::Tensor& info) {
     using Solver=typename GenericCoreFactorMathDx<rank>::Getrf;
+    constexpr int threads=GenericCoreFactorMathDx<rank>::kLuThreads;
     constexpr size_t shared=Solver::shared_memory_size;
-    compact_lu_kernel<rank><<<a.numel()/(rank*rank),kThreads,shared,at::cuda::getCurrentCUDAStream()>>>(
+    compact_lu_kernel<rank><<<a.numel()/(rank*rank),threads,shared,at::cuda::getCurrentCUDAStream()>>>(
         a.data_ptr<float>(),lu.data_ptr<float>(),pivot.data_ptr<int>(),info.data_ptr<int>());
 }
 
@@ -87,54 +89,47 @@ void launch_compact_getrs(const at::Tensor& lu,const at::Tensor& pivot,const at:
     const int64_t cols=rhs.size(-1);
     dim3 grid(lu.numel()/(rank*rank),(cols+kRhsTile-1)/kRhsTile);
     if(transpose)
-        compact_getrs_kernel<rank,true><<<grid,kRhsTile,0,at::cuda::getCurrentCUDAStream()>>>(lu.data_ptr<float>(),pivot.data_ptr<int>(),rhs.data_ptr<float>(),out.data_ptr<float>(),cols);
+        compact_getrs_kernel<rank,true><<<grid,128,0,at::cuda::getCurrentCUDAStream()>>>(lu.data_ptr<float>(),pivot.data_ptr<int>(),rhs.data_ptr<float>(),out.data_ptr<float>(),cols);
     else
-        compact_getrs_kernel<rank,false><<<grid,kRhsTile,0,at::cuda::getCurrentCUDAStream()>>>(lu.data_ptr<float>(),pivot.data_ptr<int>(),rhs.data_ptr<float>(),out.data_ptr<float>(),cols);
+        compact_getrs_kernel<rank,false><<<grid,128,0,at::cuda::getCurrentCUDAStream()>>>(lu.data_ptr<float>(),pivot.data_ptr<int>(),rhs.data_ptr<float>(),out.data_ptr<float>(),cols);
 }
 
 
 // POTRF and identity-panel TRSM share one factorization per system.
 // The factor and implicit identity stay inside this CTA throughout.
 template<int rank>
-__global__ __launch_bounds__(128) void compact_inverse_kernel(
+__global__ __launch_bounds__(rank == 32 ? 32 : 64) void compact_inverse_kernel(
     const float* gram, float* output) {
-    constexpr int columns = rank;
+    constexpr int kInvThreads = rank == 32 ? 32 : 64;
     using Factor = decltype(cusolverdx::Size<rank,rank>() + cusolverdx::Precision<float>() +
         cusolverdx::Type<cusolverdx::type::real>() + cusolverdx::Function<cusolverdx::function::potrf>() +
         cusolverdx::FillMode<cusolverdx::fill_mode::lower>() +
         cusolverdx::Arrangement<cusolverdx::arrangement::row_major>() +
-        cusolverdx::LeadingDimension<rank>() + cusolverdx::Block() + cusolverdx::BlockDim<128>() +
+        cusolverdx::LeadingDimension<rank>() + cusolverdx::Block() + cusolverdx::BlockDim<kInvThreads>() +
         cusolverdx::BatchesPerBlock<1>() + cusolverdx::SM<kCompiledSm>());
-    using First = decltype(cusolverdx::Size<rank,kRhsTile>() + cusolverdx::Precision<float>() +
+    using First = decltype(cusolverdx::Size<rank,rank>() + cusolverdx::Precision<float>() +
         cusolverdx::Type<cusolverdx::type::real>() + cusolverdx::Function<cusolverdx::function::trsm>() +
         cusolverdx::Side<cusolverdx::side::left>() + cusolverdx::FillMode<cusolverdx::fill_mode::lower>() +
         cusolverdx::Diag<cusolverdx::diag::non_unit>() +
         cusolverdx::Arrangement<cusolverdx::arrangement::row_major,cusolverdx::arrangement::row_major>() +
-        cusolverdx::LeadingDimension<rank,kRhsTile>() + cusolverdx::Block() + cusolverdx::BlockDim<128>() +
+        cusolverdx::LeadingDimension<rank,rank>() + cusolverdx::Block() + cusolverdx::BlockDim<kInvThreads>() +
         cusolverdx::BatchesPerBlock<1>() + cusolverdx::SM<kCompiledSm>());
     __shared__ float a[rank*rank];
-    __shared__ float b[rank*kRhsTile];
+    __shared__ float b[rank*rank];
     __shared__ int info;
     const int64_t s=blockIdx.x;
-    for(int i=threadIdx.x;i<rank*rank;i+=blockDim.x)
-        a[i]=gram[s*rank*rank+i]+(i/rank==i%rank?1.f:0.f);
+    for(int i=threadIdx.x;i<rank*rank;i+=blockDim.x) {
+        const float diag = (i/rank==i%rank) ? 1.f : 0.f;
+        a[i]=gram[s*rank*rank+i]+diag;
+        b[i]=diag;
+    }
     __syncthreads();
     Factor().execute(a,&info);
     __syncthreads();
-    for(int64_t start=0;start<columns;start+=kRhsTile) {
-        for(int i=threadIdx.x;i<rank*kRhsTile;i+=blockDim.x) {
-            const int row=i/kRhsTile;const int64_t col=start+i%kRhsTile;
-            b[i]=(row==col && col<columns)?1.f:0.f;
-        }
-        __syncthreads();
-        First().execute(a,b);
-        __syncthreads();
-        for(int i=threadIdx.x;i<rank*kRhsTile;i+=blockDim.x) {
-            const int row=i/kRhsTile;const int64_t col=start+i%kRhsTile;
-            if(col<columns)output[(s*rank+row)*columns+col]=b[i];
-        }
-        __syncthreads();
-    }
+    First().execute(a,b);
+    __syncthreads();
+    for(int i=threadIdx.x;i<rank*rank;i+=blockDim.x)
+        output[s*rank*rank+i]=b[i];
 }
 
 }  // namespace
@@ -200,7 +195,7 @@ at::Tensor compact_inverse_cuda(const at::Tensor& gram) {
     auto inverse=at::empty_like(gram);
     const auto rank=gram.size(-1), systems=gram.numel()/(rank*rank);
     switch(rank) {
-#define MEMSOLVE_INVERSE_CASE(R) case R: compact_inverse_kernel<R><<<systems,128,0,at::cuda::getCurrentCUDAStream()>>>(gram.data_ptr<float>(),inverse.data_ptr<float>()); break;
+#define MEMSOLVE_INVERSE_CASE(R) case R: compact_inverse_kernel<R><<<systems,(R==32?32:64),0,at::cuda::getCurrentCUDAStream()>>>(gram.data_ptr<float>(),inverse.data_ptr<float>()); break;
         MEMSOLVE_INVERSE_CASE(16) MEMSOLVE_INVERSE_CASE(32) MEMSOLVE_INVERSE_CASE(48) MEMSOLVE_INVERSE_CASE(64)
 #undef MEMSOLVE_INVERSE_CASE
     }

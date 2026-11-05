@@ -14,6 +14,7 @@ from memsolve.ball import cuda
 from memsolve.ball.reference import (
     accretive_equilibrium_mix,
     accretive_generator,
+    axial_rotary_position_factors,
     bounded_complement,
     qr_soft_frame,
 )
@@ -1638,7 +1639,7 @@ def test_compact_scalar_maps_preserve_small_values_and_tail_gradients():
 
     base = torch.zeros(1, 16, 16, device="cuda")
     base.diagonal(dim1=-2, dim2=-1).copy_(torch.linspace(-20., 20., 16, device="cuda"))
-    _, factor = cuda._compact_prepare(base)
+    factor = cuda._compact_core_forward(base)[0]
     expected_factor = torch.nn.functional.softplus(base.double().diagonal(dim1=-2, dim2=-1)
                                                    + 0.5413248546129181)
     torch.testing.assert_close(factor.double().diagonal(dim1=-2, dim2=-1),
@@ -1674,7 +1675,8 @@ def test_projection_mask_epilogue_matches_unfused_forward_and_vjp(dtype, bias):
 @pytest.mark.parametrize("mode", list(CoreMode))
 @pytest.mark.parametrize("rank", [16, 32, 48, 64])
 @pytest.mark.parametrize("length", [7, 129])
-def test_rove_fast_mix_matches_fp64_forward_and_gradients(mode, rank, length):
+@pytest.mark.parametrize("axes", [1, 2])
+def test_rove_fast_mix_matches_fp64_forward_and_gradients(mode, rank, length, axes):
     """Both core modes share a rotary write/read path, including short tokens."""
     _require_native_cuda()
     torch.manual_seed(277 + rank + length)
@@ -1691,6 +1693,9 @@ def test_rove_fast_mix_matches_fp64_forward_and_gradients(mode, rank, length):
     frequencies = 10000. ** (-torch.arange(0, head_dim, 2, device="cuda") / head_dim)
     phases = positions[..., None] * frequencies
     cosine, sine = phases.cos().contiguous(), phases.sin().contiguous()
+    if axes == 2:
+        coordinates = torch.stack((positions % 13, positions // 13), dim=-1)
+        cosine, sine = axial_rotary_position_factors(coordinates, head_dim=head_dim)
     actual = cuda.fast_mix(projected, base, raw, counts, rotary_cos=cosine, rotary_sin=sine)
     oracle_inputs = tuple(t.detach().double().requires_grad_() for t in (projected, base, raw))
     expected = _reference_fast_mix(*oracle_inputs, counts, rotary_cos=cosine, rotary_sin=sine)
@@ -1960,3 +1965,33 @@ def test_cuda_lifetimes_preserve_repeated_backward_and_parameters(mode, rotary):
     for value, snapshot, version in zip(inputs, snapshots, versions):
         assert value._version == version
         torch.testing.assert_close(value, snapshot, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rank", [16, 32, 48, 64])
+@pytest.mark.parametrize("columns", [17, 129])
+@pytest.mark.parametrize("complement", [False, True])
+def test_compact_chain_and_conjugate_match_fp64_with_zero_spills(rank, columns, complement):
+    _require_native_cuda()
+    torch.manual_seed(612 + rank + columns)
+    batch, heads = 3, 2
+    inverse = torch.randn(batch, heads, rank, rank, device="cuda") * 0.2
+    rhs = torch.randn(batch, heads, columns, rank, device="cuda").mT
+    mapping = None if complement else torch.randn(heads, rank, rank, device="cuda") * 0.2
+    eta = torch.randn(heads, device="cuda")
+    for transpose_map in (False, True):
+        first, second = cuda._compact_chain(
+            inverse, rhs, mapping, eta, complement=complement, transpose_map=transpose_map
+        )
+        expected_first = inverse.double() @ rhs.double()
+        if complement:
+            expected_mid = -eta.double()[None, :, None, None] * expected_first if transpose_map else expected_first
+        else:
+            op = mapping.double().mT if transpose_map else mapping.double()
+            expected_mid = op @ expected_first - eta.double()[None, :, None, None] * expected_first
+        expected_second = inverse.double().mT @ expected_mid
+        _assert_mixed_close(first, expected_first, limit=3e-6)
+        _assert_mixed_close(second, expected_second, limit=3e-6)
+    for kernel in cuda._compact_adjoint_kernels()[1:]:
+        for cache in kernel.device_caches.values():
+            for compiled in cache[0].values():
+                assert compiled.n_spills == 0

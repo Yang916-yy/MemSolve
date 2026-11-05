@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Lock
 
 import torch
+from torch.autograd.function import once_differentiable
 
 _LOAD_LOCK = Lock()
 _SUPPORTED_ARCHITECTURES = frozenset((80, 86, 87, 89, 90, 100, 120))
@@ -215,6 +216,333 @@ def load(
         torch.ops.load_library(str(library))
         _check_native_contract()
         _LOADED_ARCHITECTURE = requested_architecture
+
+
+@lru_cache(maxsize=1)
+def _biased_gemm_kernel():
+    # Grouped GEMM/indexing adapted from PyTorch Inductor; see THIRD_PARTY_NOTICES.md.
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def kernel(
+        X, W, B, Y, MASK,
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+        XM: tl.constexpr, XK: tl.constexpr,
+        WK: tl.constexpr, WN: tl.constexpr, BS: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_MASK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        grid_m, grid_n = tl.cdiv(M, BM), tl.cdiv(N, BN)
+        group_width = GROUP_M * grid_n
+        group = pid // group_width
+        group_size = tl.minimum(grid_m - group * GROUP_M, GROUP_M)
+        tile_m = group * GROUP_M + pid % group_size
+        tile_n = pid % group_width // group_size
+        tl.assume(tile_m >= 0)
+        tl.assume(tile_n >= 0)
+        rows = tile_m * BM + tl.arange(0, BM)
+        columns = tile_n * BN + tl.arange(0, BN)
+        inner = tl.arange(0, BK)
+        if M >= BM and N >= BN:
+            # Wrap edge loads; only valid output lanes are stored.
+            if ((XM == 1 and XK == M) or (XM == K and XK == 1)) and K > 1:
+                load_rows = tl.max_contiguous(tl.multiple_of(rows % M, BM), BM)
+            else:
+                load_rows = rows % M
+            if ((WK == 1 and WN == K) or (WK == N and WN == 1)) and K > 1:
+                load_columns = tl.max_contiguous(tl.multiple_of(columns % N, BN), BN)
+            else:
+                load_columns = columns % N
+        else:
+            load_rows, load_columns = rows, columns
+        accumulator = tl.full((BM, BN), 0, tl.float32)
+        for start in range(tl.cdiv(K, BK)):
+            indices = start * BK + inner
+            if M < BM or N < BN:
+                left = tl.load(
+                    X + load_rows[:, None] * XM + indices[None, :] * XK,
+                    (load_rows[:, None] < M) & (indices[None, :] < K), 0,
+                )
+                right = tl.load(
+                    W + load_columns[None, :] * WN + indices[:, None] * WK,
+                    (load_columns[None, :] < N) & (indices[:, None] < K), 0,
+                )
+            elif K % BK == 0:
+                left = tl.load(X + load_rows[:, None] * XM + indices[None, :] * XK)
+                right = tl.load(W + load_columns[None, :] * WN + indices[:, None] * WK)
+            else:
+                left = tl.load(
+                    X + load_rows[:, None] * XM + indices[None, :] * XK,
+                    indices[None, :] < K, 0,
+                )
+                right = tl.load(
+                    W + load_columns[None, :] * WN + indices[:, None] * WK,
+                    indices[:, None] < K, 0,
+                )
+            accumulator = tl.dot(left, right, accumulator)
+        # Recompute store indices to shorten their live ranges across the loop.
+        rows = tile_m * BM + tl.arange(0, BM)
+        columns = tile_n * BN + tl.arange(0, BN)
+        if HAS_BIAS:
+            bias = tl.load(B + columns * BS, columns < N, 0).to(tl.float32)
+            accumulator += bias[None, :]
+        if HAS_MASK:
+            valid = tl.load(MASK + rows, rows < M, 0)
+            accumulator = tl.where(valid[:, None], accumulator, 0)
+        tl.store(
+            Y + rows[:, None] * N + columns[None, :],
+            accumulator,
+            (rows[:, None] < M) & (columns[None, :] < N),
+        )
+    return kernel
+
+
+def _biased_gemm(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor | None,
+    output_dtype: torch.dtype, output_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # AB + bias: FP32 accumulation/addition, then one output rounding.
+    rows, inner = left.shape
+    columns = right.shape[1]
+    output = torch.empty((rows, columns), device=left.device, dtype=output_dtype)
+    if rows == 0 or columns == 0:
+        return output
+    if rows >= 128 and columns >= 128:
+        bm, bn, warps, group = 128, 128, 4, 4
+        bk, stages = (64, 3) if inner >= 512 else (32, 4)
+    else:
+        bm, bn, bk, warps, stages, group = 64, 64, 32, 4, 3, 1
+    grid = ((rows + bm - 1) // bm) * ((columns + bn - 1) // bn)
+    _biased_gemm_kernel()[(grid,)](
+        left, right, bias, output, output_mask, rows, columns, inner,
+        *left.stride(), *right.stride(), 0 if bias is None else bias.stride(0),
+        bm, bn, bk, group, bias is not None, output_mask is not None,
+        num_warps=warps, num_stages=stages,
+    )
+    return output
+
+
+def _wide_gemm(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor | None = None,
+    *, output_dtype: torch.dtype = torch.float32, output_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """BF16 operands with FP32 accumulation, independent of ambient AMP policy."""
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        with torch.autocast(device_type="cuda", enabled=False):
+            if output_mask is not None:
+                return _biased_gemm(left, right, bias, output_dtype, output_mask)
+            if bias is not None:
+                if output_dtype in (torch.float16, torch.bfloat16):
+                    return _biased_gemm(left, right, bias, output_dtype)
+                return torch.ops.aten.addmm.dtype(bias, left, right, torch.float32)
+            operation = torch.bmm if left.ndim == 3 else torch.mm
+            if output_dtype == torch.bfloat16:
+                return operation(left, right)
+            return operation(left, right, out_dtype=torch.float32)
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
+def _tensor_core_batches(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Size]:
+    """Broadcast matrix operands into the CUDA BMM layout."""
+
+    batch_shape = torch.broadcast_shapes(left.shape[:-2], right.shape[:-2])
+    rows, inner, columns = left.shape[-2], left.shape[-1], right.shape[-1]
+    left_batches = left.to(dtype=torch.bfloat16).expand(
+        batch_shape + (rows, inner)
+    ).reshape(-1, rows, inner)
+    right_batches = right.to(dtype=torch.bfloat16).expand(
+        batch_shape + (inner, columns)
+    ).reshape(-1, inner, columns)
+    return left_batches, right_batches, batch_shape
+
+
+class _TensorCoreBmm(torch.autograd.Function):
+    """BF16 Tensor Core BMM with an FP32 result and first-order VJP."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> torch.Tensor:
+        left_batches, right_batches, batch_shape = _tensor_core_batches(left, right)
+        ctx.save_for_backward(left, right)
+        ctx.batch_shape = batch_shape
+        ctx.rows = left.shape[-2]
+        ctx.inner = left.shape[-1]
+        ctx.columns = right.shape[-1]
+        return _wide_gemm(
+            left_batches,
+            right_batches,
+        ).reshape(batch_shape + (ctx.rows, ctx.columns))
+
+    @staticmethod
+    @once_differentiable
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        left, right = ctx.saved_tensors
+        left_batches, right_batches, _batch_shape = _tensor_core_batches(left, right)
+        grad_batches = grad_output.to(dtype=torch.bfloat16).reshape(
+            -1,
+            ctx.rows,
+            ctx.columns,
+        )
+
+        grad_left = None
+        if ctx.needs_input_grad[0]:
+            grad_left = _wide_gemm(
+                grad_batches,
+                right_batches.mT,
+            ).reshape(ctx.batch_shape + (ctx.rows, ctx.inner))
+            grad_left = grad_left.sum_to_size(*left.shape).to(dtype=left.dtype)
+
+        grad_right = None
+        if ctx.needs_input_grad[1]:
+            grad_right = _wide_gemm(
+                left_batches.mT,
+                grad_batches,
+            ).reshape(ctx.batch_shape + (ctx.inner, ctx.columns))
+            grad_right = grad_right.sum_to_size(*right.shape).to(dtype=right.dtype)
+
+        return grad_left, grad_right
+
+
+@lru_cache(maxsize=1)
+def _masked_cast_kernel():
+    from triton import jit
+    import triton.language as tl
+
+    @jit
+    def kernel(X, MASK, Y, SIZE: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        valid = tl.load(MASK + i // WIDTH, i < SIZE, 0)
+        value = tl.load(X + i, (i < SIZE) & valid, 0)
+        tl.store(Y + i, value, i < SIZE)
+    return kernel
+
+
+def _masked_cast(value, mask, dtype):
+    # Sanitize before GEMM: zero times NaN is still NaN in a weight gradient.
+    if mask is None:
+        return value.to(dtype)
+    source = value.contiguous()
+    output = torch.empty_like(source, dtype=dtype)
+    _masked_cast_kernel()[((source.numel() + 1023) // 1024,)](
+        source, mask, output, source.numel(), source.shape[-1], 1024,
+    )
+    return output
+
+
+class _TensorCoreLinear(torch.autograd.Function):
+    """BF16 Tensor Core linear map with FP32 accumulation and dtype-aware stores."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_dtype: torch.dtype | None,
+        fuse_weight_bias_grad: bool,
+        output_mask: torch.Tensor | None,
+        input_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        value_bf16 = _masked_cast(value, input_mask, torch.bfloat16)
+        weight_bf16 = weight.to(dtype=torch.bfloat16)
+        ctx.save_for_backward(value_bf16, weight_bf16, output_mask, input_mask)
+        ctx.value_shape = value.shape
+        ctx.value_dtype = value.dtype
+        ctx.weight_dtype = weight.dtype
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        ctx.bias_device = None if bias is None else bias.device
+        ctx.has_bias = bias is not None
+        ctx.fuse_weight_bias_grad = fuse_weight_bias_grad
+
+        flat_value = value_bf16.reshape(-1, value.shape[-1])
+        output = _wide_gemm(
+            flat_value,
+            weight_bf16.mT,
+            None if bias is None else bias.to(device=value.device, dtype=torch.float32),
+            output_dtype=(
+                output_dtype
+                if output_dtype in (torch.float16, torch.bfloat16)
+                and (bias is not None or output_dtype == torch.bfloat16)
+                else torch.float32
+            ),
+            output_mask=output_mask,
+        ).reshape(value.shape[:-1] + (weight.shape[0],))
+        return output if output_dtype is None else output.to(dtype=output_dtype)
+
+    @staticmethod
+    @once_differentiable
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None, None, None, None]:
+        value, weight, output_mask, input_mask = ctx.saved_tensors
+        # Match AOTAutograd: release ownership only when retain_graph is false.
+        ctx.maybe_clear_saved_tensors()
+        grad_output = _masked_cast(grad_output, output_mask, grad_output.dtype)
+        flat_value = value.reshape(-1, value.shape[-1])
+        flat_gradient = grad_output.to(dtype=torch.bfloat16).reshape(
+            -1,
+            weight.shape[0],
+        )
+
+        grad_weight = grad_bias = None
+        # Bias uses the original upstream gradient, not a BF16-rounded FP16/
+        # FP32 tensor. Fuse only when both VJPs consume the same BF16 values.
+        fused = (
+            ctx.fuse_weight_bias_grad and grad_output.dtype == torch.bfloat16
+            and ctx.needs_input_grad[1] and ctx.has_bias and ctx.needs_input_grad[2]
+        )
+        if fused:
+            grad_weight, grad_bias = torch.ops.memsolve_equilibrium.linear_weight_bias(
+                flat_value.contiguous(), flat_gradient.contiguous(),
+            )
+            grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+            grad_bias = grad_bias.to(device=ctx.bias_device, dtype=ctx.bias_dtype)
+        elif ctx.needs_input_grad[1]:
+            grad_weight = _wide_gemm(
+                flat_gradient.mT,
+                flat_value,
+            ).to(dtype=ctx.weight_dtype)
+
+        if not fused and ctx.has_bias and ctx.needs_input_grad[2]:
+            # Preserve the original FP32 bias-reduction boundary without
+            # materializing a full FP32 copy of a half-precision upstream VJP.
+            dimensions = tuple(range(grad_output.ndim - 1))
+            grad_bias = (
+                grad_output.sum(dim=dimensions, dtype=torch.float32)
+                if dimensions
+                else grad_output.to(dtype=torch.float32)
+            ).to(device=ctx.bias_device, dtype=ctx.bias_dtype)
+
+        del flat_value, value, grad_output
+        grad_value = None
+        if ctx.needs_input_grad[0]:
+            grad_value = _wide_gemm(
+                flat_gradient,
+                weight,
+                output_dtype=(
+                    torch.bfloat16 if ctx.value_dtype == torch.bfloat16 else torch.float32
+                ),
+                output_mask=input_mask,
+            ).reshape(ctx.value_shape)
+            grad_value = grad_value.to(dtype=ctx.value_dtype)
+
+        return grad_value, grad_weight, grad_bias, None, None, None, None
 
 
 @lru_cache(maxsize=1)
@@ -441,7 +769,7 @@ def _no_frame_kernels():
         g = (g + tl.trans(g)).to(tl.float32)
         inv = 1.0 / tl.sqrt(count)
         eta = tl.load(ETA + h)
-        da = _mixed_dot(a, g) * (inv * inv)
+        da = _mixed_dot(a, g) * inv
         for channel_tile in range(tl.cdiv(D, BD)):
             d = channel_tile * BD + tl.arange(0, BD)
             e = tl.load(
@@ -457,9 +785,9 @@ def _no_frame_kernels():
             # Finish E/V before loading C/DQ to limit live rotated operands.
             if HAS_ROTARY:
                 rotated_e = _rotate(e, COS, SIN, b, n, channel_tile * BD, N, D, ROTARY_BATCHED)
+                dc = eta * e.to(tl.float32)
                 direct = _wide_dot(rotated_e, tl.trans(v))
-                if UNSCALED_COMPLEMENT:
-                    direct = -eta * direct
+                da += -eta * direct if UNSCALED_COMPLEMENT else direct
                 c = tl.load(
                     X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
                     (n[:, None] < N) & (d[None, :] < D),
@@ -471,11 +799,14 @@ def _no_frame_kernels():
                     0,
                 ).to(tl.float32)
                 rotated_c = _rotate(c, COS, SIN, b, n, channel_tile * BD, N, D, ROTARY_BATCHED)
-                da += (direct + _wide_dot(rotated_c, tl.trans(dq))) * inv
+                da += _wide_dot(rotated_c, tl.trans(dq))
                 correction = _rotate(_mixed_dot(a, dq), COS, SIN, b, n, channel_tile * BD,
                                      N, D, ROTARY_BATCHED, True)
-                dc = eta * e.to(tl.float32) + correction * inv
+                dc += correction * inv
             else:
+                direct = _mixed_dot(e, tl.trans(v))
+                da += -eta * direct if UNSCALED_COMPLEMENT else direct
+                dc = eta * e.to(tl.float32)
                 c = tl.load(
                     X + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
                     (n[:, None] < N) & (d[None, :] < D),
@@ -486,18 +817,15 @@ def _no_frame_kernels():
                     (r[:, None] < R) & (d[None, :] < D),
                     0,
                 ).to(tl.float32)
-                if UNSCALED_COMPLEMENT:
-                    da += (-eta * _mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
-                else:
-                    da += (_mixed_dot(e, tl.trans(v)) + _mixed_dot(c, tl.trans(dq))) * inv
-                dc = eta * e.to(tl.float32) + _mixed_dot(a, dq) * inv
+                da += _mixed_dot(c, tl.trans(dq))
+                dc += _mixed_dot(a, dq) * inv
             tl.store(
                 DX + (b * N + n[:, None]) * (H * (R + D)) + H * R + h * D + d[None, :],
                 dc, (n[:, None] < N) & (d[None, :] < D),
             )
         tl.store(
             DX + (b * N + n[:, None]) * (H * (R + D)) + h * R + r[None, :],
-            da, (n[:, None] < N) & (r[None, :] < R),
+            da * inv, (n[:, None] < N) & (r[None, :] < R),
         )
 
     @jit
@@ -619,13 +947,25 @@ def _no_frame_statistics(projected, heads, rank, gradient=None, counts=None,
         _no_frame_block_size(rank),
         min(64, _no_frame_block_size(head_dim)),
         token_tile,
-        num_warps=8 if token_tile == 256 and gradient is not None and rank > 32 else 4,
+        num_warps=(
+            8
+            if gradient is not None
+            and ((token_tile == 256 and rank >= 32) or (rotary_cos is not None and rank == 32))
+            else 4
+        ),
         num_stages=1,
     )
-    cross = (cross[:, 0] if tiles == 1 else cross.sum(1)).view(batch, heads, rank, head_dim)
     if gradient is None:
+        del eta_gradient
+        cross = (cross[:, 0] if tiles == 1 else cross.sum(1)).view(batch, heads, rank, head_dim)
         return (gram[:, 0] if tiles == 1 else gram.sum(1)).view(batch, heads, rank, rank), cross
-    return cross, (eta_gradient[:, 0] if tiles == 1 else eta_gradient.sum(1)).view(batch, heads).sum(0)
+    del gram
+    cross = (cross[:, 0] if tiles == 1 else cross.sum(1)).view(batch, heads, rank, head_dim)
+    return cross, (
+        eta_gradient[:, 0].view(batch, heads).sum(0)
+        if tiles == 1
+        else eta_gradient.view(batch, heads, tiles).sum((0, 2))
+    )
 
 
 @lru_cache(maxsize=1)
@@ -635,51 +975,59 @@ def _compact_kernels():
     from triton.language.extra import libdevice
 
     @jit
-    def prepare(BASE, COORD, FACTOR, SIZE: tl.constexpr,
-                R: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr):
-        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        local = i % (R * R)
-        row, col = local // R, local % R
-        h = (i // (R * R)) % H
-        value = tl.load(BASE + h * R * R + local, i < SIZE, 0)
-        shifted = value + 0.5413248546129181
-        diagonal = tl.where(shifted > 20.0, shifted, libdevice.log1p(tl.exp(shifted)))
-        f = tl.where(row > col, value, tl.where(row == col, diagonal, 0.0))
-        tl.store(COORD + i, value, i < SIZE)
-        tl.store(FACTOR + i, f, i < SIZE)
+    def core_forward(
+        BASE, FACTOR, SYSTEM, DIFFERENCE,
+        R: tl.constexpr, BR: tl.constexpr,
+    ):
+        h = tl.program_id(0)
+        i = tl.arange(0, BR)
+        mask = (i[:, None] < R) & (i[None, :] < R)
+        offset = h * R * R + i[:, None] * R + i[None, :]
+        b = tl.load(BASE + offset, mask, 0.0)
+        shifted = b + 0.5413248546129181
+        diagonal = tl.where(shifted > 20.0, shifted, libdevice.log1p(libdevice.exp(shifted)))
+        f = tl.where(i[:, None] > i[None, :], b, tl.where(i[:, None] == i[None, :], diagonal, 0.0))
+        tl.store(FACTOR + offset, f, mask)
+        gram = tl.dot(f, tl.trans(f), input_precision="tf32x3")
+        bt = tl.load(BASE + h * R * R + i[None, :] * R + i[:, None], mask, 0.0)
+        skew = tl.where(i[:, None] < i[None, :], b, tl.where(i[:, None] > i[None, :], -bt, 0.0))
+        k = gram + skew
+        identity = (i[:, None] == i[None, :]).to(tl.float32)
+        tl.store(SYSTEM + offset, identity + k, mask)
+        tl.store(DIFFERENCE + offset, identity - k, mask)
 
     @jit
-    def matrix(A, B, COORD, OUT, AUX, SIZE: tl.constexpr,
-               R: tl.constexpr, OP: tl.constexpr, BLOCK: tl.constexpr):
-        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        local = i % (R * R)
-        row, col = local // R, local % R
-        offset = i - local
-        transposed = offset + col * R + row
-        a = tl.load(A + i, i < SIZE, 0)
-        if OP == 0:  # K=F F^T+Omega and both I +/- K in one pass.
-            t = tl.load(COORD + i, i < SIZE, 0)
-            tt = tl.load(COORD + transposed, i < SIZE, 0)
-            k = a + tl.where(row < col, t, tl.where(row > col, -tt, 0.0))
-            tl.store(OUT + i, (row == col).to(tl.float32) + k, i < SIZE)
-            tl.store(AUX + i, (row == col).to(tl.float32) - k, i < SIZE)
-        elif OP == 1:  # Cholesky VJP: half the symmetric copy of the lower triangle.
-            at = tl.load(A + transposed, i < SIZE, 0)
-            tl.store(OUT + i, 0.5 * tl.where(row >= col, a, at), i < SIZE)
-        else:  # Generator parameterization VJP.
-            g = tl.load(B + i, i < SIZE, 0)
-            gt = tl.load(B + transposed, i < SIZE, 0)
-            coordinate = tl.load(COORD + i, i < SIZE, 0)
-            shifted = coordinate + 0.5413248546129181
-            sigmoid = 1.0 / (1.0 + tl.exp(-shifted))
-            d = tl.where(row > col, a, tl.where(row == col, a * sigmoid, g - gt))
-            tl.store(OUT + i, d, i < SIZE)
+    def core_backward(
+        ADJOINT, MAPPING, FACTOR, BASE, OUT,
+        R: tl.constexpr, BR: tl.constexpr,
+    ):
+        h = tl.program_id(0)
+        i = tl.arange(0, BR)
+        mask = (i[:, None] < R) & (i[None, :] < R)
+        offset = h * R * R + i[:, None] * R + i[None, :]
+        u = tl.load(ADJOINT + offset, mask, 0.0)
+        m = tl.load(MAPPING + offset, mask, 0.0)
+        diagonal = (i[:, None] == i[None, :]) & (i[:, None] < R)
+        m_plus_i = m + tl.where(diagonal, 1.0, 0.0)
+        g = tl.dot(-u, tl.trans(m_plus_i), input_precision="tf32x3")
+        gt = tl.trans(g)
+        f = tl.load(FACTOR + offset, mask, 0.0)
+        core_grad = tl.dot(g + gt, f, input_precision="tf32x3")
+        b = tl.load(BASE + offset, mask, 0.0)
+        shifted = b + 0.5413248546129181
+        sigmoid = tl.where(shifted > 20.0, 1.0, 1.0 / (1.0 + libdevice.exp(-shifted)))
+        d = tl.where(
+            i[:, None] > i[None, :],
+            core_grad,
+            tl.where(i[:, None] == i[None, :], core_grad * sigmoid, g - gt),
+        )
+        tl.store(OUT + offset, d, mask)
 
     @jit
     def complement(RAW, ETA, DERIVATIVE, H: tl.constexpr, BLOCK: tl.constexpr):
         h = tl.arange(0, BLOCK)
         raw = tl.load(RAW + h, h < H, 0)
-        exponent = tl.exp(-2.0 * tl.abs(raw))
+        exponent = libdevice.exp(-2.0 * tl.abs(raw))
         scale: tl.constexpr = 1.0 - 1.1920928955078125e-7
         # Native tanh avoids cancellation near zero. Keep the exponential
         # derivative separately: 1-tanh(raw)^2 loses the FP32 tail gradient.
@@ -688,30 +1036,29 @@ def _compact_kernels():
         tl.store(ETA + h, value, h < H)
         tl.store(DERIVATIVE + h, derivative, h < H)
 
-    return prepare, matrix, complement
+    return core_forward, core_backward, complement
 
 
-def _compact_prepare(base):
-    coordinates = torch.empty_like(base)
-    core_factor = torch.empty_like(coordinates)
-    size = coordinates.numel()
-    _compact_kernels()[0][((size + 255) // 256,)](
-        base, coordinates, core_factor, size, base.shape[-1],
-        base.shape[0], 256, num_warps=4,
+def _compact_core_forward(base):
+    core_factor = torch.empty_like(base, memory_format=torch.contiguous_format)
+    system = torch.empty_like(core_factor)
+    difference = torch.empty_like(core_factor)
+    rank = base.shape[-1]
+    _compact_kernels()[0][(base.shape[0],)](
+        base, core_factor, system, difference,
+        rank, _no_frame_block_size(rank), num_warps=8 if rank > 32 else 4, num_stages=1,
     )
-    return coordinates, core_factor
+    return core_factor, system, difference
 
 
-def _compact_matrix(a, coordinates=None, b=None, *, op=0):
-    output = torch.empty_like(a, memory_format=torch.contiguous_format)
-    auxiliary = torch.empty_like(output) if op == 0 else output
-    # GEMM outputs are contiguous; the Cholesky product is normalized here too.
-    a = a.contiguous()
-    _compact_kernels()[1][((a.numel() + 255) // 256,)](
-        a, b, coordinates, output, auxiliary, a.numel(), a.shape[-1],
-        op, 256, num_warps=4,
+def _compact_core_backward(adjoint, mapping, core_factor, base):
+    output = torch.empty_like(base, memory_format=torch.contiguous_format)
+    rank = base.shape[-1]
+    _compact_kernels()[1][(base.shape[0],)](
+        adjoint, mapping, core_factor, base, output,
+        rank, _no_frame_block_size(rank), num_warps=4, num_stages=1,
     )
-    return output, auxiliary
+    return output
 
 
 def _compact_complement(raw):
@@ -836,18 +1183,18 @@ def _compact_adjoint_kernels():
         tl.store(OUT+h, (tl.load(DIRECT+h)-trace)*tl.load(DERIVATIVE+h))
 
     @jit
-    def cholesky_product(F, H, ETA, HEADS: tl.constexpr, R: tl.constexpr,
-                         BR: tl.constexpr, COMPLEMENT: tl.constexpr):
+    def cholesky_product(F, H, ETA, INVERSE, HEADS: tl.constexpr, R: tl.constexpr,
+                         BR: tl.constexpr, COMPLEMENT: tl.constexpr, FUSE_CONJUGATE: tl.constexpr):
         # H=U Z^T is fresh, unsaved storage, owned in full by one CTA.
         # L^T dL = -M H^T - M^T H, M=F-eta I. Apply the Cholesky
-        # symmetric lower projection here, before either inverse-factor GEMM.
+        # symmetric lower projection here, and for R<=32 fuse T^T @ sym @ T in registers.
         s = tl.program_id(0)
         h = s % HEADS
         i = tl.arange(0, BR)
         eta = tl.load(ETA+h)
+        mask_rr = (i[:, None] < R) & (i[None, :] < R)
         if COMPLEMENT:
-            value = tl.load(H+s*R*R+i[:, None]*R+i[None, :],
-                            (i[:, None] < R) & (i[None, :] < R), 0)
+            value = tl.load(H+s*R*R+i[:, None]*R+i[None, :], mask_rr, 0)
             product = eta * (value + tl.trans(value))
         else:
             # Accumulate products serially to reduce register pressure at r48/r64.
@@ -868,92 +1215,329 @@ def _compact_adjoint_kernels():
                 hn = tl.load(H+s*R*R+kk[:, None]*R+i[None, :],
                              (kk[:, None] < R) & (i[None, :] < R), 0)
                 product = tl.dot(-ft, hn, product, input_precision="tf32x3")
-        lower = tl.where(i[:, None] >= i[None, :], product, 0)
-        symmetric = .5 * (lower + tl.trans(lower)) - tl.where(i[:, None] == i[None, :], .5*lower, 0)
-        tl.store(H+s*R*R+i[:, None]*R+i[None, :], symmetric,
-                 (i[:, None] < R) & (i[None, :] < R))
-    return eta_trace, cholesky_product
+        lower = tl.where(
+            i[:, None] > i[None, :],
+            0.5 * product,
+            tl.where(i[:, None] == i[None, :], 0.25 * product, 0.0),
+        )
+        symmetric = lower + tl.trans(lower)
+        if FUSE_CONJUGATE:
+            t = tl.load(INVERSE + s*R*R + i[:, None]*R + i[None, :], mask_rr, 0)
+            mid = tl.dot(symmetric, t, input_precision="tf32x3")
+            tt = tl.load(INVERSE + s*R*R + i[None, :]*R + i[:, None], mask_rr, 0)
+            gram = tl.dot(tt, mid, input_precision="tf32x3")
+            tl.store(H+s*R*R+i[:, None]*R+i[None, :], gram, mask_rr)
+        else:
+            tl.store(H+s*R*R+i[:, None]*R+i[None, :], symmetric, mask_rr)
+
+    @jit
+    def compact_chain(
+        INVERSE, X, MAPPING, ETA, FIRST, SECOND,
+        H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
+        XM: tl.constexpr, XN: tl.constexpr,
+        K_TILE: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
+        COMPLEMENT: tl.constexpr, TRANSPOSE_MAP: tl.constexpr,
+        STORE_FIRST: tl.constexpr = True,
+    ):
+        s, tile = tl.program_id(0), tl.program_id(1)
+        h = s % H
+        i = tl.arange(0, BR)
+        col = tile * BC + tl.arange(0, BC)
+        mask_rd = (i[:, None] < R) & (col[None, :] < D)
+        if R <= 32:
+            j = tl.arange(0, BR)
+            mask_rr = (i[:, None] < R) & (j[None, :] < R)
+            t = tl.load(INVERSE + s * R * R + i[:, None] * R + j[None, :], mask_rr, 0.0)
+            x = tl.load(
+                X + s * R * D + j[:, None] * XM + col[None, :] * XN,
+                (j[:, None] < R) & (col[None, :] < D),
+                0.0,
+            )
+            u = tl.dot(t, x, input_precision="tf32x3")
+            if STORE_FIRST:
+                tl.store(FIRST + (s * R + i[:, None]) * D + col[None, :], u, mask_rd)
+            if COMPLEMENT:
+                mid = -tl.load(ETA + h) * u if TRANSPOSE_MAP else u
+            else:
+                if TRANSPOSE_MAP:
+                    m_mat = tl.load(MAPPING + h * R * R + j[None, :] * R + i[:, None], mask_rr, 0.0)
+                else:
+                    m_mat = tl.load(MAPPING + h * R * R + i[:, None] * R + j[None, :], mask_rr, 0.0)
+                diagonal = (i[:, None] == j[None, :]) & (i[:, None] < R)
+                m_mat -= tl.where(diagonal, tl.load(ETA + h), 0.0)
+                mid = tl.dot(m_mat, u, input_precision="tf32x3")
+            tt = tl.load(INVERSE + s * R * R + j[None, :] * R + i[:, None], mask_rr, 0.0)
+            out = tl.dot(tt, mid, input_precision="tf32x3")
+            tl.store(SECOND + (s * R + i[:, None]) * D + col[None, :], out, mask_rd)
+        else:
+            kk = tl.arange(0, K_TILE)
+            u = tl.full((BR, BC), 0.0, tl.float32)
+            for start in range(tl.cdiv(R, K_TILE)):
+                k = start * K_TILE + kk
+                t = tl.load(
+                    INVERSE + s * R * R + i[:, None] * R + k[None, :],
+                    (i[:, None] < R) & (k[None, :] < R),
+                    0.0,
+                )
+                x = tl.load(
+                    X + s * R * D + k[:, None] * XM + col[None, :] * XN,
+                    (k[:, None] < R) & (col[None, :] < D),
+                    0.0,
+                )
+                u = tl.dot(t, x, u, input_precision="tf32x3")
+            tl.store(FIRST + (s * R + i[:, None]) * D + col[None, :], u, mask_rd)
+            tl.debug_barrier()
+            if COMPLEMENT:
+                mid = -tl.load(ETA + h) * u if TRANSPOSE_MAP else u
+            else:
+                eta = tl.load(ETA + h)
+                mid = tl.full((BR, BC), 0.0, tl.float32)
+                for start in range(tl.cdiv(R, K_TILE)):
+                    k = start * K_TILE + kk
+                    if TRANSPOSE_MAP:
+                        m_tile = tl.load(
+                            MAPPING + h * R * R + k[None, :] * R + i[:, None],
+                            (i[:, None] < R) & (k[None, :] < R),
+                            0.0,
+                        )
+                    else:
+                        m_tile = tl.load(
+                            MAPPING + h * R * R + i[:, None] * R + k[None, :],
+                            (i[:, None] < R) & (k[None, :] < R),
+                            0.0,
+                        )
+                    diagonal = (i[:, None] == k[None, :]) & (i[:, None] < R)
+                    m_tile -= tl.where(diagonal, eta, 0.0)
+                    u_tile = tl.load(
+                        FIRST + (s * R + k[:, None]) * D + col[None, :],
+                        (k[:, None] < R) & (col[None, :] < D),
+                        0.0,
+                    )
+                    mid = tl.dot(m_tile, u_tile, mid, input_precision="tf32x3")
+            tl.store(SECOND + (s * R + i[:, None]) * D + col[None, :], mid, mask_rd)
+            tl.debug_barrier()
+            out = tl.full((BR, BC), 0.0, tl.float32)
+            for start in range(tl.cdiv(R, K_TILE)):
+                k = start * K_TILE + kk
+                tt = tl.load(
+                    INVERSE + s * R * R + k[None, :] * R + i[:, None],
+                    (i[:, None] < R) & (k[None, :] < R),
+                    0.0,
+                )
+                mid_tile = tl.load(
+                    SECOND + (s * R + k[:, None]) * D + col[None, :],
+                    (k[:, None] < R) & (col[None, :] < D),
+                    0.0,
+                )
+                out = tl.dot(tt, mid_tile, out, input_precision="tf32x3")
+            tl.store(SECOND + (s * R + i[:, None]) * D + col[None, :], out, mask_rd)
+
+    @jit
+    def compact_chain_bwd_r32(
+        INVERSE, GRAD, STATE, MAPPING, ETA, PRODUCT, CROSS_GRAD,
+        H: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
+        GM: tl.constexpr, GN: tl.constexpr,
+        BR: tl.constexpr, BC: tl.constexpr, COMPLEMENT: tl.constexpr,
+    ):
+        s = tl.program_id(0)
+        h = s % H
+        i = tl.arange(0, BR)
+        j = tl.arange(0, BR)
+        mask_rr = (i[:, None] < R) & (j[None, :] < R)
+        eta = tl.load(ETA + h)
+        prod_acc = tl.full((BR, BR), 0.0, tl.float32)
+        c = tl.arange(0, BC)
+        for start in range(tl.cdiv(D, BC)):
+            col = start * BC + c
+            mask_rd = (i[:, None] < R) & (col[None, :] < D)
+            t = tl.load(INVERSE + s * R * R + i[:, None] * R + j[None, :], mask_rr, 0.0)
+            g = tl.load(
+                GRAD + s * R * D + j[:, None] * GM + col[None, :] * GN,
+                (j[:, None] < R) & (col[None, :] < D),
+                0.0,
+            )
+            u = tl.dot(t, g, input_precision="tf32x3")
+            st = tl.load(
+                STATE + (s * R + j[:, None]) * D + col[None, :],
+                (j[:, None] < R) & (col[None, :] < D),
+                0.0,
+            )
+            prod_acc = tl.dot(u, tl.trans(st), prod_acc, input_precision="tf32x3")
+            if COMPLEMENT:
+                mid = -eta * u
+            else:
+                m_mat = tl.load(MAPPING + h * R * R + j[None, :] * R + i[:, None], mask_rr, 0.0)
+                diagonal = (i[:, None] == j[None, :]) & (i[:, None] < R)
+                m_mat -= tl.where(diagonal, eta, 0.0)
+                mid = tl.dot(m_mat, u, input_precision="tf32x3")
+            tt = tl.load(INVERSE + s * R * R + j[None, :] * R + i[:, None], mask_rr, 0.0)
+            dq = tl.dot(tt, mid, input_precision="tf32x3")
+            tl.store(CROSS_GRAD + (s * R + i[:, None]) * D + col[None, :], dq, mask_rd)
+        tl.store(PRODUCT + s * R * R + i[:, None] * R + j[None, :], prod_acc, mask_rr)
+
+    @jit
+    def compact_conjugate_tiled(
+        INVERSE, H_MAT, R: tl.constexpr, K_TILE: tl.constexpr, BR: tl.constexpr,
+    ):
+        s = tl.program_id(0)
+        i = tl.arange(0, BR)
+        mask_rr = (i[:, None] < R) & (i[None, :] < R)
+        kk = tl.arange(0, K_TILE)
+        inter = tl.full((BR, BR), 0.0, tl.float32)
+        for start in range(tl.cdiv(R, K_TILE)):
+            k = start * K_TILE + kk
+            tt = tl.load(
+                INVERSE + s * R * R + k[None, :] * R + i[:, None],
+                (i[:, None] < R) & (k[None, :] < R),
+                0.0,
+            )
+            sym_tile = tl.load(
+                H_MAT + s * R * R + k[:, None] * R + i[None, :],
+                (k[:, None] < R) & (i[None, :] < R),
+                0.0,
+            )
+            inter = tl.dot(tt, sym_tile, inter, input_precision="tf32x3")
+        tl.store(H_MAT + s * R * R + i[:, None] * R + i[None, :], inter, mask_rr)
+        tl.debug_barrier()
+        gram_grad = tl.full((BR, BR), 0.0, tl.float32)
+        for start in range(tl.cdiv(R, K_TILE)):
+            k = start * K_TILE + kk
+            inter_tile = tl.load(
+                H_MAT + s * R * R + i[:, None] * R + k[None, :],
+                (i[:, None] < R) & (k[None, :] < R),
+                0.0,
+            )
+            t = tl.load(
+                INVERSE + s * R * R + k[:, None] * R + i[None, :],
+                (k[:, None] < R) & (i[None, :] < R),
+                0.0,
+            )
+            gram_grad = tl.dot(inter_tile, t, gram_grad, input_precision="tf32x3")
+        tl.store(H_MAT + s * R * R + i[:, None] * R + i[None, :], gram_grad, mask_rr)
+
+    return eta_trace, cholesky_product, compact_chain, compact_chain_bwd_r32, compact_conjugate_tiled
 
 
-def _no_frame_compact(gram, cross, base, raw, mode):
-    # Factor I+G once; apply the soft frame through compact products.
+def _compact_chain(inverse, rhs, mapping, eta, *, complement, transpose_map, store_first=True):
+    batch, heads, rank, columns = rhs.shape
+    second = torch.empty((batch, heads, rank, columns), device=rhs.device, dtype=torch.float32)
+    first = torch.empty_like(second) if store_first or rank > 32 else second
+    block_r = _no_frame_block_size(rank)
+    block_c = min(64, _no_frame_block_size(columns))
+    _compact_adjoint_kernels()[2][(batch * heads, (columns + block_c - 1) // block_c)](
+        inverse, rhs, mapping, eta, first, second,
+        heads, rank, columns, *rhs.stride()[-2:],
+        16, block_r, block_c, complement, transpose_map, store_first,
+        num_warps=4, num_stages=1,
+    )
+    return (first if store_first else None), second
+
+
+def _no_frame_compact(gram, cross, base, raw, mode, *, record=True):
+    # Factor I+G once; apply the soft frame through a fused compact chain.
     inverse = torch.ops.memsolve_equilibrium.compact_inverse(gram)
-    state = _compact_product(inverse, cross)
+    del gram
     eta, eta_derivative = _compact_complement(raw)
+    if not record:
+        del eta_derivative
+        eta_derivative = None
     coordinates = core_factor = lu = pivots = mapping = None
-    if mode == 2:
-        correction = state
-    else:
-        coordinates, core_factor = _compact_prepare(base)
-        system, difference = _compact_matrix(core_factor @ core_factor.mT, coordinates)
+    if mode != 2:
+        coordinates = base if record else None
+        core_factor, system, difference = _compact_core_forward(base)
+        if not record:
+            del core_factor
+            core_factor = None
         lu, pivots = _compact_lu(system)
+        del system
         mapping = _compact_getrs(lu, pivots, difference)
-        correction = _compact_product(mapping, state, subtract_eta=eta)
+        del difference
+        if not record:
+            del lu, pivots
+            lu = pivots = None
     # Complement keeps an unscaled coefficient: token kernels apply -eta
     # after the compensated product, including eta=0 without division.
-    coefficient = _compact_product(inverse.mT, correction)
+    state, coefficient = _compact_chain(
+        inverse, cross, mapping, eta, complement=mode == 2, transpose_map=False,
+        store_first=record,
+    )
+    del cross
+    if not record:
+        return coefficient, eta, ()
     tape = (inverse, state, coordinates, lu, pivots, mapping, eta_derivative, core_factor)
     return coefficient, eta, tape
 
 
 def _no_frame_compact_backward(coefficient, eta, tape, gradient, eta_gradient, mode):
     inverse, state, coordinates, lu, pivots, mapping, eta_derivative, core_factor = tape
-    u = _compact_product(inverse, gradient)
-    product = _compact_product(u, state.mT)
+    if isinstance(tape, list):
+        tape.clear()
+    del tape, coefficient
+    batch, heads, rank, columns = state.shape
+    block_r = _no_frame_block_size(rank)
+    kernels = _compact_adjoint_kernels()
+    if rank <= 32:
+        product = torch.empty((batch, heads, rank, rank), device=state.device, dtype=torch.float32)
+        cross_gradient = torch.empty((batch, heads, rank, columns), device=state.device, dtype=torch.float32)
+        block_c = min(64, _no_frame_block_size(columns))
+        kernels[3][(batch * heads,)](
+            inverse, gradient, state, mapping, eta, product, cross_gradient,
+            heads, rank, columns, *gradient.stride()[-2:],
+            block_r, block_c, mode == 2,
+            num_warps=4, num_stages=1,
+        )
+        del gradient, state
+    else:
+        u, cross_gradient = _compact_chain(
+            inverse, gradient, mapping, eta, complement=mode == 2, transpose_map=True
+        )
+        del gradient
+        product = _compact_product(u, state.mT)
+        del u, state
     map_gradient = product.sum(0)
     raw_gradient = torch.empty_like(eta_gradient)
-    batch, heads, rank = state.shape[:3]
-    kernels = _compact_adjoint_kernels()
     kernels[0][(heads,)](map_gradient, eta_gradient, eta_derivative, raw_gradient,
-                        rank, _no_frame_block_size(rank), num_warps=4)
+                        rank, block_r, num_warps=4)
+    del eta_gradient, eta_derivative
     base_gradient = None
-    # u and product are fresh scratch; saved inverse/state/core stay read-only.
-    if mode == 2:
-        state_gradient = u.mul_(-eta[None, :, None, None])
-    else:
+    if mode != 2:
         adjoint = _compact_getrs(lu, pivots, map_gradient, transpose=True)
-        identity = torch.eye(rank, device=state.device, dtype=torch.float32)
-        generator_gradient = -(adjoint @ (mapping + identity).mT)
-        del adjoint, identity
-        state_gradient = _compact_product(mapping.mT, u, subtract_eta=eta, out=u)
-        core_gradient = (generator_gradient + generator_gradient.mT) @ core_factor
-        base_gradient, _ = _compact_matrix(core_gradient, coordinates, generator_gradient, op=2)
-        del core_gradient, generator_gradient
-    del u, map_gradient
-    cross_gradient = _compact_product(inverse.mT, state_gradient, out=state_gradient)
-    del state_gradient
-    kernels[1][(batch*heads,)](mapping, product, eta, heads, rank,
-                              _no_frame_block_size(rank), mode == 2, num_warps=4, num_stages=1)
-    intermediate = _compact_product(inverse.mT, product, out=product)
-    del product
-    gram_gradient = _compact_product(intermediate, inverse, out=intermediate)
-    return gram_gradient, cross_gradient, base_gradient, raw_gradient
+        del lu, pivots, map_gradient
+        base_gradient = _compact_core_backward(adjoint, mapping, core_factor, coordinates)
+        del adjoint, core_factor, coordinates
+    else:
+        del lu, pivots, map_gradient, core_factor, coordinates
+    fuse_conjugate = rank <= 32
+    kernels[1][(batch * heads,)](
+        mapping, product, eta, inverse, heads, rank, block_r,
+        mode == 2, fuse_conjugate, num_warps=4, num_stages=1,
+    )
+    del mapping
+    if not fuse_conjugate:
+        kernels[4][(batch * heads,)](
+            inverse, product, rank, 16 if rank % 32 == 16 else 32, block_r,
+            num_warps=4, num_stages=1,
+        )
+    del inverse
+    return product, cross_gradient, base_gradient, raw_gradient
 
 
 def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel=None,
                       rotary_cos=None, rotary_sin=None):
-    from .reference import _ieee_fp32_matmul
-
     heads, rank = base.shape[:2]
     batch, length, width = projected.shape
     head_dim = (width - heads * rank) // heads
     mode = 2 if base.numel() == 0 else 1
-    gram, cross = _no_frame_statistics(projected, heads, rank, counts=counts,
-                                       rotary_cos=rotary_cos, rotary_sin=rotary_sin)
+    stats = list(
+        _no_frame_statistics(projected, heads, rank, counts=counts,
+                             rotary_cos=rotary_cos, rotary_sin=rotary_sin)
+    )
     if sequence_parallel is not None:
-        gram, cross = sequence_parallel.sum_tensors(gram, cross)
-    # Use FP32 compact arithmetic within this autocast/TF32 scope.
-    with (
-        torch.no_grad(),
-        torch.autocast(device_type="cuda", enabled=False),
-        _ieee_fp32_matmul(projected.device),
-    ):
+        stats[:] = sequence_parallel.sum_tensors(*stats)
+    with torch.no_grad():
         coefficient, eta, tape = _no_frame_compact(
-            gram, cross, base, raw, mode
+            stats.pop(0), stats.pop(0), base, raw, mode, record=record
         )
-    del gram, cross
-    if not record:
-        tape = ()
     output = torch.empty(
         (batch, length, heads * head_dim),
         device=projected.device,
@@ -981,6 +1565,8 @@ def _no_frame_forward(projected, base, raw, counts, *, record, sequence_parallel
         num_warps=4,
         num_stages=1,
     )
+    if not record:
+        return output, ()
     return output, (coefficient, eta, *tape)
 
 
@@ -999,8 +1585,6 @@ class _NoFrameMix(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, gradient):
-        from .reference import _ieee_fp32_matmul
-
         projected, counts, rotary_cos, rotary_sin, coefficient, eta, *tape = ctx.saved_tensors
         # Keep retained graphs intact; otherwise compact tape can die before dX.
         ctx.maybe_clear_saved_tensors()
@@ -1008,26 +1592,24 @@ class _NoFrameMix(torch.autograd.Function):
         batch, length, width = projected.shape
         head_dim = (width - heads * rank) // heads
         gradient = gradient.contiguous()
-        coefficient_gradient, eta_gradient = _no_frame_statistics(
-            projected,
-            heads,
-            rank,
-            gradient,
-            counts,
-            rotary_cos,
-            rotary_sin,
+        stats = list(
+            _no_frame_statistics(
+                projected,
+                heads,
+                rank,
+                gradient,
+                counts,
+                rotary_cos,
+                rotary_sin,
+            )
         )
         sequence_parallel = ctx.sequence_parallel
         if sequence_parallel is not None:
-            coefficient_gradient, eta_gradient = sequence_parallel.sum_tensors(coefficient_gradient, eta_gradient)
+            stats[:] = sequence_parallel.sum_tensors(*stats)
         mode = 2 if tape[2] is None else 1
-        with (
-            torch.no_grad(),
-            torch.autocast(device_type="cuda", enabled=False),
-            _ieee_fp32_matmul(projected.device),
-        ):
+        with torch.no_grad():
             gram_gradient, cross_gradient, base_gradient, raw_gradient = _no_frame_compact_backward(
-                coefficient, eta, tape, coefficient_gradient, eta_gradient, mode
+                None, eta, tape, stats.pop(0), stats.pop(0), mode
             )
         if sequence_parallel is not None:
             # Compact adjoints already include every shard. Parameter SUM
@@ -1035,7 +1617,6 @@ class _NoFrameMix(torch.autograd.Function):
             raw_gradient.div_(sequence_parallel.world_size)
             if base_gradient is not None:
                 base_gradient.div_(sequence_parallel.world_size)
-        del coefficient_gradient, eta_gradient, tape
         projected_gradient = torch.empty_like(projected)
         # Narrow channel tiles bound the live FP32 rotation/adjoint operands.
         token_tile, channel_tile = 128, 32 if rank <= 32 else 16
@@ -1045,8 +1626,8 @@ class _NoFrameMix(torch.autograd.Function):
             projected,
             gradient,
             coefficient,
-            gram_gradient.contiguous(),
-            cross_gradient.contiguous(),
+            gram_gradient,
+            cross_gradient,
             eta,
             counts,
             projected_gradient,
@@ -1066,6 +1647,7 @@ class _NoFrameMix(torch.autograd.Function):
             num_warps=4,
             num_stages=1,
         )
+        del projected, gradient, coefficient, gram_gradient, cross_gradient, eta
         return projected_gradient, base_gradient, raw_gradient, None, None, None, None
 
 

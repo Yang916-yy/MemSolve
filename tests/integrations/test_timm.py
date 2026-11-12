@@ -14,6 +14,11 @@ from integrations.timm import (
     _TimmMemSolveMixer,
     _require_timm_attention_mask_api,
     create_memsolve_vit,
+    create_memsolve_vit_variant,
+    vision_default_mlp_ratio,
+    vision_default_rank,
+    vision_spec,
+    vision_variant_kwargs,
 )
 from memsolve import CoreMode, MemSolve
 from memsolve.ball import cuda
@@ -145,7 +150,8 @@ def test_timm_cuda_adapter_does_not_fall_back_to_reference() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
+@pytest.mark.parametrize("norm_type,rotary_2d", [("layernorm", False), ("rmsnorm", True)])
+def test_timm_cuda_adapter_matches_reference_outputs_and_gradients(norm_type, rotary_2d) -> None:
     pytest.importorskip("timm")
     try:
         cuda.load()
@@ -166,6 +172,7 @@ def test_timm_cuda_adapter_matches_reference_outputs_and_gradients() -> None:
         "bias": True,
         "drop_path_rate": 0.0,
     }
+    kwargs.update(norm_type=norm_type, rotary_2d=rotary_2d)
     fast = create_memsolve_vit(**kwargs, implementation="cuda").cuda().eval()
     reference = create_memsolve_vit(
         **kwargs,
@@ -296,3 +303,277 @@ def test_vit3_mean_readout_excludes_padding_and_has_no_layerscale():
     state['_extra_state'].update(version=6, pooling='cls', class_token=True, layer_scale=True)
     with pytest.raises(RuntimeError, match='vision scaffold'):
         model.load_state_dict(state)
+
+
+def test_rmsnorm_axial_rove_layout_and_checkpoint_contract():
+    kwargs = dict(image_size=32, patch_size=4, num_classes=10, embed_dim=32,
+                  depth=1, num_heads=2, rank=16, mlp_ratio=2., bias=True,
+                  dynamic_img_size=True)
+    model = create_memsolve_vit(**kwargs, norm_type="rmsnorm", rotary_2d=True)
+    assert isinstance(model.encoder.norm, torch.nn.RMSNorm)
+    x = torch.randn(2, 3, 32, 48)
+    mask = torch.ones(2, 96, dtype=torch.bool)
+    mask[:, -5:] = False
+    layout = model._token_layout(x, mask)
+    cos, sin = layout.rotary_factors
+    assert cos.shape == (1, 96, 8)
+    torch.testing.assert_close(cos.square() + sin.square(), torch.ones_like(cos))
+    # Moving right leaves the row-axis rotations unchanged.
+    torch.testing.assert_close(cos[:, 0, :4], cos[:, 1, :4])
+    assert not torch.equal(cos[:, 0, 4:], cos[:, 1, 4:])
+    output = model(x, valid_mask=mask)
+    assert output.shape == (2, 10) and torch.isfinite(output).all()
+    restored = create_memsolve_vit(**kwargs, norm_type="rmsnorm", rotary_2d=True)
+    restored.load_state_dict(model.state_dict())
+    torch.testing.assert_close(restored(x, valid_mask=mask), output)
+    with pytest.raises(RuntimeError, match="incompatible"):
+        create_memsolve_vit(**kwargs).load_state_dict(model.state_dict())
+
+
+def test_gelu_scaffold_rejects_swiglu_checkpoint():
+    model = create_memsolve_vit(image_size=32, patch_size=4, num_classes=10,
+        embed_dim=32, depth=1, num_heads=2, rank=16, mlp_ratio=2.,
+        bias=True, norm_type="rmsnorm", rotary_2d=True)
+    state = copy.deepcopy(model.state_dict())
+    state["_extra_state"]["ffn"] = "swiglu"
+    with pytest.raises(RuntimeError, match="incompatible MemSolve vision scaffold"):
+        model.load_state_dict(state)
+
+
+def test_vision_variant_kwargs_and_factory_forward_all_scales_and_options() -> None:
+    pytest.importorskip("timm")
+    expected_scales = {
+        "tiny": (192, 12, 6, 16, 4.0, 0.0),
+        "small": (384, 12, 6, 32, 4.125, 0.1),
+        "base": (768, 12, 12, 48, 4.0, 0.4),
+        "large": (1024, 24, 16, 64, 4.0, 0.45),
+    }
+    for variant, (dim, depth, heads, rank, mlp_ratio, drop_path) in expected_scales.items():
+        spec = vision_spec(variant)
+        assert (spec.embed_dim, spec.depth, spec.num_heads, spec.drop_path_rate) == (
+            dim,
+            depth,
+            heads,
+            drop_path,
+        )
+        assert vision_default_rank(variant) == rank
+        assert vision_default_mlp_ratio(variant) == mlp_ratio
+        assert vision_variant_kwargs(variant) == {
+            "embed_dim": dim,
+            "depth": depth,
+            "num_heads": heads,
+            "rank": rank,
+            "mlp_ratio": mlp_ratio,
+            "drop_path_rate": drop_path,
+        }
+
+    large = create_memsolve_vit_variant("large", image_size=32, num_classes=7).eval()
+    assert len(large.blocks) == 24
+    assert large.encoder.embed_dim == 1024
+    assert large.blocks[0].attn.mixer.config.num_heads == 16
+    assert large.blocks[0].attn.mixer.config.rank == 64
+    assert large.encoder.head.out_features == 7
+    with torch.inference_mode():
+        logits = large(torch.randn(1, 3, 32, 32))
+    assert logits.shape == (1, 7) and torch.isfinite(logits).all()
+
+    customized = create_memsolve_vit_variant(
+        "tiny",
+        image_size=32,
+        patch_size=8,
+        num_classes=5,
+        rank=24,
+        mlp_ratio=2.5,
+        core_mode=CoreMode.COMPLEMENT,
+        drop_path_rate=0.25,
+        dynamic_img_size=True,
+        norm_type="rmsnorm",
+        rotary_2d=True,
+    ).eval()
+    assert isinstance(customized.encoder.norm, torch.nn.RMSNorm)
+    assert customized.rotary_2d is True
+    assert customized.blocks[0].attn.mixer.config.rank == 24
+    assert customized.blocks[0].attn.mixer.config.core_mode == CoreMode.COMPLEMENT
+    assert customized.blocks[0].mlp.fc1.out_features == int(192 * 2.5)
+    with torch.inference_mode():
+        out = customized(torch.randn(1, 3, 24, 32))
+    assert out.shape == (1, 5) and torch.isfinite(out).all()
+
+
+def test_timm_create_model_registers_memsolve_vit_large() -> None:
+    timm = pytest.importorskip("timm")
+    model = timm.create_model("memsolve_vit_large", pretrained=False)
+    assert len(model.blocks) == 24
+    assert model.encoder.embed_dim == 1024
+    assert model.blocks[0].attn.mixer.config.num_heads == 16
+    assert model.blocks[0].attn.mixer.config.rank == 64
+    assert model.default_cfg["input_size"] == (3, 224, 224)
+
+    compact_large = timm.create_model(
+        "memsolve_vit_large",
+        pretrained=False,
+        img_size=32,
+        num_classes=11,
+        norm_type="rmsnorm",
+        rotary_2d=True,
+    ).eval()
+    assert isinstance(compact_large.encoder.norm, torch.nn.RMSNorm)
+    with torch.inference_mode():
+        logits = compact_large(torch.randn(1, 3, 32, 32))
+    assert logits.shape == (1, 11) and torch.isfinite(logits).all()
+
+    with pytest.raises(ValueError, match="No pretrained MemSolve-ViT weights"):
+        timm.create_model("memsolve_vit_large", pretrained=True)
+
+
+def test_openmmlab_backbone_supports_large_variant() -> None:
+    pytest.importorskip("timm")
+    from integrations.openmmlab import MemSolveViTBackbone
+
+    backbone = MemSolveViTBackbone(variant="large", implementation="reference").eval()
+    assert backbone.out_channels == (1024, 1024, 1024, 1024)
+    assert len(backbone.blocks) == 24
+    assert backbone.interaction_indexes == [(0, 6), (6, 12), (12, 18), (18, 24)]
+    assert backbone.interactions[0].injector.attn.n_heads == 16
+    assert backbone._pretrained_geometry["embed_dim"] == 1024
+    assert backbone._pretrained_geometry["rank"] == 64
+    with torch.inference_mode():
+        features = backbone(torch.randn(1, 3, 64, 64))
+    assert tuple(f.shape for f in features) == (
+        (1, 1024, 16, 16),
+        (1, 1024, 8, 8),
+        (1, 1024, 4, 4),
+        (1, 1024, 2, 2),
+    )
+    assert all(torch.isfinite(f).all() for f in features)
+
+
+def test_cpe_compile_preserves_static_channels_last_and_materializes_dynamic_shapes() -> None:
+    pytest.importorskip("timm")
+    model = create_memsolve_vit(
+        image_size=32,
+        patch_size=4,
+        num_classes=10,
+        embed_dim=32,
+        depth=1,
+        num_heads=2,
+        rank=16,
+        mlp_ratio=2.0,
+        core_mode=CoreMode.EQUILIBRIUM,
+        bias=True,
+        dynamic_img_size=True,
+        position_encoding="cpe",
+        implementation="reference",
+    ).eval()
+
+    graphs: list[torch.fx.GraphModule] = []
+
+    def capture_backend(gm: torch.fx.GraphModule, _example_inputs: list[torch.Tensor]):
+        graphs.append(gm)
+        return gm.forward
+
+    def node_tensor(node: torch.fx.Node) -> torch.Tensor:
+        return node.meta.get("val", node.meta["example_value"])
+
+    def find_cpe_spatial_input(gm: torch.fx.GraphModule) -> torch.fx.Node:
+        matches = [
+            node.args[0]
+            for node in gm.graph.nodes
+            if (
+                (node.op == "call_module" and str(node.target).endswith("cpe"))
+                or (node.op == "call_function" and "conv2d" in str(node.target))
+            )
+            and isinstance(node.args[0], torch.fx.Node)
+            and node_tensor(node.args[0]).shape[1] == 32
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    torch._dynamo.reset()
+    try:
+        static_fn = torch.compile(model, backend=capture_backend, fullgraph=True, dynamic=False)
+        static_img = torch.randn(2, 3, 32, 32)
+        with torch.no_grad():
+            torch.testing.assert_close(static_fn(static_img), model(static_img))
+        static_spatial = find_cpe_spatial_input(graphs[-1])
+        assert static_spatial.target == "permute"
+        static_val = node_tensor(static_spatial)
+        assert static_val.is_contiguous(memory_format=torch.channels_last)
+        assert not static_val.is_contiguous()
+
+        graphs.clear()
+        dynamic_fn = torch.compile(model, backend=capture_backend, fullgraph=True, dynamic=True)
+        dynamic_img = torch.randn(2, 3, 32, 48)
+        with torch.no_grad():
+            torch.testing.assert_close(dynamic_fn(dynamic_img), model(dynamic_img))
+        dynamic_spatial = find_cpe_spatial_input(graphs[-1])
+        assert dynamic_spatial.target == "contiguous"
+        assert node_tensor(dynamic_spatial).is_contiguous()
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compiled_cpe_vit_matches_eager_static_and_dynamic_cuda() -> None:
+    pytest.importorskip("timm")
+    try:
+        cuda.load()
+    except RuntimeError as error:
+        pytest.skip(f"native CUDA extension is unavailable: {error}")
+
+    torch.manual_seed(71)
+    eager = create_memsolve_vit(
+        image_size=32,
+        patch_size=4,
+        num_classes=10,
+        embed_dim=32,
+        depth=2,
+        num_heads=2,
+        rank=16,
+        mlp_ratio=2.0,
+        core_mode=CoreMode.EQUILIBRIUM,
+        bias=True,
+        drop_path_rate=0.0,
+        dynamic_img_size=True,
+        position_encoding="cpe",
+        implementation="cuda",
+    ).cuda().eval()
+
+    torch._dynamo.reset()
+    try:
+        compiled_static = torch.compile(eager, dynamic=False)
+        x_eager = torch.randn(2, 3, 32, 32, device="cuda", requires_grad=True)
+        x_comp = x_eager.detach().clone().requires_grad_()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out_eager = eager(x_eager)
+            out_comp = compiled_static(x_comp)
+        upstream = torch.randn_like(out_eager)
+        grads_eager = torch.autograd.grad((out_eager * upstream).sum(), (x_eager, *eager.parameters()))
+        grads_comp = torch.autograd.grad((out_comp * upstream).sum(), (x_comp, *eager.parameters()))
+        assert _relative_l2(out_comp, out_eager) <= 5e-3
+        for grad_comp, grad_eager in zip(grads_comp, grads_eager):
+            assert torch.isfinite(grad_comp).all()
+            assert _relative_l2(grad_comp, grad_eager) <= 1e-2
+
+        torch._dynamo.reset()
+        compiled_dynamic = torch.compile(eager, dynamic=True)
+        for height, width in ((32, 32), (32, 48)):
+            dx_eager = torch.randn(2, 3, height, width, device="cuda", requires_grad=True)
+            dx_comp = dx_eager.detach().clone().requires_grad_()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                dout_eager = eager(dx_eager)
+                dout_comp = compiled_dynamic(dx_comp)
+            dupstream = torch.randn_like(dout_eager)
+            dgrads_eager = torch.autograd.grad(
+                (dout_eager * dupstream).sum(), (dx_eager, *eager.parameters())
+            )
+            dgrads_comp = torch.autograd.grad(
+                (dout_comp * dupstream).sum(), (dx_comp, *eager.parameters())
+            )
+            assert _relative_l2(dout_comp, dout_eager) <= 5e-3
+            for grad_comp, grad_eager in zip(dgrads_comp, dgrads_eager):
+                assert torch.isfinite(grad_comp).all()
+                assert _relative_l2(grad_comp, grad_eager) <= 1e-2
+    finally:
+        torch._dynamo.reset()

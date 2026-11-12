@@ -224,7 +224,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path,
                         default=DEFAULT_CONFIG,
                         help="defaults to the MemSolve 300e RA/EMA recipe for T/S/B")
-    parser.add_argument("--tier", choices=("tiny", "small", "base"), required=True)
+    parser.add_argument("--tier", choices=("tiny", "small", "base", "large"), required=True)
     parser.add_argument(
         "--phase",
         choices=("pretrain", "finetune"),
@@ -369,6 +369,11 @@ def load_run(args: argparse.Namespace) -> ImageNetRun:
         **tier_values,
         "drop_path_rate": drop_path_rate,
     }
+    for key in ("norm_type", "rotary_2d", "ffn"):
+        if key in defaults:
+            model[key] = defaults[key]
+    if model.get("norm_type") == "rmsnorm":
+        model["pooling"] = "token_rms_mean"
     train = {**defaults, **phase_values}
     train.pop("input_size")
     train.setdefault("lr_schedule", "update")
@@ -492,10 +497,20 @@ def _validate_run(
 
     for key, expected in {
         "architecture": "vit3_cpe_accretive_mean_gelu_v7", "ffn": "gelu", "layer_scale": False, "class_token": False,
-        "pooling": "token_ln_mean", "position_encoding": "cpe",
+        "position_encoding": "cpe",
     }.items():
         if model.get(key) != expected:
             raise ValueError(f"the vision scaffold requires {key}={expected!r}")
+    norm_type = model.get("norm_type", "layernorm")
+    if norm_type not in {"layernorm", "rmsnorm"}:
+        raise ValueError("unsupported norm_type")
+    expected_pool = "token_rms_mean" if norm_type == "rmsnorm" else "token_ln_mean"
+    if model["pooling"] != expected_pool:
+        raise ValueError("pooling must match the token normalization")
+    if not isinstance(model.get("rotary_2d", False), bool):
+        raise ValueError("rotary_2d must be boolean")
+    if model.get("rotary_2d", False) and (embed_dim // heads) % 4:
+        raise ValueError("2D RoVE requires head_dim divisible by four")
     from memsolve import MemSolveConfig
     MemSolveConfig(dim=embed_dim, num_heads=heads, rank=model["rank"],
                    core_mode=operator["core_mode"])
@@ -554,6 +569,7 @@ def _validate_run(
         "small": (384, 12, 6, 32),
         "base": (768, 12, 12, 48),
         "tiny": (192, 12, 6, 16),
+        "large": (1024, 24, 16, 64),
     }[tier]
     actual = (model["embed_dim"], model["depth"], model["num_heads"], model["rank"])
     if actual != expected:
@@ -1822,6 +1838,8 @@ def build_model(run: ImageNetRun) -> nn.Module:
         rank=int(model["rank"]),
         core_mode=run.operator["core_mode"],
         position_encoding=str(model["position_encoding"]),
+        norm_type=str(model.get("norm_type", "layernorm")),
+        rotary_2d=bool(model.get("rotary_2d", False)),
         mlp_ratio=float(model["mlp_ratio"]),
         bias=bool(run.operator["bias"]),
         implementation=str(run.operator["implementation"]),
@@ -2081,7 +2099,7 @@ def _assert_finite_loss(loss: torch.Tensor, *, epoch: int, step: int) -> None:
 
 
 def prepare_training_model(model: nn.Module, state: DistributedState, execution: str) -> nn.Module:
-    """Compile surrounding vision blocks; retain the tested MemSolve CUDA boundary."""
+    """Compile full vision blocks including registered MemSolve custom ops."""
     if execution not in {"eager", "graph", "compile-graph"}:
         raise ValueError(f"unsupported training execution: {execution}")
     if execution == "compile-graph":
@@ -2097,10 +2115,7 @@ def prepare_training_model(model: nn.Module, state: DistributedState, execution:
         dynamo_config.recompile_limit = max(
             dynamo_config.recompile_limit, 2 * mixer_count + 4
         )
-        for module in model.modules():
-            if isinstance(module, MemSolve):
-                module.forward = torch.compiler.disable(module.forward)
-        # The outer CUDA Graph captures compiled blocks and native mixer calls.
+        # The outer CUDA Graph captures full compiled blocks and MemSolve custom ops.
         # emulate_precision_casts keeps BF16 rounding between fused operations.
         model.compile(backend="inductor", fullgraph=False, dynamic=False,
                       options={"triton.cudagraphs": False, "emulate_precision_casts": True})
@@ -2176,7 +2191,7 @@ class ImageNetGraphStep:
         torch.cuda.synchronize(device)
         self.model.zero_grad(set_to_none=True)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=stream):
+        with torch.cuda.graph(self.graph, stream=stream, capture_error_mode="thread_local"):
             self.logits, self.loss = forward_backward()
         self.gradients = tuple(p.grad for p in self.parameters)
         torch.cuda.current_stream(device).wait_stream(stream)
@@ -2489,7 +2504,7 @@ def _recipe_fidelity(
     # A custom TOML can alter hyperparameters without creating CLI overrides.
     with DEFAULT_CONFIG.open("rb") as handle:
         canonical = tomllib.load(handle)
-    if run.phase not in canonical["tiers"][run.tier]:
+    if run.tier not in canonical["tiers"] or run.phase not in canonical["tiers"][run.tier]:
         return "explicitly-modified"
     canonical_train = {
         **canonical["defaults"],
@@ -2507,6 +2522,8 @@ def _recipe_fidelity(
         tier_model["drop_path_rate"] = phase_drop_path
     matches_recipe = matches_recipe and all(run.model.get(key) == value for key, value in tier_model.items())
     matches_recipe = matches_recipe and run.model["image_size"] == canonical["tiers"][run.tier][run.phase]["input_size"]
+    matches_recipe = matches_recipe and run.model.get("norm_type", "layernorm") == "layernorm"
+    matches_recipe = matches_recipe and not run.model.get("rotary_2d", False)
     if (
         matches_recipe
         and not (set(run.overrides) - non_semantic_overrides)

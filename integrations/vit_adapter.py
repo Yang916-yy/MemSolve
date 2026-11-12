@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """ViT-Adapter modules adapted from Vision-RWKV; see THIRD_PARTY_NOTICES.md."""
 
+from collections import OrderedDict
 from functools import partial
+import threading
 
 import torch
 import torch.nn as nn
@@ -11,43 +13,83 @@ from integrations.deform_attention import MSDeformAttn
 from timm.layers import DropPath
 
 
+_DEFORM_CACHE_MAX = 32
+_DEFORM_CACHE_LOCK = threading.Lock()
+_DEFORM_INPUTS_CACHE: OrderedDict[
+    tuple[torch.device, int, int],
+    tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+          tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+] = OrderedDict()
 
 
 def get_reference_points(spatial_shapes, device):
     reference_points_list = []
-    for lvl, (H_, W_) in enumerate(spatial_shapes):
+    for H_, W_ in spatial_shapes:
         ref_y, ref_x = torch.meshgrid(
-            torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
-            torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device), indexing="ij")
-        ref_y = ref_y.reshape(-1)[None] / H_
-        ref_x = ref_x.reshape(-1)[None] / W_
-        ref = torch.stack((ref_x, ref_y), -1)
+            (torch.arange(H_, dtype=torch.float32, device=device) + 0.5) / H_,
+            (torch.arange(W_, dtype=torch.float32, device=device) + 0.5) / W_,
+            indexing="ij",
+        )
+        ref = torch.stack((ref_x.reshape(-1)[None], ref_y.reshape(-1)[None]), -1)
         reference_points_list.append(ref)
     reference_points = torch.cat(reference_points_list, 1)
-    reference_points = reference_points[:, :, None]
-    return reference_points
+    return reference_points[:, :, None]
+
+
+def _deform_level_metadata(shapes, device):
+    if device.type == "cpu" and not torch.compiler.is_compiling():
+        spatial_shapes = torch.tensor(shapes, dtype=torch.long, device=device)
+    else:
+        spatial_shapes = torch.stack([
+            torch.stack((
+                torch.full((), h_i, dtype=torch.long, device=device),
+                torch.full((), w_i, dtype=torch.long, device=device),
+            ))
+            for h_i, w_i in shapes
+        ])
+    if len(shapes) == 1:
+        level_start_index = torch.zeros((1,), dtype=torch.long, device=device)
+    else:
+        areas = spatial_shapes[:, 0] * spatial_shapes[:, 1]
+        level_start_index = torch.cat((
+            torch.zeros((1,), dtype=torch.long, device=device),
+            areas.cumsum(0)[:-1],
+        ))
+    return spatial_shapes, level_start_index
+
+
+def _build_deform_pair(h, w, device):
+    multi_scale = [(h // 8, w // 8), (h // 16, w // 16), (h // 32, w // 32)]
+    single_scale = [(h // 16, w // 16)]
+    shapes1, starts1 = _deform_level_metadata(multi_scale, device)
+    ref1 = get_reference_points(single_scale, device)
+    shapes2, starts2 = _deform_level_metadata(single_scale, device)
+    ref2 = get_reference_points(multi_scale, device)
+    return (ref1, shapes1, starts1), (ref2, shapes2, starts2)
 
 
 def deform_inputs(x):
-    bs, c, h, w = x.shape
-    spatial_shapes = torch.as_tensor([(h // 8, w // 8),
-                                      (h // 16, w // 16),
-                                      (h // 32, w // 32)],
-                                     dtype=torch.long, device=x.device)
-    level_start_index = torch.cat((spatial_shapes.new_zeros(
-        (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-    reference_points = get_reference_points([(h // 16, w // 16)], x.device)
-    deform_inputs1 = [reference_points, spatial_shapes, level_start_index]
+    _, _, h, w = x.shape
+    device = x.device
+    if torch.compiler.is_compiling():
+        pair1, pair2 = _build_deform_pair(h, w, device)
+        return list(pair1), list(pair2)
 
-    spatial_shapes = torch.as_tensor([(h // 16, w // 16)], dtype=torch.long, device=x.device)
-    level_start_index = torch.cat((spatial_shapes.new_zeros(
-        (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-    reference_points = get_reference_points([(h // 8, w // 8),
-                                             (h // 16, w // 16),
-                                             (h // 32, w // 32)], x.device)
-    deform_inputs2 = [reference_points, spatial_shapes, level_start_index]
+    key = (device, int(h), int(w))
+    with _DEFORM_CACHE_LOCK:
+        cached = _DEFORM_INPUTS_CACHE.get(key)
+        if cached is not None:
+            _DEFORM_INPUTS_CACHE.move_to_end(key)
+            return list(cached[0]), list(cached[1])
 
-    return deform_inputs1, deform_inputs2
+    pair1, pair2 = _build_deform_pair(key[1], key[2], device)
+    if not (x.is_cuda and torch.cuda.is_current_stream_capturing()):
+        with _DEFORM_CACHE_LOCK:
+            _DEFORM_INPUTS_CACHE[key] = (pair1, pair2)
+            _DEFORM_INPUTS_CACHE.move_to_end(key)
+            while len(_DEFORM_INPUTS_CACHE) > _DEFORM_CACHE_MAX:
+                _DEFORM_INPUTS_CACHE.popitem(last=False)
+    return list(pair1), list(pair2)
 
 
 class ConvFFN(nn.Module):

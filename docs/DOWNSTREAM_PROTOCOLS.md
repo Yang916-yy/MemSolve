@@ -2,7 +2,7 @@
 
 For dense prediction, we wrap the pretrained non-hierarchical **MemSolve-ViT** backbone (CPE + GELU, no CLS token, no LayerScale) in a standard **ViT-Adapter** and attach OpenMMLab Mask R-CNN + FPN (for COCO 2017) or UPerNet (for ADE20K).
 
-The 12 encoder blocks are divided into four interaction stages (`[0–2, 3–5, 6–8, 9–11]`). A convolutional spatial prior extracts stride 4/8/16/32 feature maps, and multi-scale deformable attention injects spatial features into the token stream and extracts multi-scale pyramids after each stage.
+The encoder blocks are divided into four equal interaction stages (`[0–2, 3–5, 6–8, 9–11]` for 12-layer Tiny/Small/Base, or 6 blocks per stage for 24-layer Large). A convolutional spatial prior extracts stride 4/8/16/32 feature maps, and multi-scale deformable attention injects spatial features into the token stream and extracts multi-scale pyramids after each stage.
 
 ## Architecture & Hyperparameters
 
@@ -14,7 +14,7 @@ Our setup follows the ViT-Adapter recipes used by [ViG (AAAI 2025, Appendix C)](
 | Small | 384 / 12 / 6 | 32 | 4.125 | 6 / 1.0 | 0.2 |
 | Base | 768 / 12 / 12 | 48 | 4.0 | 12 / 0.5 | 0.3 |
 
-All three tiers use a 64-channel spatial prior, 4 deformable sampling points, CFFN ratio 0.25, `SyncBN`, and zero-initialized injector scaling.
+All three paper tiers use a 64-channel spatial prior, 4 deformable sampling points, CFFN ratio 0.25, `SyncBN`, and zero-initialized injector scaling (`MemSolveViTBackbone` also supports `variant="large"` with width 1024, depth 24, 16 heads, rank 64, and default `deform_num_heads=16`).
 
 | Setting | COCO 2017 (Mask R-CNN 1×) | ADE20K (UPerNet 160k) |
 | --- | --- | --- |
@@ -68,5 +68,6 @@ torchrun --standalone --nproc_per_node=2 experiments/train_openmmlab.py \
 
 - Switch `small` to `tiny` or `base` in the config filename for the other model sizes.
 - Add `--cfg-options model.backbone.with_cp=True` to enable activation checkpointing if GPU memory is tight.
+- Add `--cfg-options model.backbone.compile_blocks=True` to dynamically `torch.compile` full `MemSolveViTBackbone` encoder blocks (including registered `MemSolve` custom ops with no Dynamo graph breaks; CUDA Graphs remain disabled for variable detection/segmentation canvas shapes).
 - Use `--resume` (or `--resume /path/to/checkpoint.pth`) to resume training, or `--test /path/to/checkpoint.pth` to run evaluation only.
 - Published training logs and resolved configs for our Small and Base runs are in [`results/coco/`](../results/coco/) and [`results/ade20k/`](../results/ade20k/).

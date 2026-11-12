@@ -94,8 +94,9 @@ through their public APIs. The MLM recipe is adapted from LIONS-EPFL/LION
 (Masked_Language_Modeling/yamls/pretrain), with Composer-to-PyTorch
 weight-decay conversion; adaptations are documented in docs/BERT_MLM.md.
 
-The compact Cholesky and triangular solves use NVIDIA cuSOLVERDx's POTRF/TRSM
-device operations and follow the cooperative load/solve/store structure in
+When built with MEMSOLVE_USE_MATHDX=ON, the optional cuSOLVERDx compact
+Cholesky and triangular solve path uses NVIDIA cuSOLVERDx's POTRF/TRSM
+device operations and follows the cooperative load/solve/store structure in
 MathDx 26.06.1 example/cusolverdx/07_BLAS/trsm_batched_block.cu (Apache-2.0).
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 https://docs.nvidia.com/cuda/cusolverdx/get_started/functions/trsm.html

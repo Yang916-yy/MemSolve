@@ -27,6 +27,7 @@ output = concat_heads(Y) W_o + b_o
 - **Shared per-head generator**: In `equilibrium` mode, the unconstrained parameter $U \in \mathbb{R}^{r \times r}$ is learned per head and shared across the batch. The $r \times r$ Cayley map $F$ is solved once per head during each forward pass.
 - **Initialization**: Setting $U = 0$ yields $L = I$, $\Omega = 0$, $J = I$, and $F = 0$, while $\eta$ is initialized to $0.9$. Both `equilibrium` and `complement` therefore start from the exact same input-output mapping, while `equilibrium` immediately receives nonzero gradients on $U$.
 - **Masking and complexity**: Invalid (padded) tokens are zeroed before statistics accumulation, and $n = \max(\text{valid\_tokens}, 1)$ normalizes the relation scale. The reference backend forms $P$ explicitly via a thin QR factorization of $[A; I_r]$; the CUDA backend factors $I_r + A^\top A$ directly in rank space without materializing the $n \times r$ matrix $P$, keeping time and memory linear in sequence length $N$.
+- **Readout recomputation (`recompute_readout: Literal["auto"] | bool = "auto"`)**: `MemSolveConfig.recompute_readout` (also mutable on `MemSolve` instances via `layer.recompute_readout`) controls whether the CUDA fast path reconstructs the intermediate `[B, N, D]` mixed-token readout from compact factors during backward (`"auto"` recomputes whenever sequence length $N > 512$), leaving forward outputs and gradients mathematically identical.
 
 ## Rotary Value Encoding (RoVE)
 
@@ -50,5 +51,5 @@ Because $O_i^\top O_j = O(p_j - p_i)$, any pair of tokens interacts through thei
 
 - [`memsolve/ball/reference.py`](../memsolve/ball/reference.py): PyTorch reference implementation, FP64 test oracle, and rotary helpers.
 - [`memsolve/ball/model.py`](../memsolve/ball/model.py): `MemSolve` `nn.Module`, parameter initialization, checkpoint validation, and diagnostics.
-- [`memsolve/ball/config.py`](../memsolve/ball/config.py): `MemSolveConfig` and `CoreMode` definitions.
-- [`memsolve/ball/cuda.py`](../memsolve/ball/cuda.py): Mixed-precision Triton + cuSOLVERDx/cuBLASLt fast path (see [CUDA_CONTRACT.md](CUDA_CONTRACT.md)).
+- [`memsolve/ball/config.py`](../memsolve/ball/config.py): `MemSolveConfig` (including `CoreMode`, RoVE settings, and `recompute_readout: Literal["auto"] | bool = "auto"`).
+- [`memsolve/ball/cuda.py`](../memsolve/ball/cuda.py), [`csrc/ball/`](../csrc/ball/): Mixed-precision Triton + native CUDA C++ (`SM80`/`SM90a`, cuBLASLt, optional MathDx) fast path with full-graph `torch.library.custom_op` registration (see [CUDA_CONTRACT.md](CUDA_CONTRACT.md)).

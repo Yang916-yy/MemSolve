@@ -457,3 +457,115 @@ def test_shared_rotary_tables_are_per_forward_and_recomputed_once(monkeypatch):
     assert len(calls) == 2
     assert calls[0][0].data_ptr() != calls[1][0].data_ptr()
     assert not torch.equal(calls[0][0], calls[1][0])
+
+
+def test_centered_short_conv_compile_materializes_contiguous_activations():
+    torch.manual_seed(73)
+    model = MemSolveBertForMaskedLM(config(memsolve_short_conv_kernel=3)).eval()
+    short_conv = model.bert.encoder.layer[0].attention.short_conv
+    with torch.no_grad():
+        short_conv.conv.weight.normal_(std=0.05)
+        short_conv.conv.bias.fill_(0.02)
+
+    eager_conv_inputs_contiguous: list[bool] = []
+    handle = short_conv.conv.register_forward_pre_hook(
+        lambda _mod, inputs: eager_conv_inputs_contiguous.append(inputs[0].is_contiguous())
+    )
+    x = torch.randn(2, 8, 64)
+    valid_mask = torch.tensor(
+        [[True, True, True, True, True, True, False, False], [True] * 8],
+        dtype=torch.bool,
+    )
+    try:
+        eager_out = short_conv(x, valid_mask)
+    finally:
+        handle.remove()
+    assert eager_conv_inputs_contiguous == [False]
+
+    graphs: list[torch.fx.GraphModule] = []
+
+    def capture_backend(gm: torch.fx.GraphModule, _example_inputs: list[torch.Tensor]):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    try:
+        compiled_short_conv = torch.compile(
+            short_conv, backend=capture_backend, fullgraph=True, dynamic=False
+        )
+        compiled_out = compiled_short_conv(x, valid_mask)
+        torch.testing.assert_close(compiled_out, eager_out)
+
+        def node_tensor(node: torch.fx.Node) -> torch.Tensor:
+            return node.meta.get("val", node.meta["example_value"])
+
+        conv_nodes = [
+            node
+            for node in graphs[-1].graph.nodes
+            if (node.op == "call_module" and str(node.target).endswith("conv"))
+            or (node.op == "call_function" and "conv1d" in str(node.target))
+        ]
+        assert len(conv_nodes) == 1
+        conv_node = conv_nodes[0]
+        conv_in = conv_node.args[0]
+        assert isinstance(conv_in, torch.fx.Node)
+        assert conv_in.target == "contiguous"
+        assert node_tensor(conv_in).is_contiguous()
+
+        users = list(conv_node.users)
+        assert len(users) == 1 and users[0].target == "transpose"
+        transpose_users = list(users[0].users)
+        assert len(transpose_users) == 1 and transpose_users[0].target == "contiguous"
+        assert node_tensor(transpose_users[0]).is_contiguous()
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_bf16_cuda_short_conv_mlm_matches_eager_and_gradients():
+    torch.manual_seed(79)
+    eager = (
+        MemSolveBertForMaskedLM(
+            config(
+                memsolve_rank=32,
+                memsolve_short_conv_kernel=3,
+                position_embedding_type="rove",
+            )
+        )
+        .cuda()
+        .train()
+    )
+    with torch.no_grad():
+        for layer in eager.bert.encoder.layer:
+            layer.attention.short_conv.conv.weight.normal_(std=0.02)
+            layer.attention.mixer.core_base_raw.normal_(std=0.05)
+            layer.attention.implementation = "cuda"
+
+    compiled_copy = copy.deepcopy(eager)
+    data = batch("cuda")
+
+    def relative(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return (a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-8)
+
+    torch._dynamo.reset()
+    try:
+        compiled_model = torch.compile(compiled_copy, dynamic=False)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            eager_out = eager(**data)
+            compiled_out = compiled_model(**data)
+        eager_out.loss.backward()
+        compiled_out.loss.backward()
+
+        assert relative(compiled_out.logits, eager_out.logits) < 5e-3
+        eager_grads, compiled_grads = [], []
+        for (name, p_eager), (other_name, p_comp) in zip(
+            eager.named_parameters(), compiled_copy.named_parameters()
+        ):
+            assert name == other_name
+            assert p_comp.grad is not None and torch.isfinite(p_comp.grad).all(), name
+            eager_grads.append(p_eager.grad.flatten())
+            compiled_grads.append(p_comp.grad.flatten())
+        assert relative(torch.cat(compiled_grads), torch.cat(eager_grads)) < 2e-2
+    finally:
+        torch._dynamo.reset()

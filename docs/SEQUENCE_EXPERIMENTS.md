@@ -18,7 +18,7 @@ Pass `--prepare-only` to inspect the resolved hyperparameters and data splits wi
 
 ### Shared Encoder & RoVE Setup (`experiments/configs/lra_rove.toml`)
 
-All 10 mixers share the exact same 6-layer pre-LayerNorm backbone, FFN width (ratio 2), dropout (0.1), pooling, token masks, and optimizer schedule:
+All 10 mixers share the exact same 6-layer pre-LayerNorm backbone, FFN width (ratio 2), pooling, token masks, and optimizer schedule:
 - **Position Encoding**: Symbolic tasks (`listops`, `text`, `retrieval`) use 1D RoVE (`--position-encoding rove_1d`); pixel tasks (`image`, `pathfinder`) use 2D axial RoVE (`--position-encoding rove_2d`), rotating horizontal and vertical channel halves with base 10,000. For attention baselines, RoVE rotates values $V$ before attention and applies the inverse rotation at readout before the output projection, so every mixer receives the exact same content-position transport.
 - **Task Schedule**:
 
@@ -50,10 +50,10 @@ Supported `--mixer` choices:
 - `performer`: 128 positive orthogonal random features per head.
 - `nystromformer`: 128 masked contiguous landmarks with 6 iterative pinv steps.
 - `agent`: 128 masked pooled agent tokens.
-- `mita`: 128 routers, top-128 selected keys, 1 router per query (uses variable-length FlashAttention).
+- `mita`: 128 routers, top-128 selected keys, 1 router per query (uses variable-length FlashAttention; pair with `--execution compile` rather than `compile-graph`).
 - `polaformer`: Polarity-aware linear attention with learned power ($\alpha = 4$).
 
-Passing `--fail-on-nonfinite` halts immediately with exit code `86` and writes `failure.json` if losses, gradients, or weights become `NaN`/`Inf`.
+Passing `--fail-on-nonfinite` halts immediately with exit code `86` and writes `failure.json` if losses, gradients, or weights become `NaN`/`Inf`. `--execution compile` and `--execution compile-graph` compile full encoder blocks end-to-end through Inductor (including registered `MemSolve` custom ops without Dynamo graph breaks).
 
 ## Learned Absolute Position Recipe (`experiments/configs/lra.toml`)
 

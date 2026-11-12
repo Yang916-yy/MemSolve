@@ -1,0 +1,223 @@
+{
+  "run": "memsolve_bert_base_rove_noconv_lion_c4_128_seed17_20261021",
+  "recorded": {
+    "experiment": {
+      "data": {
+        "train": [
+          {
+            "format": "memsolve-local-text-stream-v1",
+            "max_length": 128,
+            "num_source_files": 1024,
+            "packing": "one_document",
+            "resume": "HF Trainer replays/skips consumed batches; worker mask RNG is not bitwise restored",
+            "row_count": null,
+            "shuffle_buffer": 10000,
+            "shuffle_seed": 17,
+            "source": {
+              "config": "en",
+              "dataset": "allenai/c4",
+              "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+            },
+            "tokenize_batch_size": 256,
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e",
+            "verification": "SHA256 verified at download; size and mtime checked again before launch",
+            "file_manifest_sha256": "b6eea7e3f7c4a1a88329f984847538a5c3ef048cdc2b3ed3353cb90fc29b17d0"
+          }
+        ],
+        "validation": [
+          {
+            "eval_mask_probability": 0.15,
+            "fingerprint": "cfb94e9f81d3c7da",
+            "format": 1,
+            "mask_seed": 17,
+            "max_docs": 10000,
+            "max_length": 128,
+            "num_shards": 1,
+            "packing": "one_document",
+            "rows": 10000,
+            "shard_index": 0,
+            "source": {
+              "file_count": 8
+            },
+            "split": "validation",
+            "token_counts": {
+              "attention_tokens": 1148152,
+              "content_tokens": 1128152,
+              "masked_targets": 169544
+            },
+            "tokenizer_hash": "25a50e20acd8929fbd06917df039ee9254eef7fc9c52a4765b494455cd66c78e"
+          }
+        ]
+      },
+      "dataloader_drop_last": true,
+      "gradient_accumulation_steps": 4,
+      "initialization": "random",
+      "kind": "mlm",
+      "recipe": {
+        "execution": "compile-graph",
+        "global_batch_size": 4096,
+        "model": {
+          "ffn_type": "swiglu",
+          "hidden_size": 768,
+          "intermediate_size": 2048,
+          "max_position_embeddings": 512,
+          "memsolve_core_mode": "equilibrium",
+          "memsolve_implementation": "cuda",
+          "memsolve_rank": 32,
+          "memsolve_rotary_base": 10000.0,
+          "memsolve_rotary_scaling": "yarn",
+          "memsolve_rotary_train_length": 128,
+          "memsolve_short_conv_kernel": 0,
+          "model_type": "memsolve_bert",
+          "num_attention_heads": 12,
+          "num_hidden_layers": 14,
+          "position_embedding_type": "rove",
+          "vocab_size": 30522
+        },
+        "streaming_shuffle_buffer": 10000,
+        "train_mask_probability": 0.3,
+        "training": {
+          "accelerator_config": {
+            "dispatch_batches": false,
+            "split_batches": false
+          },
+          "adam_beta1": 0.9,
+          "adam_beta2": 0.98,
+          "adam_epsilon": 1e-06,
+          "average_tokens_across_devices": true,
+          "bf16": true,
+          "bf16_full_eval": false,
+          "data_seed": 17,
+          "dataloader_drop_last": true,
+          "dataloader_num_workers": 8,
+          "dataloader_persistent_workers": true,
+          "dataloader_prefetch_factor": 2,
+          "ddp_find_unused_parameters": false,
+          "disable_tqdm": true,
+          "eval_steps": 1000,
+          "eval_strategy": "steps",
+          "greater_is_better": false,
+          "learning_rate": 0.0008,
+          "load_best_model_at_end": true,
+          "logging_steps": 10,
+          "lr_scheduler_kwargs": {
+            "lr_end": 1.6e-05,
+            "power": 1.0
+          },
+          "lr_scheduler_type": "polynomial",
+          "max_grad_norm": 1.0,
+          "max_steps": 70000,
+          "metric_for_best_model": "masked_nll",
+          "optim": "adamw_torch_fused",
+          "per_device_eval_batch_size": 128,
+          "per_device_train_batch_size": 512,
+          "remove_unused_columns": false,
+          "report_to": "none",
+          "save_safetensors": true,
+          "save_steps": 1000,
+          "save_strategy": "steps",
+          "save_total_limit": 3,
+          "seed": 17,
+          "warmup_ratio": 0.06,
+          "weight_decay": 0.0125
+        }
+      },
+      "source_sha256": "8cbf7da5988a4b1b3dc605a78db1a50b00182772f03fa8322fb0c01bb0f0e869",
+      "world_size": 2
+    },
+    "versions": {
+      "accelerate": "1.15.0",
+      "datasets": "4.8.5",
+      "memsolve_source_sha256": "8cbf7da5988a4b1b3dc605a78db1a50b00182772f03fa8322fb0c01bb0f0e869",
+      "mteb": "2.21.6",
+      "sentence-transformers": "5.7.0",
+      "torch": "2.14.0+cu132",
+      "transformers": "4.57.6"
+    }
+  },
+  "model_config": {
+    "architectures": [
+      "MemSolveBertForMaskedLM"
+    ],
+    "attention_probs_dropout_prob": 0.0,
+    "classifier_dropout": null,
+    "dtype": "float32",
+    "ffn_type": "swiglu",
+    "hidden_act": "gelu",
+    "hidden_dropout_prob": 0.1,
+    "hidden_size": 768,
+    "initializer_range": 0.02,
+    "intermediate_size": 2048,
+    "layer_norm_eps": 1e-12,
+    "max_position_embeddings": 512,
+    "memsolve_contract": {
+      "bias": true,
+      "core_mode": "equilibrium",
+      "dim": 768,
+      "eta_parameterization": "per_head_interior_tanh",
+      "num_heads": 12,
+      "numerics": "tf32-wbc-ieee-fgram-tc16-v6",
+      "operator": "accretive_equilibrium",
+      "rank": 32,
+      "rotary": {
+        "amplitude": 1.0,
+        "base": 10000.0,
+        "layout": "full_head_adjacent_pairs",
+        "scaling": "yarn",
+        "train_length": 128,
+        "type": "value_transport",
+        "yarn_beta": [
+          32,
+          1
+        ]
+      },
+      "version": 26
+    },
+    "memsolve_core_mode": "equilibrium",
+    "memsolve_implementation": "cuda",
+    "memsolve_rank": 32,
+    "memsolve_rotary_base": 10000.0,
+    "memsolve_rotary_scaling": "yarn",
+    "memsolve_rotary_train_length": 128,
+    "memsolve_short_conv_kernel": 0,
+    "model_type": "memsolve_bert",
+    "num_attention_heads": 12,
+    "num_hidden_layers": 14,
+    "pad_token_id": 0,
+    "position_embedding_type": "rove",
+    "transformers_version": "4.57.6",
+    "type_vocab_size": 2,
+    "use_cache": false,
+    "vocab_size": 30522
+  },
+  "selection": {
+    "best_checkpoint": "run:nlp-pretrain/memsolve_bert_base_rove_noconv_lion_c4_128_seed17_20261021/training/checkpoint-70000",
+    "best_metric": 1.6902296566266115,
+    "global_step": 70000,
+    "metric": "masked_nll",
+    "selection": "best_validation"
+  },
+  "final_evaluation": {
+    "epoch": 1.0,
+    "eval_loss": 1.6900652647018433,
+    "eval_masked_accuracy": 0.6539088717682091,
+    "eval_masked_nll": 1.6902296566266115,
+    "eval_masked_perplexity": 5.42072546771645,
+    "eval_masked_tokens": 169256,
+    "eval_runtime": 2.2481,
+    "eval_samples_per_second": 4448.116,
+    "eval_steps_per_second": 17.792
+  },
+  "training_summary": {
+    "epoch": 1.0,
+    "train_loss": 2.4571385063443865,
+    "train_runtime": 95445.5811,
+    "train_samples_per_second": 3004.015,
+    "train_steps_per_second": 0.733
+  },
+  "trainer_state": {
+    "global_step": 70000,
+    "best_metric": 1.6902296566266115,
+    "best_model_checkpoint": "run:nlp-pretrain/memsolve_bert_base_rove_noconv_lion_c4_128_seed17_20261021/training/checkpoint-70000"
+  }
+}

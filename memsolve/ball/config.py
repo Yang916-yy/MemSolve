@@ -3,6 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
+from typing import Literal
+
+
+def _validate_recompute_readout(value: object) -> Literal["auto"] | bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value == "auto":
+            return "auto"
+        raise ValueError(
+            f"recompute_readout must be True, False, or 'auto', got {value!r}"
+        )
+    raise TypeError(
+        f"recompute_readout must be a bool or 'auto', got {type(value).__name__}"
+    )
 
 
 class CoreMode(str, Enum):
@@ -14,7 +29,13 @@ class CoreMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class MemSolveConfig:
-    """Configuration for the one MemSolve operator and its explicit ablations."""
+    """Configuration for the one MemSolve operator and its explicit ablations.
+
+    ``recompute_readout`` controls CUDA output-projection activation checkpointing:
+    ``False`` retains the mixed readout activation for backward, ``True`` always
+    recomputes it from compact state, and ``"auto"`` recomputes when sequence
+    length ``N > 512``.
+    """
 
     dim: int
     num_heads: int
@@ -27,6 +48,7 @@ class MemSolveConfig:
     rotary_base: float = 10000.0
     rotary_train_length: int = 128
     rotary_scaling: str = "yarn"
+    recompute_readout: Literal["auto"] | bool = "auto"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -73,6 +95,11 @@ class MemSolveConfig:
             raise ValueError("rotary_scaling must be 'none' or 'yarn'")
         if self.rotary and self.head_dim % 2:
             raise ValueError("rotary requires an even head_dim")
+        object.__setattr__(
+            self,
+            "recompute_readout",
+            _validate_recompute_readout(self.recompute_readout),
+        )
 
     @property
     def head_dim(self) -> int:

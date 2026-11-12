@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
+from torch.fx.experimental.symbolic_shapes import has_static_value
 import torch.nn as nn
 
-from .config import CoreMode, MemSolveConfig
+from .config import CoreMode, MemSolveConfig, _validate_recompute_readout
 from .reference import (
     _compact_matmul,
     accretive_equilibrium_mix,
@@ -42,6 +44,9 @@ class MemSolve(nn.Module):
     def __init__(self, config: MemSolveConfig) -> None:
         super().__init__()
         self.config = config
+        self._recompute_readout: Literal["auto"] | bool = _validate_recompute_readout(
+            config.recompute_readout
+        )
         self.w_bc = nn.Linear(
             config.dim,
             config.num_heads * config.rank + config.dim,
@@ -64,6 +69,16 @@ class MemSolve(nn.Module):
             ),
             requires_grad=config.scalar_complement,
         )
+
+    @property
+    def recompute_readout(self) -> Literal["auto"] | bool:
+        """Return the CUDA readout recomputation policy ('auto' recomputes when N > 512)."""
+
+        return self._recompute_readout
+
+    @recompute_readout.setter
+    def recompute_readout(self, value: Literal["auto"] | bool) -> None:
+        self._recompute_readout = _validate_recompute_readout(value)
 
     def complement(self) -> torch.Tensor:
         """Return the learned per-head complement."""
@@ -199,7 +214,16 @@ class MemSolve(nn.Module):
                 f"got {x.dtype}"
             )
 
-        for name, parameter in self.named_parameters():
+        for name, parameter in (
+            ("core_base_raw", self.core_base_raw),
+            ("eta_raw", self.eta_raw),
+            ("w_bc.weight", self.w_bc.weight),
+            ("w_bc.bias", self.w_bc.bias),
+            ("w_o.weight", self.w_o.weight),
+            ("w_o.bias", self.w_o.bias),
+        ):
+            if parameter is None:
+                continue
             if parameter.device != x.device:
                 raise RuntimeError(
                     f"implementation='cuda' requires {name} on {x.device}, "
@@ -237,7 +261,7 @@ class MemSolve(nn.Module):
             if sequence_parallel is not None:
                 valid_counts = sequence_parallel.valid_counts(mask, batch_size=batch, device=x.device)
             elif not all_valid:
-                valid_counts = mask.sum(dim=-1, dtype=torch.float32).clamp_min_(1)
+                valid_counts = mask.sum(dim=-1, dtype=torch.float32).clamp_min(1.0)
         elif (valid_counts.shape != (batch,) or valid_counts.device != x.device
               or valid_counts.dtype != torch.float32 or valid_counts.requires_grad
               or not valid_counts.is_contiguous()):
@@ -250,20 +274,86 @@ class MemSolve(nn.Module):
         )
         from . import cuda as cuda_backend
 
-        mixed = cuda_backend.fast_mix(
-            projected,
-            self.core_base_raw if self.core_base_raw is not None else self.eta_raw.new_empty((config.num_heads, config.rank, 0)),
-            self.eta_raw,
-            valid_counts,
-            sequence_parallel=sequence_parallel,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
+        recompute_policy: Literal["auto"] | bool = (
+            self._recompute_readout
+            if torch.is_grad_enabled() and self.w_o.weight.requires_grad
+            else False
         )
-        output = tensor_core_linear(
+        if recompute_policy == "auto" and has_static_value(length):
+            recompute_policy = length > 512
+        core_base = (
+            self.core_base_raw
+            if self.core_base_raw is not None
+            else self.eta_raw.new_empty((config.num_heads, config.rank, 0))
+        )
+        if (
+            (torch.compiler.is_compiling() or type(x) is not torch.Tensor)
+            and sequence_parallel is None
+            and cuda_backend._is_default_fast_mix()
+        ):
+            if recompute_policy is not False:
+                return cuda_backend._compiled_fast_mix_output_linear(
+                    projected,
+                    core_base,
+                    self.eta_raw,
+                    valid_counts,
+                    rotary_cos,
+                    rotary_sin,
+                    self.w_o.weight,
+                    self.w_o.bias,
+                    output_dtype=x.dtype,
+                    fuse_weight_bias_grad=True,
+                    output_mask=mask,
+                    recompute_policy=recompute_policy,
+                )
+            mixed = cuda_backend.fast_mix(
+                projected,
+                core_base,
+                self.eta_raw,
+                valid_counts,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+            )
+            del projected
+            return tensor_core_linear(
+                mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype,
+                fuse_weight_bias_grad=True, output_mask=mask,
+            )
+        if recompute_policy is False:
+            mixed = cuda_backend.fast_mix(
+                projected,
+                core_base,
+                self.eta_raw,
+                valid_counts,
+                sequence_parallel=sequence_parallel,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+            )
+            del projected
+            return tensor_core_linear(
+                mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype,
+                fuse_weight_bias_grad=True, output_mask=mask,
+            )
+        with cuda_backend._recompute_scope(recompute_policy) as recompute:
+            mixed = cuda_backend.fast_mix(
+                projected,
+                core_base,
+                self.eta_raw,
+                valid_counts,
+                sequence_parallel=sequence_parallel,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+            )
+        del projected
+        if recompute.spec is not None:
+            return cuda_backend._recompute_output_linear(
+                mixed, recompute.spec, self.w_o.weight, self.w_o.bias,
+                output_dtype=x.dtype, fuse_weight_bias_grad=True, output_mask=mask,
+            )
+        return tensor_core_linear(
             mixed, self.w_o.weight, self.w_o.bias, output_dtype=x.dtype,
             fuse_weight_bias_grad=True, output_mask=mask,
         )
-        return output
 
     def _reference_compact_problem(
         self,
@@ -436,7 +526,8 @@ class MemSolve(nn.Module):
         if context_length is None:
             physical_length = length if sequence_parallel is None else sequence_parallel.global_length
             if (valid_mask is None or config.rotary_scaling == "none"
-                    or physical_length <= config.rotary_train_length):
+                    or (not isinstance(physical_length, torch.SymInt)
+                        and physical_length <= config.rotary_train_length)):
                 # Every possible valid span has scale one within the training
                 # context; keep a shared table instead of expanding over B.
                 context_length = physical_length
@@ -454,11 +545,14 @@ class MemSolve(nn.Module):
             if context_length.shape != (batch,):
                 raise ValueError("rotary_context_length tensor must have shape [B]")
             context_length = context_length.to(device=x.device)
-            torch._assert_async((context_length > 0).all(), "rotary_context_length must be positive")
-        elif not isinstance(context_length, int) or isinstance(context_length, bool):
+            if not torch.compiler.is_compiling() and type(context_length) is torch.Tensor:
+                torch._assert_async((context_length > 0).all(), "rotary_context_length must be positive")
+        elif not isinstance(context_length, (int, torch.SymInt)) or isinstance(context_length, bool):
             raise TypeError("rotary_context_length must be an integer or integer tensor [B]")
-        elif context_length <= 0:
+        elif not isinstance(context_length, torch.SymInt) and context_length <= 0:
             raise ValueError("rotary_context_length must be positive")
+        if isinstance(context_length, torch.SymInt) and config.rotary_scaling == "yarn":
+            context_length = torch.full((1,), context_length, dtype=torch.int64, device=x.device)
         return rotary_position_factors(
             position_ids, head_dim=config.head_dim, base=config.rotary_base,
             train_length=config.rotary_train_length, context_length=context_length,

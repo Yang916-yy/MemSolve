@@ -123,7 +123,12 @@ class _CenteredShortConv(nn.Module):
         if valid_mask is not None:
             x = x.masked_fill(~valid_mask[..., None], 0)
         if sequence_parallel is None:
-            local = self.conv(x.transpose(1, 2)).transpose(1, 2)
+            if torch.compiler.is_compiling():
+                # Keep Conv1d activations contiguous so Inductor does not fuse strided
+                # channel-major layouts into downstream LayerNorm backward.
+                local = self.conv(x.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
+            else:
+                local = self.conv(x.transpose(1, 2)).transpose(1, 2)
         else:
             # The halo supplies neighboring tokens and global-end padding.
             padded = sequence_parallel.halo(x, self.conv.kernel_size[0] // 2)
@@ -135,6 +140,18 @@ class _CenteredShortConv(nn.Module):
         if valid_mask is not None:
             x = x.masked_fill(~valid_mask[..., None], 0)
         return x
+
+
+_CUDA_LOADED_DEVICES: set[torch.device] = set()
+
+
+def _ensure_cuda_loaded(device: torch.device) -> None:
+    if device not in _CUDA_LOADED_DEVICES:
+        from memsolve.ball import cuda
+
+        cuda.load(device=device)
+        if device.type == "cuda":
+            _CUDA_LOADED_DEVICES.add(device)
 
 
 class _MemSolveBertAttention(nn.Module):
@@ -163,6 +180,14 @@ class _MemSolveBertAttention(nn.Module):
         # MemSolve already owns Wo. Keep only BERT's dropout + residual + LN.
         self.output.dense = nn.Identity()
 
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        if self.implementation == "cuda":
+            param = next(self.parameters(), None)
+            if param is not None and param.is_cuda:
+                _ensure_cuda_loaded(param.device)
+        return result
+
     def forward(
         self, hidden_states, attention_mask=None, head_mask=None,
         encoder_hidden_states=None, past_key_values=None,
@@ -184,10 +209,9 @@ class _MemSolveBertAttention(nn.Module):
             valid_mask = attention_mask[:, 0, 0, :] == 0
         x = (self.short_conv(hidden_states, valid_mask)
              if self.short_conv is not None else hidden_states)
-        if self.implementation == "cuda":
-            # Load the device's native extension once for HF inference/training.
-            from memsolve.ball import cuda
-            cuda.load(device=x.device)
+        if self.implementation == "cuda" and not torch.compiler.is_compiling():
+            # Load the device's native extension once per device without per-layer locking.
+            _ensure_cuda_loaded(x.device)
         if x.is_cuda and torch.is_autocast_enabled("cuda"):
             x = x.to(torch.get_autocast_dtype("cuda"))
         elif self.implementation == "cuda":

@@ -280,8 +280,6 @@ def run(args):
     if args.execution=="compile":
         import torch._functorch.config as fc
         fc.backward_pass_autocast="off"
-        for module in model.modules():
-            if isinstance(module,MemSolve):module.forward=torch.compiler.disable(module.forward)
         model.compile(dynamic=True,fullgraph=False,
             options={"triton.cudagraphs":False,"emulate_precision_casts":True})
     optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4,betas=(.9,.999),eps=1e-6,

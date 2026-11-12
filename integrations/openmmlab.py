@@ -3,14 +3,22 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import threading
 from typing import Any, Sequence
+import weakref
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from experiments.imagenet import validate_checkpoint_contract
-from integrations.timm import MemSolveViT, VisionTokenLayout, vision_spec, vision_default_rank
+from integrations.timm import (
+    MemSolveViT,
+    VisionTokenLayout,
+    vision_default_rank,
+    vision_spec,
+    vision_variant_kwargs,
+)
 from integrations.vit_adapter import SpatialPriorModule, InteractionBlock, deform_inputs
 from integrations.deform_attention import MSDeformAttn
 from memsolve import CoreMode
@@ -26,8 +34,8 @@ class MemSolveViTBackbone(MemSolveViT):
     def __init__(self, *, variant: str, image_size: int = 224,
                  rank: int | None = None, core_mode: CoreMode | str = CoreMode.EQUILIBRIUM,
                  bias: bool = True, implementation: str = "cuda",
-                 mlp_ratio: float | None = None, drop_path_rate: float = 0.2,
-                 conv_inplane: int = 64, deform_num_heads: int = 6,
+                 mlp_ratio: float | None = None, drop_path_rate: float | None = 0.2,
+                 conv_inplane: int = 64, deform_num_heads: int | None = None,
                  deform_ratio: float = 1.0, cffn_ratio: float = 0.25,
                  n_points: int = 4, with_cp: bool = False,
                  checkpoint: str | Path | None = None, checkpoint_weights: str = "auto",
@@ -37,31 +45,39 @@ class MemSolveViTBackbone(MemSolveViT):
             raise ValueError("ViT-Adapter requires four equally sized block groups")
         if checkpoint_weights not in {"auto", "model", "model_ema"}:
             raise ValueError("checkpoint_weights must be auto, model or model_ema")
-        rank = vision_default_rank(variant) if rank is None else rank
-        mlp_ratio = (4.125 if variant == "small" else 4.0) if mlp_ratio is None else mlp_ratio
+        geometry = vision_variant_kwargs(
+            variant,
+            spec=spec,
+            rank=rank,
+            mlp_ratio=mlp_ratio,
+            drop_path_rate=drop_path_rate,
+        )
+        embed_dim = geometry["embed_dim"]
+        depth = geometry["depth"]
+        num_heads = geometry["num_heads"]
+        resolved_deform_heads = num_heads if deform_num_heads is None else deform_num_heads
         super().__init__(image_size=image_size, patch_size=16, num_classes=0,
-                         embed_dim=spec.embed_dim, depth=spec.depth, num_heads=spec.num_heads,
-                         rank=rank, mlp_ratio=mlp_ratio, core_mode=core_mode, bias=bias,
-                         implementation=implementation, drop_path_rate=drop_path_rate,
+                         **geometry, core_mode=core_mode, bias=bias,
+                         implementation=implementation,
                          position_encoding="cpe", dynamic_img_size=True, dynamic_img_pad=True)
         self.encoder.norm = nn.Identity()
         self.variant = variant
         self.checkpoint_weights = checkpoint_weights
-        self.out_channels = (spec.embed_dim,) * 4
-        self._pretrained_geometry = dict(patch_size=16, embed_dim=spec.embed_dim,
-            depth=spec.depth, num_heads=spec.num_heads, rank=rank, mlp_ratio=mlp_ratio,
-            norm_eps=1e-6, position_encoding="cpe")
+        self.out_channels = (embed_dim,) * 4
+        self._pretrained_geometry = dict(patch_size=16, embed_dim=embed_dim,
+            depth=depth, num_heads=num_heads, rank=geometry["rank"],
+            mlp_ratio=geometry["mlp_ratio"], norm_eps=1e-6, position_encoding="cpe")
         self._pretrained_operator = dict(core_mode=CoreMode(core_mode).value, bias=bias)
-        step = spec.depth // 4
+        step = depth // 4
         self.interaction_indexes = [(i * step, (i + 1) * step) for i in range(4)]
-        self.level_embed = nn.Parameter(torch.empty(3, spec.embed_dim))
-        self.spm = SpatialPriorModule(inplanes=conv_inplane, embed_dim=spec.embed_dim)
+        self.level_embed = nn.Parameter(torch.empty(3, embed_dim))
+        self.spm = SpatialPriorModule(inplanes=conv_inplane, embed_dim=embed_dim)
         self.interactions = nn.ModuleList([
-            InteractionBlock(dim=spec.embed_dim, num_heads=deform_num_heads, n_points=n_points,
-                deform_ratio=deform_ratio, cffn_ratio=cffn_ratio, drop_path=drop_path_rate,
+            InteractionBlock(dim=embed_dim, num_heads=resolved_deform_heads, n_points=n_points,
+                deform_ratio=deform_ratio, cffn_ratio=cffn_ratio, drop_path=geometry["drop_path_rate"],
                 extra_extractor=(i == 3), with_cp=with_cp) for i in range(4)])
-        self.up = nn.ConvTranspose2d(spec.embed_dim, spec.embed_dim, 2, 2)
-        self.output_norms = nn.ModuleList([nn.SyncBatchNorm(spec.embed_dim) for _ in range(4)])
+        self.up = nn.ConvTranspose2d(embed_dim, embed_dim, 2, 2)
+        self.output_norms = nn.ModuleList([nn.SyncBatchNorm(embed_dim) for _ in range(4)])
         for module in (self.spm, self.interactions, self.up):
             module.apply(self._init_adapter)
         for module in self.interactions.modules():
@@ -71,16 +87,12 @@ class MemSolveViTBackbone(MemSolveViT):
         if checkpoint is not None:
             self.load_pretrained(checkpoint)
         if compile_blocks:
-            from memsolve import MemSolve
             import torch._dynamo.config as dynamo_config
             import torch._functorch.config as functorch_config
 
             functorch_config.backward_pass_autocast = "off"
             dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 64)
-            for module in self.encoder.modules():
-                if isinstance(module, MemSolve):
-                    module.forward = torch.compiler.disable(module.forward)
-            # Fuse the surrounding blocks while retaining the native mixer boundary.
+            # Compile full encoder blocks including MemSolve custom ops.
             # Detection batches have varying spatial shapes; do not cache CUDA graphs.
             for block in self.encoder.blocks:
                 block.compile(dynamic=True, fullgraph=False,
@@ -175,18 +187,66 @@ def _pixel_valid_mask(
     batch, _channels, height, width = inputs.shape
     if len(data_samples) != batch:
         raise ValueError("data_samples length must match the image batch size")
-    mask = torch.zeros(batch, height, width, dtype=torch.bool, device=inputs.device)
-    for index, sample in enumerate(data_samples):
-        metainfo = sample.metainfo
-        shape = metainfo.get("img_shape", (height, width))
+    shapes: list[tuple[int, int]] = []
+    all_full = True
+    for sample in data_samples:
+        shape = sample.metainfo.get("img_shape", (height, width))
         image_height, image_width = int(shape[0]), int(shape[1])
         if not 0 < image_height <= height or not 0 < image_width <= width:
             raise ValueError(
                 "img_shape must be positive and fit in the padded batch input, "
                 f"got {(image_height, image_width)} for {(height, width)}"
             )
-        mask[index, :image_height, :image_width] = True
-    return mask
+        if image_height != height or image_width != width:
+            all_full = False
+        shapes.append((image_height, image_width))
+    device = inputs.device
+    if all_full:
+        return torch.ones((batch, height, width), dtype=torch.bool, device=device)
+    if batch == 1:
+        h0, w0 = shapes[0]
+        valid_h = torch.arange(height, device=device)[:, None] < h0
+        valid_w = torch.arange(width, device=device)[None, :] < w0
+        return (valid_h & valid_w).unsqueeze(0)
+    if device.type == "cpu":
+        bounds = torch.tensor(shapes, dtype=torch.long, device=device)
+    else:
+        bounds = torch.stack([
+            torch.stack((
+                torch.full((), h_i, dtype=torch.long, device=device),
+                torch.full((), w_i, dtype=torch.long, device=device),
+            ))
+            for h_i, w_i in shapes
+        ])
+    valid_h = torch.arange(height, device=device)[None, :, None] < bounds[:, 0:1, None]
+    valid_w = torch.arange(width, device=device)[None, None, :] < bounds[:, 1:2, None]
+    return valid_h & valid_w
+
+
+class _ThreadLocalValidMask:
+    """Thread-local per-instance descriptor so concurrent calls never race or leak masks."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _table(self) -> weakref.WeakKeyDictionary[Any, torch.Tensor]:
+        table = getattr(self._local, "masks", None)
+        if table is None:
+            table = weakref.WeakKeyDictionary()
+            self._local.masks = table
+        return table
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None:
+            return None
+        return self._table().get(instance)
+
+    def __set__(self, instance: Any, value: torch.Tensor | None) -> None:
+        table = self._table()
+        if value is None:
+            table.pop(instance, None)
+        else:
+            table[instance] = value
 
 
 class _MaskAwareMixin:
@@ -204,7 +264,7 @@ class _MaskAwareMixin:
                             enabled=device.type == "cuda"):
             return super().test_step(data)
 
-    _memsolve_valid_mask: torch.Tensor | None = None
+    _memsolve_valid_mask = _ThreadLocalValidMask()
 
     def forward(
         self,
@@ -227,6 +287,8 @@ class _MaskAwareMixin:
 
 class _SegmentationMaskMixin:
     """MMSeg sliding-window inference with matching crop-local validity masks."""
+
+    _memsolve_valid_mask = _ThreadLocalValidMask()
 
     def slide_inference(self, inputs, batch_img_metas):
         # Adapted from MMSegmentation 1.2.2 EncoderDecoder (Apache-2.0).

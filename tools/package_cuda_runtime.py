@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package the current strict CUDA artifacts as one installable runtime wheel."""
+"""Package the current CUDA artifacts as one installable runtime wheel."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -21,8 +22,19 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DIST_NAME = "memsolve_cuda_runtime"
 PACKAGE_NAME = "memsolve_cuda_runtime"
-PLATFORM_TAG = "linux_x86_64"
 SUPPORTED_ARCHITECTURES = (80, 86, 87, 89, 90, 100, 120)
+
+
+def _default_platform_tag() -> str:
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "linux_x86_64"
+    if machine in ("aarch64", "arm64"):
+        return "linux_aarch64"
+    raise RuntimeError(f"unsupported Linux CPU architecture for wheel packaging: {machine!r}")
+
+
+PLATFORM_TAG = _default_platform_tag()
 
 
 def _normalized(value: str) -> str:
@@ -47,6 +59,20 @@ def _parse_glibc_version(value: str) -> tuple[int, int]:
     if match is None:
         raise ValueError(f"invalid GLIBC version {value!r}; expected major.minor")
     return int(match.group(1)), int(match.group(2))
+
+
+def _parse_architectures(value: str) -> tuple[int, ...]:
+    items = [part.strip().rstrip("af") for part in re.split(r"[;,]", value) if part.strip()]
+    if not items:
+        raise ValueError("architectures list must not be empty")
+    parsed: list[int] = []
+    for item in items:
+        arch = int(item)
+        if arch not in SUPPORTED_ARCHITECTURES:
+            raise ValueError(f"unsupported architecture {arch}; expected one of {SUPPORTED_ARCHITECTURES}")
+        if arch not in parsed:
+            parsed.append(arch)
+    return tuple(parsed)
 
 
 def _run(*command: str) -> str:
@@ -108,7 +134,7 @@ def _runtime_init(
     cxx11_abi: int,
     architectures: tuple[int, ...],
 ) -> bytes:
-    return f'''"""Generated strict CUDA runtime for MemSolve."""
+    return f'''"""Generated CUDA runtime for MemSolve."""
 
 from pathlib import Path
 
@@ -121,7 +147,11 @@ ARCHITECTURES = {architectures!r}
 
 
 def library_path(architecture: int) -> Path:
-    return Path(__file__).with_name("lib") / f"memsolve_equilibrium_sm{{architecture}}.so"
+    lib_dir = Path(__file__).with_name("lib")
+    unified = lib_dir / "memsolve_equilibrium.so"
+    if unified.is_file():
+        return unified
+    return lib_dir / f"memsolve_equilibrium_sm{{architecture}}.so"
 '''.encode("utf-8")
 
 
@@ -152,18 +182,28 @@ def main() -> int:
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--torch-version", required=True)
     parser.add_argument("--cuda-version", required=True)
-    parser.add_argument("--mathdx-version", required=True)
-    parser.add_argument("--mathdx-license", type=Path, required=True)
+    parser.add_argument("--mathdx-version", default="none")
+    parser.add_argument("--mathdx-license", type=Path, default=None)
     parser.add_argument("--project-license", type=Path, default=ROOT / "LICENSE")
     parser.add_argument("--notice", type=Path, default=ROOT / "NOTICE")
     parser.add_argument("--max-glibc", default="2.31")
+    parser.add_argument("--platform-tag", default=PLATFORM_TAG)
+    parser.add_argument(
+        "--architectures",
+        default=",".join(str(a) for a in SUPPORTED_ARCHITECTURES),
+        help="Comma/semicolon-separated SM architectures packaged in the wheel",
+    )
     args = parser.parse_args()
 
-    for path in (args.python, args.mathdx_license, args.project_license, args.notice):
+    required_paths = [args.python, args.project_license, args.notice]
+    if args.mathdx_license is not None:
+        required_paths.append(args.mathdx_license)
+    for path in required_paths:
         if not path.is_file():
             parser.error(f"required file does not exist: {path}")
     try:
         max_glibc = _parse_glibc_version(args.max_glibc)
+        architectures = _parse_architectures(args.architectures)
     except ValueError as error:
         parser.error(str(error))
 
@@ -180,17 +220,32 @@ def main() -> int:
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    artifacts: dict[int, Path] = {
-        architecture: args.libraries_dir / f"memsolve_equilibrium_sm{architecture}.so"
-        for architecture in SUPPORTED_ARCHITECTURES
-    }
-    manifest_artifacts = {
-        str(architecture): _strip_and_validate_library(
-            library,
-            max_glibc=max_glibc,
-        )
-        for architecture, library in artifacts.items()
-    }
+    unified_library = args.libraries_dir / "memsolve_equilibrium.so"
+    manifest_artifacts: dict[str, dict[str, str]] = {}
+    packaged_binaries: dict[str, bytes] = {}
+
+    if unified_library.is_file():
+        validated = _strip_and_validate_library(unified_library, max_glibc=max_glibc)
+        unified_bytes = unified_library.read_bytes()
+        packaged_binaries[f"{PACKAGE_NAME}/lib/memsolve_equilibrium.so"] = unified_bytes
+        for architecture in architectures:
+            manifest_artifacts[str(architecture)] = dict(validated)
+    else:
+        artifacts: dict[int, Path] = {
+            architecture: args.libraries_dir / f"memsolve_equilibrium_sm{architecture}.so"
+            for architecture in architectures
+        }
+        manifest_artifacts = {
+            str(architecture): _strip_and_validate_library(
+                library,
+                max_glibc=max_glibc,
+            )
+            for architecture, library in artifacts.items()
+        }
+        packaged_binaries = {
+            f"{PACKAGE_NAME}/lib/{library.name}": library.read_bytes()
+            for library in artifacts.values()
+        }
 
     torch_public_version = args.torch_version.split("+", maxsplit=1)[0]
     local = (
@@ -201,7 +256,7 @@ def main() -> int:
     normalized_dist = _normalized(DIST_NAME)
     dist_info = f"{normalized_dist}-{wheel_version}.dist-info"
     wheel_path = args.output_dir / (
-        f"{normalized_dist}-{wheel_version}-py3-none-{PLATFORM_TAG}.whl"
+        f"{normalized_dist}-{wheel_version}-py3-none-{args.platform_tag}.whl"
     )
     metadata = {
         "schema_version": 1,
@@ -211,24 +266,29 @@ def main() -> int:
         "cuda_version": args.cuda_version,
         "cxx11_abi": torch_contract["cxx11_abi"],
         "mathdx_version": args.mathdx_version,
-        "architectures": list(SUPPORTED_ARCHITECTURES),
+        "platform_tag": args.platform_tag,
+        "architectures": list(architectures),
         "artifacts": manifest_artifacts,
     }
+    license_lines = (
+        "License-File: licenses/LICENSE\n"
+        "License-File: licenses/NOTICE\n"
+    )
+    if args.mathdx_license is not None:
+        license_lines += "License-File: licenses/LICENSE.NVIDIA-MATHDX\n"
     core_metadata = (
         "Metadata-Version: 2.3\n"
         "Name: memsolve-cuda-runtime\n"
         f"Version: {wheel_version}\n"
-        "Summary: Strict precompiled CUDA runtime for MemSolve\n"
+        "Summary: Precompiled CUDA runtime for MemSolve\n"
         "Requires-Python: >=3.10,<3.13\n"
-        "License-File: licenses/LICENSE\n"
-        "License-File: licenses/NOTICE\n"
-        "License-File: licenses/LICENSE.NVIDIA-MATHDX\n"
+        f"{license_lines}"
     ).encode("utf-8")
     wheel_metadata = (
         "Wheel-Version: 1.0\n"
         "Generator: MemSolve tools/package_cuda_runtime.py\n"
         "Root-Is-Purelib: false\n"
-        f"Tag: py3-none-{PLATFORM_TAG}\n"
+        f"Tag: py3-none-{args.platform_tag}\n"
     ).encode("utf-8")
     files = {
         f"{PACKAGE_NAME}/__init__.py": _runtime_init(
@@ -237,7 +297,7 @@ def main() -> int:
             torch_version=args.torch_version,
             cuda_version=args.cuda_version,
             cxx11_abi=int(torch_contract["cxx11_abi"]),
-            architectures=SUPPORTED_ARCHITECTURES,
+            architectures=architectures,
         ),
         f"{PACKAGE_NAME}/metadata.json": (
             json.dumps(metadata, indent=2, sort_keys=True) + "\n"
@@ -246,14 +306,10 @@ def main() -> int:
         f"{dist_info}/WHEEL": wheel_metadata,
         f"{dist_info}/licenses/LICENSE": args.project_license.read_bytes(),
         f"{dist_info}/licenses/NOTICE": args.notice.read_bytes(),
-        f"{dist_info}/licenses/LICENSE.NVIDIA-MATHDX": args.mathdx_license.read_bytes(),
     }
-    files.update(
-        {
-            f"{PACKAGE_NAME}/lib/{library.name}": library.read_bytes()
-            for library in artifacts.values()
-        }
-    )
+    if args.mathdx_license is not None:
+        files[f"{dist_info}/licenses/LICENSE.NVIDIA-MATHDX"] = args.mathdx_license.read_bytes()
+    files.update(packaged_binaries)
     _write_wheel(wheel_path, files=files)
     print(wheel_path)
     return 0

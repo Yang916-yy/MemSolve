@@ -1,4 +1,4 @@
-"""Data contracts shared by the GenomicBenchmarks and LRA runners.
+"""Data contracts for the Long Range Arena (LRA) sequence runner.
 
 Tokenization, source metadata, deterministic validation splits, and
 variable-length collation.
@@ -24,16 +24,6 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import BatchSampler, DataLoader, Dataset
 
 
-GENOMIC_BENCHMARKS = (
-    "dummy_mouse_enhancers_ensembl",
-    "demo_coding_vs_intergenomic_seqs",
-    "demo_human_or_worm",
-    "human_enhancers_cohn",
-    "human_enhancers_ensembl",
-    "human_ensembl_regulatory",
-    "human_nontata_promoters",
-    "human_ocr_ensembl",
-)
 LRA_TASKS = ("listops", "text", "retrieval", "image", "pathfinder", "pathx")
 PATHFINDER_TASKS = ("pathfinder", "pathx")
 LRA_SOURCE_REVISION = "google-research/long-range-arena@cd31e5c6"
@@ -132,25 +122,6 @@ class TokenVocabulary:
         return cls(sorted(tokens))
 
 
-class NucleotideTokenizer:
-    """The fixed nucleotide alphabet used by GenomicBenchmarks."""
-
-    PAD = 0
-    UNK = 1
-    _LOOKUP = {token: index + 2 for index, token in enumerate("ACGTN")}
-    vocab_size = len(_LOOKUP) + 2
-
-    def encode(self, sequence: str, max_length: int) -> torch.Tensor:
-        _require_positive_length(max_length)
-        values = [
-            self._LOOKUP.get(token, self.UNK)
-            for token in str(sequence).upper()[:max_length]
-        ]
-        if not values:
-            raise ValueError("empty genomic sequence is not a valid model input")
-        return torch.tensor(values, dtype=torch.long)
-
-
 class PackedTokenDataset(Dataset):
     """Variable-length token storage backed by immutable NumPy memmaps."""
 
@@ -239,71 +210,6 @@ class IndexedDataset(Dataset):
 
     def __getitem__(self, index: int):
         return self.dataset[self.indices[index]]
-
-
-class GenomicRowsDataset(Dataset):
-    """On-demand DNA encoding over Arrow or local folder-backed rows."""
-
-    def __init__(
-        self,
-        rows: Any,
-        *,
-        sequence_key: str,
-        label_key: str,
-        tokenizer: NucleotideTokenizer,
-        max_length: int,
-        label_map: dict[int, int],
-    ) -> None:
-        self.rows = rows
-        self.sequence_key = sequence_key
-        self.label_key = label_key
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.label_map = label_map
-        self.lengths, self.labels = _row_lengths_and_labels(
-            rows,
-            sequence_key=sequence_key,
-            label_key=label_key,
-            max_length=max_length,
-            label_map=label_map,
-        )
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        row = self.rows[index]
-        sequence, label = _row_sequence_label(
-            row, self.sequence_key, self.label_key
-        )
-        return self.tokenizer.encode(sequence, self.max_length), self.label_map[label]
-
-
-class FolderGenomicDataset(Dataset):
-    """Official package-compatible local ``train/<class>/*.txt`` input."""
-
-    def __init__(self, split_dir: Path, class_to_label: dict[str, int], max_length: int) -> None:
-        self.rows: list[tuple[Path, int]] = []
-        for class_name, label in class_to_label.items():
-            class_dir = split_dir / class_name
-            if not class_dir.is_dir():
-                raise FileNotFoundError(f"missing genomic class directory: {class_dir}")
-            self.rows.extend((path, label) for path in sorted(class_dir.iterdir()) if path.is_file())
-        self.max_length = max_length
-        self.tokenizer = NucleotideTokenizer()
-        self.labels = [label for _path, label in self.rows]
-        self.lengths = [
-            min(len(path.read_text(encoding="utf-8").strip()), max_length)
-            for path, _label in self.rows
-        ]
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        path, label = self.rows[index]
-        sequence = path.read_text(encoding="utf-8").strip()
-        return self.tokenizer.encode(sequence, self.max_length), label
 
 
 class PixelSequenceDataset(Dataset):
@@ -522,106 +428,6 @@ def make_loader(
         shuffle=train,
         generator=torch.Generator().manual_seed(seed) if train else None,
         **kwargs,
-    )
-
-
-def prepare_genomic_benchmarks(
-    dataset_name: str,
-    *,
-    data_root: Path,
-    max_length: int,
-    validation_fraction: float,
-    split_seed: int,
-    allow_download: bool,
-    revision: str | None,
-    formal: bool = False,
-) -> DatasetBundle:
-    """Load official GenomicBenchmarks train/test data without test selection."""
-
-    if dataset_name not in GENOMIC_BENCHMARKS:
-        raise ValueError(f"unsupported GenomicBenchmarks dataset: {dataset_name}")
-    rows = _load_genomic_rows(
-        dataset_name,
-        data_root=data_root,
-        allow_download=allow_download,
-        revision=revision,
-        formal=formal,
-    )
-    if rows["kind"] == "folder":
-        train_dir = rows["train_dir"]
-        test_dir = rows["test_dir"]
-        class_to_label = rows["class_to_label"]
-        inferred = _folder_max_length(train_dir, test_dir)
-        resolved_length = _resolve_max_length(max_length, inferred)
-        train_full = FolderGenomicDataset(train_dir, class_to_label, resolved_length)
-        test = FolderGenomicDataset(test_dir, class_to_label, resolved_length)
-        provenance = rows["provenance"]
-    else:
-        train_rows = rows["train_rows"]
-        test_rows = rows["test_rows"]
-        sequence_key = rows["sequence_key"]
-        label_key = rows["label_key"]
-        label_values = sorted(
-            {
-                *_column_labels(train_rows, label_key),
-                *_column_labels(test_rows, label_key),
-            }
-        )
-        label_map = {label: index for index, label in enumerate(label_values)}
-        inferred = max(
-            _column_max_length(train_rows, sequence_key),
-            _column_max_length(test_rows, sequence_key),
-        )
-        resolved_length = _resolve_max_length(max_length, inferred)
-        tokenizer = NucleotideTokenizer()
-        train_full = GenomicRowsDataset(
-            train_rows,
-            sequence_key=sequence_key,
-            label_key=label_key,
-            tokenizer=tokenizer,
-            max_length=resolved_length,
-            label_map=label_map,
-        )
-        test = GenomicRowsDataset(
-            test_rows,
-            sequence_key=sequence_key,
-            label_key=label_key,
-            tokenizer=tokenizer,
-            max_length=resolved_length,
-            label_map=label_map,
-        )
-        provenance = rows["provenance"]
-        class_to_label = {str(label): mapped for label, mapped in label_map.items()}
-
-    train_indices, validation_indices = stratified_split_indices(
-        train_full.labels, validation_fraction, split_seed
-    )
-    train = IndexedDataset(train_full, train_indices)
-    validation = IndexedDataset(train_full, validation_indices)
-    metadata = {
-        "suite": "genomic_benchmarks",
-        "dataset": dataset_name,
-        "source": provenance,
-        "source_definition": "ML-Bioinfo-CEITEC/genomic_benchmarks",
-        "split_protocol": "official-train-test-plus-stratified-validation-v1",
-        "split_seed": split_seed,
-        "validation_fraction": validation_fraction,
-        "split_fingerprints": {
-            "train": index_fingerprint(train),
-            "validation": index_fingerprint(validation),
-        },
-        "class_to_label": class_to_label,
-    }
-    return DatasetBundle(
-        train=train,
-        validation=validation,
-        test=test,
-        input_kind="tokens",
-        num_classes=len(class_to_label),
-        max_length=resolved_length,
-        vocab_size=NucleotideTokenizer.vocab_size,
-        pad_token_id=NucleotideTokenizer.PAD,
-        metadata=metadata,
     )
 
 
@@ -1338,180 +1144,6 @@ def _prepare_lra_pathfinder(
     )
 
 
-def _load_genomic_rows(
-    dataset_name: str,
-    *,
-    data_root: Path,
-    allow_download: bool,
-    revision: str | None,
-    formal: bool,
-) -> dict[str, Any]:
-    local = data_root / dataset_name
-    train_dir, test_dir = local / "train", local / "test"
-    if train_dir.is_dir() and test_dir.is_dir():
-        train_classes = {path.name for path in train_dir.iterdir() if path.is_dir()}
-        test_classes = {path.name for path in test_dir.iterdir() if path.is_dir()}
-        if train_classes != test_classes:
-            raise ValueError("genomic local train/test class directories differ")
-        return {
-            "kind": "folder",
-            "train_dir": train_dir,
-            "test_dir": test_dir,
-            "class_to_label": {name: index for index, name in enumerate(sorted(train_classes))},
-            "provenance": {
-                "transport": "local-folders",
-                "path": str(local.resolve()),
-                **(
-                    {"content_sha256": _directory_content_sha256(local)}
-                    if formal
-                    else {}
-                ),
-            },
-        }
-    cache_base = (
-        data_root
-        / f"katarinagresova___genomic_benchmarks_{dataset_name}"
-        / "default"
-        / "0.0.0"
-    )
-    candidates = []
-    if revision:
-        candidates.append(cache_base / revision)
-    elif cache_base.is_dir():
-        candidates.extend(sorted((path for path in cache_base.iterdir() if path.is_dir()), reverse=True))
-    for candidate in candidates:
-        train_files = tuple(candidate.glob("*-train.arrow"))
-        test_files = tuple(candidate.glob("*-test.arrow"))
-        if len(train_files) != 1 or len(test_files) != 1:
-            continue
-        try:
-            from datasets import Dataset as ArrowDataset
-        except ImportError as error:
-            raise RuntimeError("install the sequence extra to read GenomicBenchmarks Arrow data") from error
-        train_rows = ArrowDataset.from_file(str(train_files[0]))
-        test_rows = ArrowDataset.from_file(str(test_files[0]))
-        sequence_key = "seq" if "seq" in train_rows.column_names else "sequence"
-        return {
-            "kind": "arrow",
-            "train_rows": train_rows,
-            "test_rows": test_rows,
-            "sequence_key": sequence_key,
-            "label_key": "label",
-            "provenance": {
-                "transport": "local-hf-arrow",
-                "repository": f"katarinagresova/Genomic_Benchmarks_{dataset_name}",
-                "revision": candidate.name,
-                "train_fingerprint": train_rows._fingerprint,
-                "test_fingerprint": test_rows._fingerprint,
-                **(
-                    {
-                        "content_sha256": _named_file_content_sha256(
-                            {"train": train_files[0], "test": test_files[0]}
-                        )
-                    }
-                    if formal
-                    else {}
-                ),
-            },
-        }
-    if not allow_download:
-        raise FileNotFoundError(
-            f"no local GenomicBenchmarks data for {dataset_name} under {data_root}; "
-            "provide a cache or pass --allow-download"
-        )
-    try:
-        from datasets import load_dataset
-    except ImportError as error:
-        raise RuntimeError("install the sequence extra to download GenomicBenchmarks") from error
-    repository = f"katarinagresova/Genomic_Benchmarks_{dataset_name}"
-    rows = load_dataset(repository, revision=revision or "main", cache_dir=str(data_root))
-    sequence_key = "seq" if "seq" in rows["train"].column_names else "sequence"
-    return {
-        "kind": "arrow",
-        "train_rows": rows["train"],
-        "test_rows": rows["test"],
-        "sequence_key": sequence_key,
-        "label_key": "label",
-        "provenance": {
-            "transport": "huggingface",
-            "repository": repository,
-            "revision": revision or "main",
-            "train_fingerprint": rows["train"]._fingerprint,
-            "test_fingerprint": rows["test"]._fingerprint,
-        },
-    }
-
-
-def _row_sequence_label(row: Any, sequence_key: str, label_key: str) -> tuple[str, int]:
-    if isinstance(row, dict):
-        return str(row[sequence_key]), int(row[label_key])
-    return str(row[0]), int(row[1])
-
-
-def _row_lengths_and_labels(
-    rows: Any,
-    *,
-    sequence_key: str,
-    label_key: str,
-    max_length: int,
-    label_map: dict[int, int],
-) -> tuple[list[int], list[int]]:
-    try:
-        sequences = rows[sequence_key]
-        labels = rows[label_key]
-        return (
-            [min(len(str(sequence)), max_length) for sequence in sequences],
-            [label_map[int(label)] for label in labels],
-        )
-    except (KeyError, TypeError):
-        lengths, labels = [], []
-        for index in range(len(rows)):
-            sequence, label = _row_sequence_label(rows[index], sequence_key, label_key)
-            lengths.append(min(len(sequence), max_length))
-            labels.append(label_map[label])
-        return lengths, labels
-
-
-def _column_labels(rows: Any, key: str) -> list[int]:
-    try:
-        return [int(value) for value in rows[key]]
-    except (KeyError, TypeError):
-        return [int(_row_sequence_label(rows[index], "sequence", key)[1]) for index in range(len(rows))]
-
-
-def _column_max_length(rows: Any, key: str) -> int:
-    try:
-        values = rows[key]
-    except (KeyError, TypeError):
-        values = (rows[index][key] for index in range(len(rows)))
-    try:
-        return max(len(str(value)) for value in values)
-    except ValueError as error:
-        raise ValueError("cannot infer max length from an empty split") from error
-
-
-def _folder_max_length(train_dir: Path, test_dir: Path) -> int:
-    lengths = [
-        len(path.read_text(encoding="utf-8").strip())
-        for split_dir in (train_dir, test_dir)
-        for class_dir in split_dir.iterdir()
-        if class_dir.is_dir()
-        for path in class_dir.iterdir()
-        if path.is_file()
-    ]
-    if not lengths:
-        raise ValueError("cannot infer max length from an empty genomic folder")
-    return max(lengths)
-
-
-def _resolve_max_length(requested: int, inferred: int) -> int:
-    if requested < 0:
-        raise ValueError("max_length must be non-negative")
-    resolved = inferred if requested == 0 else requested
-    _require_positive_length(resolved)
-    return resolved
-
-
 def _normalise_listops(text: str) -> str:
     return text.translate({ord("]"): ord("X"), ord("("): None, ord(")"): None})
 
@@ -1692,10 +1324,8 @@ def _require_positive_length(length: int) -> None:
 
 __all__ = [
     "DatasetBundle",
-    "GENOMIC_BENCHMARKS",
     "IndexedDataset",
     "LRA_TASKS",
-    "NucleotideTokenizer",
     "PATHFINDER_TASKS",
     "PATHFINDER_SPLIT_PROTOCOL",
     "PATHX_RESOLUTION",
@@ -1708,7 +1338,6 @@ __all__ = [
     "limit_dataset",
     "make_loader",
     "pathfinder_split_indices",
-    "prepare_genomic_benchmarks",
     "prepare_lra",
     "stratified_split_indices",
     "validate_formal_source_provenance",

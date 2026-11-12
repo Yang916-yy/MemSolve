@@ -96,7 +96,7 @@ correction to a batch-shared accretive linear system with a strictly
 contractive readout, letting tokens interact in ways that locally parameterized
 bidirectional scans cannot represent.
 Two additive token reductions give linear complexity at fixed rank and exact
-sequence parallelism, and our implementation runs $7.8\times$ faster than
+sequence parallelism, and our implementation runs $7.9\times$ faster than
 FlashAttention at $8{,}192$ tokens in single-GPU forward--backward execution.
 On ImageNet-1K, a plain $78$M-parameter MemSolve-ViT-B reaches $82.7\%$ Top-1
 accuracy, surpassing ViG-B and ViT$^3$-B with about $13\%$ fewer parameters,
@@ -111,27 +111,29 @@ Range Arena tasks under a controlled backbone.
 
 Delta-rule memories have advanced causal sequence modeling by pairing
 error-correcting writes with adaptive gating
-\cite{yang2025deltanet,yang2025gdn,kimi2025linear,hatamizadeh2026gdn2}.
+\cite{yang2025deltanet,yang2025gdn,siems2025deltaproduct,kimi2025linear,hatamizadeh2026gdn2}.
 Self-attention keeps every token for retrieval \cite{vaswani2017attention},
 whereas linear attention and state-space models (SSMs) compress the context
 into a fixed-size state in which stored associations interfere as they
-accumulate \cite{katharopoulos2020linear,gu2024mamba}.
+accumulate \cite{katharopoulos2020linear,gu2024mamba,dao2024mamba2}.
 The delta rule reduces this interference by predicting content from the
 current memory and writing back only the error
-\cite{schlag2021fastweights,yang2025deltanet}, so each update can revise what
-is already stored.
+\cite{schlag2021fastweights,yang2025deltanet,liu2024longhorn}, so each update
+can revise what is already stored.
 Gated Delta Networks (GDNs) add adaptive forgetting and write controls on top
 of this rule.
 
 Error-correcting updates can also be read as training an internal predictor on
 the context.
-Test-time training (TTT) uses trainable inner models \cite{sun2025ttt},
-Intention turns regularized regression into a composable module
-\cite{garnelo2023intention}, and MesaNet builds causal memory states with
-conjugate-gradient solves \cite{vonoswald2026mesanet}.
+Test-time training (TTT) uses trainable inner models
+\cite{sun2025ttt,behrouz2025titans,behrouz2026atlas}, Intention turns
+regularized regression into a composable module \cite{garnelo2023intention},
+and MesaNet builds causal memory states with conjugate-gradient solves
+\cite{vonoswald2026mesanet}.
 When the whole context is visible, this inner learning need not follow token
-order, and ViT$^3$ finds that full-batch updates over all visual tokens
-outperform sequential mini-batches \cite{han2026vit3}.
+order: large-chunk and full-batch inner updates improve throughput and visual
+recognition \cite{zhang2026lact,han2026vit3}, whereas single-step key--value
+updates reduce to linear attention \cite{liu2026kvbinding}.
 These results suggest letting every association act on one memory state at
 once and solving for its equilibrium directly, instead of approximating it
 with one or a few gradient steps.
@@ -141,9 +143,10 @@ Recurrent models stay cheap because they update a compact state
 incrementally, whereas a memory coupled across all tokens seems to require a
 global solve.
 When LION extends DeltaNet to bidirectional contexts, it corrects prefix and
-suffix memories in separate scans, because the parallel full-attention form
-requires a sequence-sized matrix inverse whose cubic cost undermines fast
-training \cite{afzal2025lion}.
+suffix memories in separate scans because the parallel full-attention form
+requires a sequence-sized matrix inverse \cite{afzal2025lion}, while
+non-causal state-space duality avoids sequential scans by aggregating
+unwhitened outer products without residual error correction \cite{shi2025vssd}.
 
 We propose \textbf{MemSolve}, an operator that builds full-context associative
 memory through one compact equilibrium solve.
@@ -176,8 +179,9 @@ The exact operator decomposes into two additive token reductions, one shared
 core solve, and independent token readouts.
 Sequence shards exchange only compact statistics, the core is factored once per
 head for the whole batch, and fused kernels never store the token-sized frame.
-As a result, MemSolve overtakes FlashAttention at 196 tokens in complete-mixer
-forward--backward execution (\S\ref{sec:efficiency}).
+As a result, MemSolve outperforms FlashAttention across all tested sequence
+lengths ($128$ to $32{,}768$ tokens) in complete-mixer forward--backward
+execution (\S\ref{sec:efficiency}).
 
 \paragraph{Architectures and Results ($\S$\ref{sec:experiments}).}
 We use the same operator for image classification, dense prediction, masked
@@ -204,35 +208,42 @@ where $\beta_i$ sets the write strength.
 This update is one gradient step on the local loss
 $\ell_i(U)=\tfrac12\norm{U^\T k_i-c_i}_2^2$, so each token acts as a training
 example for the memory.
-GDNs extend it with adaptive forgetting \cite{yang2025gdn}, channel-wise decay,
-and separate erase and write gates \cite{kimi2025linear,hatamizadeh2026gdn2}.
+GDNs extend it with adaptive forgetting \cite{yang2025gdn}, multi-step
+Householder transitions \cite{siems2025deltaproduct}, channel-wise decay, and
+separate erase and write gates \cite{kimi2025linear,hatamizadeh2026gdn2}.
 Under sequential updates, each residual is evaluated at the intermediate state
 $U_{i-1}$, so early tokens shape what later tokens see.
 When the whole context is available, all residuals can instead be measured
 against one shared state.
 
 \paragraph{Memory as regression.}
-TTT treats the hidden state as an inner model trained on the sequence
-\cite{sun2025ttt}, and test-time regression unifies many memory mechanisms
-under this view \cite{wang2025testtimeregression}.
+TTT treats the hidden state as an inner model trained on the sequence with
+momentum or local-window objectives
+\cite{sun2025ttt,behrouz2025titans,behrouz2026atlas}, test-time regression and
+Longhorn unify causal updates under online learning
+\cite{wang2025testtimeregression,liu2024longhorn}, and single-step key--value
+binding collapses algebraically to linear attention \cite{liu2026kvbinding}.
 Some methods solve this regression directly: Intention fits a regularized
 key--value system per sample and evaluates it at separate query embeddings
 \cite{garnelo2023intention}, while MesaNet runs conjugate gradients at each
 causal step \cite{vonoswald2026mesanet}.
-In the bidirectional setting, ViT$^3$ shows that a full-batch inner gradient
-step beats sequential mini-batches for visual recognition, although extra
-inner passes cost throughput and stability \cite{han2026vit3}.
+Beyond token-by-token recurrences, LaCT applies nonlinear optimizer steps over
+large chunks \cite{zhang2026lact}, and ViT$^3$ shows that a full-batch inner
+gradient step beats sequential mini-batches for visual recognition, although
+extra inner passes cost throughput and stability \cite{han2026vit3}.
 MemSolve keeps the regression view but shares a single write--read frame per
 sample and a single learned core across the batch (Appendix~\ref{app:related}).
 
 \paragraph{Bidirectional mixers.}
-BiMamba, Hydra, and LION let each token gather information from both
-directions \cite{zhu2024vim,hwang2024hydra,afzal2025lion}.
-Visibility alone does not say how the two sides interact, and
+BiMamba, VMamba, Hydra, and LION let each token gather information from
+multiple directions \cite{zhu2024vim,liu2024vmamba,hwang2024hydra,afzal2025lion},
+while XCiT and VSSD mix visual tokens globally via normalized feature
+cross-covariance or non-causal state aggregation \cite{ali2021xcit,shi2025vssd}.
+Visibility alone does not say how contexts interact, and
 Section~\ref{sec:ssm} asks whether a suffix token can change how prefix content
 reaches a fixed center token.
-Appendix~\ref{app:related} covers equilibrium models and kernel operator
-learning.
+Appendix~\ref{app:related} covers equilibrium models
+\cite{bai2019deep,winston2020mondeq} and kernel operator learning.
 
 \section{MemSolve}
 \label{sec:method}
@@ -302,8 +313,8 @@ Instead, each head learns a compact accretive core
  \label{eq:core}
 \end{equation}
 built from a lower-triangular $L$ with positive diagonal and a skew-symmetric
-$\Omega$ (Appendix~\ref{app:parameters}), and matches $\Gamma_X$ to supply the
-complementary damping $\I_r-P^\T P$ alongside $LL^\T$:
+$\Omega$ \cite{winston2020mondeq} (Appendix~\ref{app:parameters}), and matches
+$\Gamma_X$ to supply the complementary damping $\I_r-P^\T P$ alongside $LL^\T$:
 \begin{equation}
  \Gamma_X=(\I_r-P^\T P)+LL^\T=R^{-\T}R^{-1}+LL^\T\succ0.
  \label{eq:gamma}
@@ -362,7 +373,7 @@ Cayley transform
 \end{equation}
 Like the scalar reflection $(1-j)/(1+j)$, which covers $(-1,1)$, the matrix
 version covers every real strict contraction in compact space, including
-nonsymmetric ones (Appendix~\ref{app:coverage}).
+nonsymmetric ones \cite{wang2023direct} (Appendix~\ref{app:coverage}).
 
 Mapping $FZ$ back through $P$ acts only inside the $r$-dimensional relation
 span, so we add a complementary content path that keeps the features
@@ -397,9 +408,10 @@ satisfies $\norm{K_X}_2\le\max\{|\eta|,\norm{F}_2\}<1$ and has rank bound
 $\rank(K_X-\eta\I_N)\le r$, with $K_Xv=\eta v$ for all $v\in\ker(P^\T)$.
 \end{theorem}
 
-This token-space bound follows because $K_X$ is an isometric compression of
-the block-diagonal contraction $\diag(\eta\I_N,F)$ (Appendix~\ref{app:spectrum}).
-It concerns the linear map $C\mapsto K_XC$ at a fixed frame and does not bound
+Whereas standard dot-product softmax attention is not globally Lipschitz
+\cite{kim2021lipschitz}, this fixed-frame token map $C\mapsto K_XC$ is strictly
+contractive because $K_X$ is an isometric compression of
+$\diag(\eta\I_N,F)$ (Appendix~\ref{app:spectrum}); the bound does not cover
 derivatives through $P(X)$ or the surrounding residual block.
 All singular values of the $N\times N$ operator $K_X$ also follow exactly from
 a compact matrix of size at most $r$ together with $|\eta|$.
@@ -419,8 +431,9 @@ projection, so both mix context in an input-dependent way.
 Head outputs are concatenated and passed through a linear projection.
 
 \paragraph{Optional rotary value encoding.}
-Whereas RoVE was introduced on top of RoPE attention \cite{garcia2026rove},
-applying its rotary transport solely to the content path injects relative
+Whereas relative value rotations were introduced inside pairwise RoPE and
+geometry-aware attention \cite{su2024roformer,miyato2024gta,garcia2026rove},
+applying rotary transport solely to the content path injects relative
 position into MemSolve while keeping the relation Gram matrix $A^\T A$ and
 shared frame $P$ position-invariant.
 Each content vector $c_i$ is rotated by $O_i=O(t_i)$ before aggregation and
@@ -431,8 +444,9 @@ $O_i^\T$ is applied to the contextual correction at readout:
  \label{eq:rove-readout}
 \end{equation}
 With a fixed frequency scale, $O_i^\T O_j=O(t_j-t_i)$ encodes relative offsets
-in 1D sequences or axial offsets in 2D grids, adds no learned parameters, and
-leaves the fixed-frame contraction bound intact (Appendix~\ref{app:rove}).
+in 1D sequences or axial offsets in 2D grids \cite{heo2024ropevit}, adds no
+learned parameters, and leaves the fixed-frame contraction bound intact
+(Appendix~\ref{app:rove}).
 
 \subsection{Beyond independent directional scans}
 \label{sec:ssm}
@@ -454,8 +468,9 @@ coefficient $-\eta/(3+t^2)$ that carries the first token's content to the
 second.
 
 Single-layer directional scans cannot do this.
-Consider bidirectional state-space mixers whose transitions depend only on the
-current token and whose two directions merge linearly:
+Consider directional state-space mixers \cite{zhu2024vim,liu2024vmamba} whose
+transitions depend only on the current token and whose directions merge
+linearly:
 \begin{equation}
  \begin{aligned}
  h_i^+&=A^+(x_i)h_{i-1}^++b^+(x_i),\\
@@ -540,8 +555,10 @@ $r$ avoids cancellation in the complementary term (Appendix~\ref{app:forward}).
 
 \subsection{Exact sequence parallelism}
 
-Since $G$ and $H$ are sums over token rows, MemSolve parallelizes across the
-sequence without gathering activations.
+Unlike sequence-parallel or ring attention, which gather activations or
+circulate key--value blocks of size $O(ND)$ across devices
+\cite{korthikanti2023reducing,liu2024ring}, MemSolve parallelizes across the
+sequence through compact reductions.
 With the sequence split over $p$ devices and each shard normalized by the
 global valid count ($A_s=B_s/\sqrt N$), the statistics add up exactly,
 $G=\sum_sA_s^\T A_s$ and $H=\sum_sA_s^\T C_s$.
@@ -557,17 +574,23 @@ unsharded execution up to summation order.
 
 We fuse token-level work around the reductions and the readout, chain the
 per-sample compact matrix products on chip, and keep the compact factorizations
-in dedicated dense-solver kernels.
-The backward kernels reuse the saved compact factors and accumulate
-shared-core gradients across the batch in tiles, which avoids storing an
-$r\times r$ core adjoint for every sample.
+in dedicated on-chip dense-solver kernels.
+Beyond $N>512$ tokens, the backward pass can reconstruct pre-projection
+mixed tokens from saved compact factors instead of storing a token-sized
+readout buffer \cite{dao2022flashattention,korthikanti2023reducing}, and
+accumulates shared-core gradients across the batch in tiles so no per-sample
+$r\times r$ core adjoint is materialized.
 Our GPU backend combines Triton \cite{tillet2019triton} for tiled reductions
-and readouts, cuSOLVERDx for register-level compact factorizations, and
-cuBLASLt for projection gradients.
-Compact statistics, factors, and adjoints stay in FP32.
-The readout kernels split each sensitive FP32 coefficient of $W$ into a
-leading and a residual BF16 word \cite{henry2019bfloat} and accumulate both
-Tensor Core products in FP32 (Appendix~\ref{app:precision}).
+and readouts (with Hopper \texttt{SM90a} TMA, warp-group MMA, and programmatic
+dependent launch specializations \cite{shah2024flashattention3}),
+self-contained register- and warp-level CUDA C++ kernels for compact Cholesky
+and LU solves (retaining cuSOLVERDx as an optional backend), and cuBLASLt for
+projection gradients.
+Compact statistics, factors, and adjoints stay in IEEE FP32 with symmetrized
+FP64-diagonal Gram factorizations, while the readout kernels split each
+sensitive FP32 coefficient of $W$ into a leading and a residual BF16 word
+\cite{henry2019bfloat} and accumulate both Tensor Core products in FP32 with
+low-order terms accumulated first (Appendix~\ref{app:precision}).
 
 \section{Experiments}
 \label{sec:experiments}
@@ -585,10 +608,10 @@ followed by pre-LayerNorm MemSolve and GELU FFN sublayers with stochastic depth
 \cite{huang2016stochastic}, and the network ends with LayerNorm, mean pooling,
 and a linear classifier.
 We train from scratch on ImageNet-1K \cite{russakovsky2015imagenet} for 300
-epochs at $224\times224$ with the plain ViT$^3$ recipe (AdamW
-\cite{loshchilov2019adamw}, batch 2,048, peak learning rate
-$2\times10^{-3}$) and report the EMA checkpoint (decay $0.9999$) with the best
-validation Top-1 (Appendix~\ref{app:vision}).
+epochs at $224\times224$ with the plain DeiT~III / ViT$^3$ recipe
+\cite{touvron2022deit3,han2026vit3} (AdamW \cite{loshchilov2019adamw}, batch
+2,048, peak learning rate $2\times10^{-3}$) and report the EMA checkpoint
+(decay $0.9999$) with the best validation Top-1 (Appendix~\ref{app:vision}).
 
 \begin{table}[!ht]
 \centering
@@ -761,7 +784,7 @@ Linear Attention \cite{katharopoulos2020linear} & 40.95 & 66.96 & 84.28 & 60.32 
 MHA (Softmax) \cite{vaswani2017attention} & 40.05 & 66.32 & 83.81 & 63.09 & 80.28 & 66.71\\
 BigBird \cite{zaheer2020bigbird} & 40.50 & 65.98 & 84.46 & 66.38 & 76.49 & 66.76\\
 Agent Attention \cite{han2024agent} & \textbf{41.95} & 68.51 & \textbf{85.46} & 59.38 & 79.38 & 66.94\\
-Local Attention ($w=256$) & 37.40 & 68.83 & 83.57 & \textbf{68.23} & 76.85 & 66.98\\
+Local Attention ($w=256$) \cite{beltagy2020longformer} & 37.40 & 68.83 & 83.57 & \textbf{68.23} & 76.85 & 66.98\\
 Nystr\"omformer \cite{xiong2021nystrom} & 39.30 & \textbf{68.90} & 85.20 & 62.53 & 79.51 & 67.09\\
 MiTA \cite{wen2026mita} & 40.05 & 66.21 & 83.90 & 65.16 & 80.82 & 67.23\\
 \midrule
@@ -781,14 +804,15 @@ projection.
 the position table and encodes relative offsets through parameter-free RoVE
 (Eq.~\eqref{eq:rove-readout}), so both stay close to the 110M budget of
 BERT-Base \cite{devlin2019bert}.
-Following the LION/M2 C4 benchmark \cite{raffel2020t5,afzal2025lion}, we
-pretrain both for 70,000 steps at length 128 with batch 4,096 and $30\%$
-masking. Without a position table, the RoVE encoder still slightly lowers the
-validation masked NLL ($1.6183$ vs.\ $1.6211$) and raises masked accuracy
-($66.5\%$ vs.\ $66.4\%$, Appendix~\ref{app:nlp}).
+Following the LION/M2 C4 benchmark
+\cite{raffel2020t5,fu2023monarch,afzal2025lion}, we pretrain both for 70,000
+steps at length 128 with batch 4,096 and $30\%$ masking. Without a position
+table, the RoVE encoder still slightly lowers the validation masked NLL
+($1.6183$ vs.\ $1.6211$) and raises masked accuracy ($66.5\%$ vs.\ $66.4\%$,
+Appendix~\ref{app:nlp}).
 We then fine-tune on eight GLUE tasks with LION's M2-BASE hyperparameters
-\cite{wang2019glue,afzal2025lion}, transferring RTE, MRPC, and STS-B from the
-fine-tuned MNLI encoder.
+\cite{wang2019glue,fu2023monarch,afzal2025lion}, transferring RTE, MRPC, and
+STS-B from the fine-tuned MNLI encoder.
 
 \paragraph{Closing the gap to BERT.}
 In Table~\ref{tab:glue}, MemSolve-BERT and its RoVE variant average $81.9$ and
@@ -860,10 +884,10 @@ cross-entropy (CE) measured at the same checkpoint.}
 
 
 We ablate the learned core $J$, the skew coupling $\Omega$, and the rank $r$
-by training MemSolve-ViT-S on ImageNet-100 for 100 epochs from a shared
-initialization (Table~\ref{tab:ablations}, Appendix~\ref{app:vision}), and we
-also compare mean validation error over early (11--30) and late (81--100)
-epochs.
+by training MemSolve-ViT-S on ImageNet-100 \cite{tian2020cmc} for 100 epochs
+from a shared initialization (Table~\ref{tab:ablations},
+Appendix~\ref{app:vision}), and we also compare mean validation error over
+early (11--30) and late (81--100) epochs.
 \textbf{The learned core matters most.}
 Adding it to \textsc{Complement} ($F=0$) raises Top-1 by $0.62$ points, lowers
 validation cross-entropy from $0.775$ to $0.735$, and cuts relative error by
@@ -891,26 +915,32 @@ Table~\ref{tab:mixer-efficiency}.}
 \end{figure}
 
 We benchmark complete mixers, including input and output projections, for
-MemSolve, FlashAttention \cite{dao2024flashattention2}, and Vim's fused
-BiMamba-v2 \cite{zhu2024vim} on one A800-80GB GPU with BF16 autocast and CUDA
-Graphs (Fig.~\ref{fig:efficiency}, with exact values, visual shapes, and
-forward-only results in Appendix~\ref{app:efficiency}).
+MemSolve, FlashAttention \cite{dao2022flashattention,dao2024flashattention2},
+and Vim's fused BiMamba-v2 \cite{zhu2024vim} on one A800-80GB GPU with BF16
+autocast and CUDA Graphs (Fig.~\ref{fig:efficiency}, with exact values, visual
+shapes, and forward-only results in Appendix~\ref{app:efficiency}).
 
 \paragraph{Speed.}
-In the fixed-width sweep ($D=768$), MemSolve's forward--backward pass
-overtakes FlashAttention at 196 tokens and is $2.8\times$, $7.8\times$, and
-$28.9\times$ faster at 2,048, 8,192, and 32,768 tokens, where it also runs
-$9.2\times$ faster than fused BiMamba.
+Without activation recomputation (\texttt{recompute\_readout=False}, matching
+both baselines), MemSolve's forward--backward pass in the fixed-width sweep
+($D=768$) outperforms FlashAttention across all tested lengths from $128$ to
+$32{,}768$ tokens (starting at $0.245$ versus $0.267$\,ms at $128$ tokens) and
+runs $2.8\times$, $7.9\times$, and $29.0\times$ faster at $2{,}048$, $8{,}192$,
+and $32{,}768$ tokens, where it is also $9.2\times$ faster than fused BiMamba.
 At the 196-token Small and Base ViT shapes, it is $1.2$--$1.6\times$ faster
-than FlashAttention and $9.3$--$13.8\times$ faster than BiMamba, although
-FlashAttention remains faster at 128 tokens in the small-batch sweep and at
-Small/Base forward-only visual execution.
+than FlashAttention and $8.9$--$14.2\times$ faster than BiMamba; in
+forward-only execution (Table~\ref{tab:mixer-forward}), MemSolve leads at
+Tiny, Small, and from $2{,}048$ tokens upward, whereas FlashAttention leads only
+at the Base visual shape and at $128$--$512$ tokens in the small-batch sweep.
 
 \paragraph{Memory.}
-Because the fused kernels never store the frame, MemSolve has the lowest peak
-memory in every setting.
-At 32,768 tokens it uses $2{,}617.8$\,MiB, compared with $2{,}940.1$\,MiB for
-FlashAttention and $6{,}140.7$\,MiB for BiMamba, which is $11\%$ and $57\%$ less.
+Because the fused kernels never materialize the $N\times r$ frame or an
+$N\times N$ score matrix, MemSolve has the lowest peak memory in every setting:
+at $32{,}768$ tokens it uses $2{,}617.8$\,MiB versus $2{,}940.1$\,MiB for
+FlashAttention ($11\%$ less) and $6{,}140.7$\,MiB for BiMamba ($57\%$ less),
+and enabling optional readout recomputation (\texttt{recompute\_readout="auto"})
+lowers peak memory to $2{,}425.8$\,MiB ($17\%$ and $60\%$ less) at a
+$28.2\times$ speedup ($10.117$\,ms).
 
 \section{Discussion and Limitations}
 
@@ -926,7 +956,8 @@ arbitrarily long inputs remain bounded by the bottleneck rank $r$.
 While our evaluations cover ImageNet classification, COCO and ADE20K dense
 prediction, GLUE language understanding, and Long Range Arena sequences up to
 $4{,}096$ tokens, our masked-language pretraining is conducted at sequence
-length $128$ following the LION M2 benchmark.
+length $128$ following the LION/M2 benchmark
+\cite{fu2023monarch,afzal2025lion}.
 Scaling multi-node language and multimodal pretraining directly at
 multi-thousand-token contexts using our RoVE content transport and exact
 sequence-parallel reductions ($\S\ref{sec:implementation}$) is a natural
@@ -971,13 +1002,19 @@ and experiments. It is organized as follows:
 
 \subsection{Internal optimization and associative memory}
 
-Internal learning can be formulated by solving for an internal state on
-context tokens and reading predictions back from that state.
-Intention makes this paradigm explicit in the key--value--query setting
-\cite{garnelo2023intention}: it fits a regularized least-squares model
-$(E_K^\T E_K+\alpha\I)^{-1}E_K^\T E_V$ to embedded keys and values, optionally
-applies a learned map to the fitted state, and evaluates the predictor at
-separate query embeddings $E_Q$.
+Internal learning can be formulated by optimizing or solving for an internal
+state on context tokens and reading predictions back from that state.
+Sequential test-time training updates deep or matrix memories with momentum or
+local-window objectives \cite{sun2025ttt,behrouz2025titans,behrouz2026atlas},
+Longhorn derives closed-form online ridge updates per causal step
+\cite{liu2024longhorn}, LaCT amortizes nonlinear inner steps over large token
+chunks \cite{zhang2026lact}, and single-step key--value binding reduces
+algebraically to linear attention \cite{liu2026kvbinding}.
+Intention makes direct least-squares regression explicit in the
+key--value--query setting \cite{garnelo2023intention}: it fits a regularized
+model $(E_K^\T E_K+\alpha\I)^{-1}E_K^\T E_V$ to embedded keys and values,
+optionally applies a learned map to the fitted state, and evaluates the
+predictor at separate query embeddings $E_Q$.
 Because the inverse sits entirely on the key side while queries are
 unnormalized and $\alpha$ is fixed, the resulting token operator is neither
 symmetric nor uniformly contractive as sequence length grows.
@@ -1017,17 +1054,20 @@ Once the input-dependent soft frame is formed, the equilibrium condition in
 Eq.~\eqref{eq:dynamics} is linear in the memory state, allowing a single direct
 factorization of the shared $r\times r$ core to replace iterative root
 finding.
-Strong monotonicity of the accretive core guarantees a unique equilibrium and
-uniformly bounds both forward and adjoint solves (Proposition~\ref{prop:solve}),
-while the reflected readout maps this core to a strictly contractive token
-operator for each fixed frame via the classical accretive--Cayley
-correspondence \cite{bauschke2017convex}.
+Whereas standard dot-product self-attention lacks global Lipschitz bounds
+\cite{kim2021lipschitz}, strong monotonicity of the accretive core guarantees a
+unique equilibrium and uniformly bounds both forward and adjoint solves
+(Proposition~\ref{prop:solve}), while the reflected readout maps this core to a
+strictly contractive token operator for each fixed frame via the
+accretive--Cayley correspondence \cite{bauschke2017convex,wang2023direct}.
 
 \subsection{Kernel-based operator learning}
 
 Gathering token values into a compact representation and redistributing them
-through normalized feature coordinates also connects to kernel-based operator
-learning.
+through normalized feature coordinates also connects to cross-covariance token
+mixers and kernel-based operator learning.
+In vision, XCiT mixes tokens in $O(N)$ time through an $\ell_2$-normalized
+$d\times d$ feature cross-covariance matrix \cite{ali2021xcit}.
 Orthogonal Neural Operator (ONO) learns solution operators for partial
 differential equations by representing a kernel through learned
 eigenfunctions and positive eigenvalue weights \cite{xiao2024ono}, applying
@@ -1047,9 +1087,13 @@ interactions.
 
 Structured state-space models (SSMs) provide hardware-efficient sequence maps
 \cite{gu2022s4,gu2024mamba,dao2024mamba2} that have been adapted to
-bidirectional vision and language modeling through selective scans in Vim,
-bidirectional matrix mixers in Hydra, and unified recurrent/chunkwise/attention
-formulations in LION \cite{zhu2024vim,hwang2024hydra,afzal2025lion}.
+bidirectional vision and language modeling through two- and four-direction
+selective scans in Vim and VMamba, bidirectional matrix mixers in Hydra, and
+unified recurrent/chunkwise/attention formulations in LION
+\cite{zhu2024vim,liu2024vmamba,hwang2024hydra,afzal2025lion}.
+To avoid directional scan bias in vision, VSSD replaces causal scans with
+non-causal global state aggregation \cite{shi2025vssd}, accumulating
+unwhitened outer products without residual error correction.
 In video generation, Video DeltaNet \cite{xi2026videodeltanet} resolves
 spatial token writes jointly within each frame through a frame-level ridge
 inverse $(\I+A_t)^{-1}$, while still scanning forward and backward across
@@ -1097,8 +1141,8 @@ rank-deficient, while applying the Woodbury identity gives
 which establishes Eq.~\eqref{eq:complement}.
 Moreover, because the reduced QR factorization of the augmented matrix
 $[A^\T,\I_r]^\T$ (with positive-diagonal upper triangular factor $R$) has top
-block $P=AR^{-1}$, the QR reference implementation and the compact Cholesky
-formulation agree in exact arithmetic.
+block $P=AR^{-1}$ \cite{golub2013matrix}, the QR reference implementation and
+the compact Cholesky formulation agree in exact arithmetic.
 
 Scaling by $\sqrt N$ also bounds the conditioning of the Gram matrix
 independently of sequence length: writing $b_i^\T$ for row $i$ of $B$, if the
@@ -1153,9 +1197,10 @@ $\I_r+F_0$ is invertible and its inverse Cayley transform satisfies
 Cholesky-factoring $\sym(J_0)=LL^\T$ and setting $\Omega=(J_0-J_0^\T)/2$ shows
 that our triangular/softplus parameterization represents every such $L$ and
 $\Omega$.
-By the classical accretive--Cayley correspondence \cite{bauschke2017convex},
-$F$ therefore covers all real strict contractions in compact space, while the
-induced token map retains its shared-frame and rank-$r$ structure.
+By the classical accretive--Cayley correspondence
+\cite{bauschke2017convex,wang2023direct}, $F$ therefore covers all real strict
+contractions in compact space, while the induced token map retains its
+shared-frame and rank-$r$ structure.
 
 \subsection{Token contraction and the exact compact spectrum}
 \label{app:spectrum}
@@ -1362,8 +1407,10 @@ shared matrix $F$, which implementations may either save from the forward
 pass or reconstruct from projections and compact intermediates
 (\textsc{Equilibrium} also reuses $L$ and the LU factors of $\I_r+J$), so no
 token-sized frame is ever stored.
-When $N\le r$, standard automatic differentiation handles the token-space
-expression alongside an analytic adjoint for the shared core solve.
+When $N\le r$, the native backend pads the $N\times N$ token-space Gram matrix
+with an identity block to the nearest supported compact rank, applies the same
+on-chip Cholesky inverse kernel, and evaluates an explicit analytical FP32
+backward pass alongside the shared-core adjoint.
 
 \subsection{A common compact backward}
 \label{app:backward}
@@ -1507,33 +1554,51 @@ contributions by $1/p$ before the final data-parallel gradient reduction.
 Correctness follows immediately from the row-wise additivity of $(G,H)$ in
 the forward pass and linearity of the adjoint reductions in the backward pass
 ($N>r$).
-Because no recurrent state crosses shard boundaries, MemSolve requires no
-inter-shard scan communication. When embedded in a backbone with a centered
-depthwise convolution, only a lightweight boundary halo exchange is needed for
-the convolution itself.
+Unlike sequence-parallel or ring attention, which communicate $O(ND)$
+activations or key--value shards across devices
+\cite{korthikanti2023reducing,liu2024ring}, MemSolve exchanges only compact
+$O(r^2+rh)$ statistics and requires no inter-shard scan communication.
+When embedded in a backbone with a centered depthwise convolution, only a
+lightweight boundary halo exchange is needed for the convolution itself.
 
 \subsection{Precision and scheduling}
 \label{app:precision}
-Our native CUDA backend supports ranks $r\in\{16,32,48,64\}$.
+Our native CUDA backend supports ranks $r\in\{16,32,48,64\}$ through
+self-contained CUDA C++ compact solvers (with cuSOLVERDx retained as an
+optional backend) and embeds multi-architecture binaries for Ampere
+(\texttt{SM80}) and Hopper (\texttt{SM90a}), where Triton kernels specialize
+to hardware TMA descriptors, transposed $M=64$ warp-group MMA, and
+programmatic dependent launch \cite{shah2024flashattention3}.
 Token projections and reduction kernels use BF16 multiplicands with FP32
-accumulation, while Gram matrices, compact states, triangular/LU factors, and
-adjoints are stored in FP32.
-Batched compact matrix products subtract the diagonal scalar $\eta$ in IEEE
-FP32 before applying Triton's three-term TF32 decomposition, whereas compact
-factorizations and linear solves retain strict IEEE FP32 arithmetic.
-During token readout, the kernels split sensitive FP32 coefficients in $W$
-into BF16 leading and residual words and accumulate both Tensor Core products
-in FP32, recovering near-FP32 coefficient accuracy without falling back to
-FP32 token operands (though under extreme mask sparsity and large relation
-norms, subtraction in the compact complementary form can still amplify
-relative rounding error).
+accumulation, applying a single post-reduction $1/N$ and $1/\sqrt{N}$
+normalization via IEEE round-to-nearest operations (\texttt{sqrt.rn},
+\texttt{div.rn}) and inline one-step FMA Newton--Raphson count reciprocals.
+Gram matrices, compact states, triangular/LU factors, and adjoints are stored
+in FP32; the on-chip Cholesky inverse symmetrizes each Gram matrix and
+accumulates diagonal updates and reciprocals in IEEE FP64, while batched
+compact products subtract $\eta$ in IEEE FP32 before three-term TF32
+accumulation.
+During token readout and backward projections, sensitive FP32 coefficients are
+split into BF16 leading and residual words and accumulated low-order term
+first via FMA in FP32, recovering near-FP32 coefficient accuracy without FP32
+token operands (though under extreme mask sparsity and large relation norms,
+subtraction in the compact complementary form can still amplify relative
+rounding error).
+By default (\texttt{recompute\_readout="auto"}), training forward passes with
+sequence length $N>512$ selectively recompute the pre-projection mixed tokens
+from saved compact factors during the backward pass rather than storing a
+token-sized buffer \cite{korthikanti2023reducing}.
 
 \paragraph{Training implementation.}
 All training runs were conducted on NVIDIA A800-SXM4-80GB GPUs using PyTorch
-2.14.0, CUDA 13.2, and \texttt{timm} 1.0.29, combining \texttt{torch.compile}
-for surrounding pointwise operations with CUDA Graph replay to amortize
-launch overhead without altering the mathematical operator in
-Section~\ref{sec:method}.
+2.14.0 \cite{ansel2024pytorch2}, CUDA 13.2, and \texttt{timm} 1.0.29.
+Registering the native kernels through \texttt{torch.library.custom\_op} with
+symbolic shape metadata (specializing saved buffers to $N\le r$ versus $N>r$
+and pairing cuBLASLt projection gradients with a stream-ordered $32$\,MiB
+workspace) enables full-graph \texttt{torch.compile} fusion
+\cite{ansel2024pytorch2} across complete blocks without Dynamo graph breaks,
+combined with CUDA Graph replay to amortize launch overhead without altering
+the mathematical operator in Section~\ref{sec:method}.
 
 \subsection{Optional rotary value encoding}
 \label{app:rove}
@@ -1564,12 +1629,13 @@ map in Eq.~\eqref{eq:tokenmap} shows that Eq.~\eqref{eq:rove-compact}
 evaluates the orthogonal conjugation $\mathcal O^{-1}\mathcal K\mathcal O$,
 which preserves all singular values and the strict contraction bound of
 Theorem~\ref{thm:contraction}.
-Following RoVE and YaRN \cite{garcia2026rove,peng2024yarn}, 1D sequences use
-base frequencies $\omega_k=10000^{-2k/h}$ ($k=0,\ldots,h/2-1$, with optional
-unit-amplitude YaRN frequency interpolation $\beta_{\rm fast}=32$,
+Following RoPE, geometry-aware value transport, RoVE, and YaRN
+\cite{su2024roformer,miyato2024gta,garcia2026rove,peng2024yarn}, 1D sequences
+use base frequencies $\omega_k=10000^{-2k/h}$ ($k=0,\ldots,h/2-1$, with
+optional unit-amplitude YaRN frequency interpolation $\beta_{\rm fast}=32$,
 $\beta_{\rm slow}=1$ beyond the training window), while 2D grids of shape
 $H_g\times W_g$ apply axial rotations by partitioning the $h/2$ channel pairs
-equally between row and column coordinates.
+equally between row and column coordinates \cite{heo2024ropevit}.
 We evaluate 1D RoVE in MemSolve-BERT ($\S\ref{sec:language}$) and both 1D and
 2D axial RoVE in Long Range Arena ($\S\ref{sec:lra}$).
 
@@ -1609,7 +1675,8 @@ Input size & \multicolumn{3}{c}{$224\times224$} & Random erasing prob.\ \cite{zh
 Patch / blocks & \multicolumn{3}{c}{$16\times16$ / 12} & Test crop ratio & \multicolumn{3}{c}{0.875}\\
 \bottomrule
 \end{tabular}
-\caption{\textbf{MemSolve-ViT configurations and ImageNet-1K training recipe.}
+\caption{\textbf{MemSolve-ViT configurations and ImageNet-1K training recipe
+\cite{touvron2022deit3,han2026vit3}.}
 All models use 12 blocks and $16\times16$ patches.
 Stochastic depth increases linearly to the listed maximum.}
 \label{tab:architecture}
@@ -1624,11 +1691,12 @@ begin at the first optimizer step with fixed decay $0.9999$, and all ImageNet
 runs use random seed 0.
 
 \paragraph{ImageNet-100 ablation recipe.}
-The ablations in Section~\ref{sec:ablations} are conducted on a fixed
-100-class ImageNet subset (126,689 training and 5,000 validation images) using
-the Small architecture and augmentations from Table~\ref{tab:architecture},
-trained for 100 epochs with batch size 512, peak learning rate
-$5\times10^{-4}$, 5 warmup epochs, and neither repeated augmentation nor EMA.
+The ablations in Section~\ref{sec:ablations} are conducted on the standard
+100-class ImageNet subset (126,689 training and 5,000 validation images)
+\cite{tian2020cmc} using the Small architecture and augmentations from
+Table~\ref{tab:architecture}, trained for 100 epochs with batch size 512, peak
+learning rate $5\times10^{-4}$, 5 warmup epochs, and neither repeated
+augmentation nor EMA.
 All ablated variants share seed 0 and identical initial weights, with
 lower-rank variants slicing nested relation projections and the $\Omega=0$
 variant retaining the learned symmetric core factor $LL^\T$.
@@ -1662,7 +1730,7 @@ matching DeiT-T and using $16\%$ to $28\%$ fewer parameters than the
 $6$M--$7$M ViG-T, ViT$^3$-T, and Vim-T models).
 Under the same single-pass 300-epoch recipe, it reaches $74.7\%$ Top-1
 accuracy---gaining $+2.5$ percentage points over the matched-size DeiT-T
-baseline while running $2.1\times$ faster than FlashAttention and $15.3\times$
+baseline while running $2.0\times$ faster than FlashAttention and $14.5\times$
 faster than BiMamba with $25\%$ and $60\%$ lower peak memory in Tiny
 forward--backward execution (Table~\ref{tab:mixer-tiny}).
 Whereas the $6$M--$7$M recurrent and test-time-training baselines invest extra
@@ -1811,9 +1879,10 @@ stated in the LION text.
 \subsection{GLUE fine-tuning and repeated seeds}
 \label{app:glue}
 
-The BERT and LION M2-BASE baselines in Table~\ref{tab:glue} are reproduced
-from Table~10 of \cite{afzal2025lion}, while MemSolve entries report per-task
-means across the fine-tuning seeds summarized in Table~\ref{tab:glue-seeds}.
+The BERT and LION M2-BASE \cite{fu2023monarch} baselines in
+Table~\ref{tab:glue} are reproduced from Table~10 of \cite{afzal2025lion},
+while MemSolve entries report per-task means across the fine-tuning seeds
+summarized in Table~\ref{tab:glue-seeds}.
 Downstream classification attaches BERT's standard CLS pooler (dense layer
 plus $\tanh$), dropout, and a linear classification head: all encoder weights
 are initialized from the MLM checkpoint (with the pooler and classifier
@@ -1933,8 +2002,10 @@ gradient clipping $1.0$.}
 \paragraph{Mixers and shapes.}
 We benchmark complete token mixers, including input and output projections,
 across identical input shapes.
-MemSolve runs in \textsc{Equilibrium} mode without RoVE or external positional
-layers. FlashAttention uses \texttt{timm}'s packed-QKV attention module
+MemSolve runs in \textsc{Equilibrium} mode with readout recomputation disabled
+(\texttt{recompute\_readout=False}, matching non-checkpointed FlashAttention-2
+and BiMamba-v2) and without RoVE or external positional layers. FlashAttention
+uses \texttt{timm}'s packed-QKV attention module
 backed by PyTorch's non-causal FlashAttention-2 SDPA kernel, and BiMamba uses
 Vim's official fused v2 implementation (expansion factor 2, state dimension
 16, causal convolution width 4, shared input/output projections, and averaged
@@ -1948,16 +2019,19 @@ $(B,D,H,r)=(4,768,12,32)$ and varies $N$ from 128 to 32,768.
 \paragraph{Execution and measurement.}
 Benchmarks run on a single NVIDIA A800-SXM4-80GB GPU with PyTorch 2.14.0 and
 CUDA 13.2, using FP32 parameters, BF16 inputs and autocast, TF32 enabled, and
-CUDA Graphs (without \texttt{torch.compile}).
+CUDA Graphs (without \texttt{torch.compile} \cite{ansel2024pytorch2}).
 Forward--backward timings include evaluating the mean squared output loss and
 full backward pass (excluding optimizer steps), whereas forward-only timings
 run under inference mode.
 Each process executes 20 eager warmup steps, captures the CUDA Graph, runs 20
 graph warmup replays, and records CUDA event timings across seven groups of
 50 replays. We report the mean of the median latencies from two independent
-processes with reversed operator ordering (for instance, at 2,048 tokens the
-two MemSolve forward--backward medians are $0.820$ and $0.840$\,ms, averaging
-to $0.830$\,ms).
+processes with reversed operator ordering (for instance, at 2,048 tokens with
+\texttt{recompute\_readout=False}, the two MemSolve forward--backward medians
+are $0.892$ and $0.782$\,ms, averaging to $0.837$\,ms; enabling optional
+readout recomputation via \texttt{recompute\_readout="auto"} lowers peak memory
+to $625.8$\,MiB at $2.763$\,ms for $8{,}192$ tokens and $2{,}425.8$\,MiB at
+$10.117$\,ms for $32{,}768$ tokens).
 Peak allocated memory is reset after eager warmup and measured across graph
 capture and replay, covering parameters, gradients, and intermediate
 activations (excluding CUDA context and caching-allocator reserves).
@@ -1980,16 +2054,16 @@ forward-only results.
 Setting &ms &MiB &ms &MiB &ms &MiB\\
 \midrule
 \multicolumn{7}{l}{\emph{Visual shapes: 196 tokens}}\\
-Small &\textbf{1.126} &\textbf{283.7} &1.783 &321.1 &15.565 &664.7\\
-Base &\textbf{1.734} &\textbf{304.8} &2.087 &332.1 &16.052 &680.3\\
+Small &\textbf{1.096} &\textbf{283.7} &1.784 &321.1 &15.562 &664.7\\
+Base &\textbf{1.808} &\textbf{304.7} &2.092 &332.1 &16.057 &680.3\\
 \midrule
 \multicolumn{7}{l}{\emph{Length sweep: batch 4, width 768}}\\
-128 tokens &0.280 &\textbf{40.1} &\textbf{0.267} &76.2 &0.987 &103.2\\
-196 tokens &\textbf{0.300} &\textbf{42.1} &0.332 &78.4 &1.363 &115.5\\
-512 tokens &\textbf{0.416} &\textbf{67.0} &0.564 &120.4 &1.775 &172.6\\
-2,048 tokens &\textbf{0.830} &\textbf{188.7} &2.295 &236.4 &5.790 &455.7\\
-8,192 tokens &\textbf{2.694} &\textbf{673.8} &20.907 &775.6 &21.948 &1,592.8\\
-32,768 tokens &\textbf{9.806} &\textbf{2,617.8} &283.266 &2,940.1 &90.289 &6,140.7\\
+128 tokens &\textbf{0.245} &\textbf{40.3} &0.267 &76.2 &0.976 &103.2\\
+196 tokens &\textbf{0.262} &\textbf{43.0} &0.332 &78.4 &1.360 &115.5\\
+512 tokens &\textbf{0.382} &\textbf{67.0} &0.528 &120.4 &1.777 &172.6\\
+2,048 tokens &\textbf{0.837} &\textbf{188.7} &2.305 &236.4 &5.792 &455.7\\
+8,192 tokens &\textbf{2.673} &\textbf{673.8} &21.212 &775.6 &22.182 &1,592.8\\
+32,768 tokens &\textbf{9.855} &\textbf{2,617.8} &285.692 &2,940.1 &90.665 &6,140.7\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -2005,9 +2079,9 @@ Base &\textbf{1.734} &\textbf{304.8} &2.087 &332.1 &16.052 &680.3\\
 Mixer & Latency (ms) & Peak memory (MiB)\\
 \midrule
 \rowcolor{ResultYellow}
-\textbf{MemSolve} & \textbf{0.519} & \textbf{144.8}\\
-FlashAttention & 1.066 & 193.9\\
-BiMamba & 7.921 & 359.6\\
+\textbf{MemSolve} & \textbf{0.546} & \textbf{144.8}\\
+FlashAttention & 1.070 & 193.9\\
+BiMamba & 7.920 & 359.6\\
 \bottomrule
 \end{tabular}
 \caption{\textbf{Tiny-shape mixer forward--backward efficiency.}
@@ -2040,17 +2114,17 @@ repetitions are archived in the repository.
 Setting &ms &MiB &ms &MiB &ms &MiB\\
 \midrule
 \multicolumn{7}{l}{\emph{Visual shapes: 196 tokens}}\\
-Tiny &\textbf{0.146} &\textbf{42.0} &0.208 &80.6 &2.143 &209.7\\
-Small &0.344 &\textbf{84.8} &\textbf{0.343} &138.0 &4.244 &394.9\\
-Base &0.522 &\textbf{97.4} &\textbf{0.477} &146.1 &4.433 &405.0\\
+Tiny &\textbf{0.134} &\textbf{34.2} &0.207 &80.6 &2.146 &209.7\\
+Small &\textbf{0.324} &\textbf{72.2} &0.344 &138.0 &4.248 &394.9\\
+Base &0.625 &\textbf{97.4} &\textbf{0.443} &146.1 &4.435 &405.0\\
 \midrule
 \multicolumn{7}{l}{\emph{Length sweep: batch 4, width 768}}\\
-128 tokens &0.129 &\textbf{10.7} &\textbf{0.054} &39.8 &0.269 &55.3\\
-196 tokens &0.131 &\textbf{12.5} &\textbf{0.074} &41.4 &0.446 &63.4\\
-512 tokens &0.165 &\textbf{20.9} &\textbf{0.134} &52.9 &0.548 &98.4\\
-2,048 tokens &\textbf{0.296} &\textbf{61.7} &0.589 &106.5 &1.632 &270.7\\
-8,192 tokens &\textbf{0.707} &\textbf{222.8} &5.346 &322.5 &6.179 &962.2\\
-32,768 tokens &\textbf{2.319} &\textbf{870.8} &75.901 &1,186.5 &25.735 &3,728.7\\
+128 tokens &0.104 &\textbf{9.2} &\textbf{0.054} &39.8 &0.275 &55.3\\
+196 tokens &0.104 &\textbf{10.8} &\textbf{0.074} &41.4 &0.445 &63.4\\
+512 tokens &0.140 &\textbf{16.6} &\textbf{0.135} &52.9 &0.562 &98.4\\
+2,048 tokens &\textbf{0.267} &\textbf{48.4} &0.636 &106.5 &1.632 &270.7\\
+8,192 tokens &\textbf{0.708} &\textbf{174.1} &5.434 &322.5 &6.216 &962.2\\
+32,768 tokens &\textbf{2.292} &\textbf{678.1} &76.629 &1,186.5 &25.930 &3,728.7\\
 \bottomrule
 \end{tabular}
 \end{table}

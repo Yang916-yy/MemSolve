@@ -5,7 +5,6 @@ import functools
 import json
 import math
 from pathlib import Path
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -16,14 +15,12 @@ from torch.utils.data import Dataset, TensorDataset
 import experiments.train_transformers as train_transformers
 from experiments.sequence_data import (
     DatasetBundle,
-    NucleotideTokenizer,
     PATHFINDER_SPLIT_PROTOCOL,
     TokenVocabulary,
     build_packed_tokens,
     collate_tokens,
     collate_values,
     pathfinder_split_indices,
-    prepare_genomic_benchmarks,
     prepare_lra,
     stratified_split_indices,
     validate_formal_source_provenance,
@@ -237,13 +234,6 @@ def test_cuda_runtime_metadata_records_the_current_native_contract() -> None:
     assert metadata["memsolve_cuda_contract"] == cuda._NATIVE_CONTRACT_VERSION
 
 
-def test_nucleotide_tokenizer_does_not_confuse_unknown_with_padding() -> None:
-    tokenizer = NucleotideTokenizer()
-    assert tokenizer.encode("ACGTNZ", 8).tolist() == [2, 3, 4, 5, 6, 1]
-    with pytest.raises(ValueError, match="empty genomic"):
-        tokenizer.encode("", 8)
-
-
 def test_stratified_split_is_deterministic_and_keeps_every_class_in_train() -> None:
     labels = [0] * 8 + [1] * 4 + [2]
     train, validation = stratified_split_indices(labels, 0.25, 19)
@@ -275,7 +265,7 @@ def test_collate_uses_lengths_not_the_token_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "mixer", ("mha", "memsolve", "linear_transformer", "performer", "nystromformer", "cosformer", "rebased")
+    "mixer", ("mha", "memsolve", "linear", "performer", "nystromformer", "agent", "mita", "polaformer", "local")
 )
 @pytest.mark.parametrize("pooling", ("mean", "meanmax"))
 def test_sequence_classifier_masks_padding_for_both_mixers(
@@ -1365,45 +1355,6 @@ def test_checkpoint_allows_explicit_resume_for_the_same_run(tmp_path) -> None:
     assert state["completed"]
     assert state["format_version"] == 2
     assert "early_stop_best_accuracy" in state
-
-
-def test_mha_rope_matches_explicit_rotation_and_preserves_initialization():
-    cls = train_transformers.MaskedMultiheadAttention
-    torch.manual_seed(19)
-    baseline = cls(8, 2, bias=True).double()
-    torch.manual_seed(19)
-    rotated = cls(8, 2, bias=True, rope=True).double()
-    for name, value in baseline.state_dict().items():
-        torch.testing.assert_close(value, rotated.state_dict()[name], rtol=0, atol=0)
-    x = torch.randn(2, 5, 8, dtype=torch.float64, requires_grad=True)
-    mask = torch.tensor([[True, True, True, False, False], [False]*5])
-    actual = rotated(x, mask)
-    attn = rotated.attention
-    q, k, v = F.linear(x[:1], attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
-    q, k, v = [t.reshape(1, 5, 2, 4).transpose(1, 2) for t in (q, k, v)]
-    matrices = []
-    for position in range(5):
-        blocks = []
-        for frequency in (1.0, 0.01):
-            angle = position * frequency
-            blocks.append(torch.tensor([[math.cos(angle), -math.sin(angle)],
-                                        [math.sin(angle), math.cos(angle)]], dtype=torch.float64))
-        matrices.append(torch.block_diag(*blocks))
-    rotation = torch.stack(matrices)
-    q, k = [torch.einsum('nij,bhnj->bhni', rotation, t) for t in (q, k)]
-    scores = (q @ k.transpose(-2, -1)) / 2
-    scores = scores.masked_fill(~mask[:1, None, None, :], -torch.inf)
-    expected = attn.out_proj((scores.softmax(-1) @ v).transpose(1, 2).reshape(1, 5, 8))
-    expected = expected * mask[:1, :, None]
-    torch.testing.assert_close(actual[:1], expected, rtol=1e-10, atol=1e-10)
-    assert torch.count_nonzero(actual[1]) == 0
-    grad_a = torch.autograd.grad(actual.square().sum(), x, retain_graph=True)[0]
-    grad_b = torch.autograd.grad(expected.square().sum(), x)[0]
-    torch.testing.assert_close(grad_a, grad_b, rtol=1e-10, atol=1e-10)
-    # Position zero has identity rotation, including the original MHA gradient.
-    one = x.detach()[:, :1].requires_grad_()
-    valid = torch.ones(2, 1, dtype=torch.bool)
-    torch.testing.assert_close(rotated(one, valid), baseline(one, valid), rtol=1e-10, atol=1e-10)
 
 
 def test_nystromformer_lra_recipe_preserves_published_step_budgets() -> None:

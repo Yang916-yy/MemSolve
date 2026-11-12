@@ -15,8 +15,8 @@ The Hugging Face integration replaces BERT's self-attention layer with MemSolve 
 | Parameters (RoVE, tied MLM head) | 111,123,938 |
 | Parameters (learned absolute positions, tied MLM head) | 111,517,154 |
 
-- **Position Encoding**: The paper evaluates both **learned absolute position embeddings** (`MemSolve-BERT`, max 512 positions, with step-by-step logs in [`results/mlm/`](../results/mlm/) and [`results/glue/`](../results/glue/)) and parameter-free **RoVE** (`MemSolve-BERT (RoVE)`). The default template in `experiments/configs/memsolve_bert_mlm.json` uses **RoVE** (`"position_embedding_type": "rove"`); to train the learned-position model, set `"position_embedding_type": "absolute"` in the config.
-- **Short Convolution**: Set `memsolve_short_conv_kernel=0` to disable the depthwise convolution. When enabled (`kernel=3`), padded tokens are zeroed before and after the convolution, and its weights are zero-initialized so the branch starts as an exact identity.
+- **Position Encoding**: The paper evaluates both **learned absolute position embeddings** (`MemSolve-BERT`, max 512 positions, with step-by-step logs in [`results/mlm/`](../results/mlm/) and [`results/glue/`](../results/glue/)) and parameter-free **RoVE** (`MemSolve-BERT (RoVE)`, logged in [`results/mlm/rove_conv3/`](../results/mlm/rove_conv3/) and [`results/glue/rove_conv3/`](../results/glue/rove_conv3/), alongside the no-ShortConv control in `rove_noconv/`). The default template in `experiments/configs/memsolve_bert_mlm.json` uses **RoVE** (`"position_embedding_type": "rove"`); to train the learned-position model, set `"position_embedding_type": "absolute"` in the config.
+- **Short Convolution**: Set `memsolve_short_conv_kernel=0` to disable the depthwise convolution. When enabled (`kernel=3`), padded tokens are zeroed before and after the convolution, its weights are zero-initialized so the branch starts as an exact identity, and compiled non-sequence-parallel blocks materialize contiguous `[B, D, N]` / `[B, N, D]` layouts around `Conv1d` so Inductor does not fuse strided channel-major views into downstream `LayerNorm` backward reductions.
 - **Initialization**: Projection weights and BERT layers use $\mathcal{N}(0, 0.02^2)$ with zero bias; the MemSolve core starts at $J = I$ ($F = 0$) and $\eta = 0.9$.
 
 ```python
@@ -58,7 +58,7 @@ Our pretraining budget matches the [LION M2-BERT setup](https://arxiv.org/html/2
 | Eval & checkpoint interval | Every 1,000 steps |
 | Precision & execution | FP32 weights, BF16 autocast, `compile-graph` |
 
-*Note on weight decay*: Composer's decoupled weight decay (`1e-5`) translates to PyTorch `AdamW` weight decay as `1e-5 / 8e-4 = 0.0125` (excluding norms and biases).
+*Note on weight decay*: Composer's decoupled weight decay (`1e-5`) translates to PyTorch `AdamW` weight decay as `1e-5 / 8e-4 = 0.0125` (excluding norms and biases). Setting `"execution": "compile-graph"` in the MLM JSON config (alternatives: `"graph"` or `"eager"`) compiles complete `MemSolveBert` encoder blocks—including depthwise short convolutions, SwiGLU FFNs, and registered `MemSolve` custom ops—end-to-end through Inductor without Dynamo graph breaks before capturing the CUDA Graph.
 
 ```bash
 # Dry-run preflight check
@@ -90,7 +90,7 @@ torchrun --standalone --nproc_per_node=2 -m experiments.train_mlm \
 
 ## GLUE Fine-Tuning
 
-`experiments/configs/memsolve_bert_glue.json` implements the LION M2-BASE fine-tuning protocol (sequence length 128, 6% linear warmup, linear decay to zero, evaluated at the final checkpoint). Following standard practice, RTE, MRPC, and STS-B initialize from the fine-tuned MNLI encoder, while MNLI, QQP, QNLI, SST-2, and CoLA initialize directly from the pretrained MLM checkpoint.
+`experiments/configs/memsolve_bert_glue.json` implements the LION M2-BASE fine-tuning protocol (sequence length 128, 6% linear warmup, linear decay to zero, evaluated at the final checkpoint; pass `--compile` to `experiments.train_glue` for Inductor `reduce-overhead` block compilation). Following standard practice, RTE, MRPC, and STS-B initialize from the fine-tuned MNLI encoder, while MNLI, QQP, QNLI, SST-2, and CoLA initialize directly from the pretrained MLM checkpoint.
 
 ```bash
 # Tokenize and cache GLUE splits

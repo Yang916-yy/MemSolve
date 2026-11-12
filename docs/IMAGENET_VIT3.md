@@ -70,12 +70,15 @@ torchrun --standalone --nproc_per_node=2 experiments/train_imagenet.py \
   --batch-size 512 --grad-accum 2
 ```
 
-Use `--tier tiny` or `--tier base` for the other sizes. All three train at 224px
-in one stage. Install `.[vision]` and build the native extension first.
+Use `--tier tiny` or `--tier base` for the other paper sizes (`--tier large` is
+also supported when paired with a `--config` defining `[tiers.large]`). All three
+paper tiers train at 224px in one stage. Install `.[vision]` and build the native
+extension first.
 
-`--execution compile-graph` compiles surrounding vision blocks while leaving
-the native mixer outside Dynamo, then captures a complete accumulated
-forward/backward update. DDP synchronizes on the final microbatch. Optimizer,
+`--execution compile-graph` compiles complete vision blocks end-to-end (preserving
+zero-copy `channels_last` CPE views at static shapes and including the
+registered `MemSolve` custom ops with no Dynamo graph breaks), then captures
+a complete accumulated forward/backward update. DDP synchronizes on the final microbatch. Optimizer,
 clipping, augmentation, and scheduling remain outside the graph. Warmup restores
 RNG state and buffers without updating weights. `graph` omits compilation;
 `eager` omits capture. Graph modes require fixed microbatch shapes.
@@ -94,11 +97,33 @@ and working outputs outside Git.
 
 ## ImageNet-100 ablations
 
-The paper compares Equilibrium, Complement, no skew coupling, and rank 16
-using Small for 100 epochs. The fixed subset has 126,689 training and 5,000
-validation images. The recipe uses effective batch 512, LR 5e-4, five warmup
-epochs, the same augmentation policy, and no RA or EMA. The paper records the
-selection rule and results. Use the same class list and initialization across
-comparisons. The [published ablation records](../results/imagenet100/) include
-all epoch logs, configurations, and the subset class mapping. Trial queues and
-source snapshots stay with local run artifacts.
+The paper compares Equilibrium (`equilibrium_r32`), Complement (`complement_r32`),
+no skew coupling (`no_omega_r32`), and rank 16 (`equilibrium_r16`) using Small for
+100 epochs (`experiments/configs/imagenet100.toml`). The fixed subset has 126,689
+training and 5,000 validation images. The recipe uses effective batch 512, LR
+5e-4, five warmup epochs, the same augmentation policy, and no RA or EMA. All four
+variants share the same 100-class subset and deterministic master initialization:
+
+```bash
+python -m experiments.reproduce_imagenet100 equilibrium_r32 \
+  --data-root /datasets/imagenet-1k-wds \
+  --output /runs/imagenet100/equilibrium_r32
+```
+
+Pass `--prepare-only` to build/verify the subset byte-offset indices, shared
+master initialization (`common_init.pt`), and `no_omega_r32` lower-triangular
+parametrization on CPU before launching training. The
+[published ablation records](../results/imagenet100/) include all epoch logs,
+configurations, and the subset class mapping.
+
+### Optional RMSNorm and axial RoVE
+
+The timm adapter and ImageNet recipe accept `norm_type = "rmsnorm"` and
+`rotary_2d = true` in `[defaults]`. Defaults remain LayerNorm and no RoVE.
+RMSNorm replaces the two outer block norms and the final token norm; the
+operator's internal normalization is unchanged. Each block applies residual
+CPE before normalization and mixing. Inside the mixer, axial RoVE rotates the
+content before aggregation and applies the inverse rotation at readout. Half
+of each head's channel pairs encode rows and half encode columns, using fixed
+base 10000 and unit amplitude. All layers share the same per-forward tables.
+Checkpoint metadata records these choices and rejects incompatible scaffolds.

@@ -1,6 +1,6 @@
 """Replay a published LRA configuration with local dataset/output paths."""
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import json
@@ -46,20 +46,79 @@ class PixelEncoder(train.SequenceEncoder):
                 )
 
 
+def _verify_recorded_bundle(bundle, record_data: dict) -> None:
+    train.validate_formal_source_provenance(bundle)
+    expected_dataset = record_data['dataset']
+    actual_sha = bundle.metadata.get('source', {}).get('content_sha256')
+    expected_sha = expected_dataset['source']['content_sha256']
+    if actual_sha != expected_sha:
+        raise ValueError(
+            f'dataset content_sha256 mismatch: got {actual_sha!r}, '
+            f'expected {expected_sha!r}'
+        )
+    for key in (
+        'suite',
+        'task',
+        'source_definition',
+        'split_protocol',
+        'split_seed',
+        'validation_fraction',
+        'vocabulary_fingerprint',
+        'split_fingerprints',
+        'tokenization',
+        'resolution',
+        'value_masking',
+    ):
+        if bundle.metadata.get(key) != expected_dataset.get(key):
+            raise ValueError(
+                f'dataset {key} mismatch: got {bundle.metadata.get(key)!r}, '
+                f'expected {expected_dataset.get(key)!r}'
+            )
+    actual_sizes = {
+        'train': len(bundle.train),
+        'validation': len(bundle.validation),
+        'test': len(bundle.test),
+    }
+    if actual_sizes != record_data['split_sizes']:
+        raise ValueError(
+            f"split_sizes mismatch: got {actual_sizes!r}, "
+            f"expected {record_data['split_sizes']!r}"
+        )
+    actual_contract = {
+        'input_kind': bundle.input_kind,
+        'max_length': bundle.max_length,
+        'vocab_size': bundle.vocab_size,
+        'paired': bundle.paired,
+        'value_masking': (
+            bundle.value_masking if bundle.input_kind == 'values' else None
+        ),
+    }
+    if actual_contract != record_data['data_contract']:
+        raise ValueError(
+            f"data_contract mismatch: got {actual_contract!r}, "
+            f"expected {record_data['data_contract']!r}"
+        )
+
+
 @contextmanager
-def _apply_pathfinder_pixel_protocol():
+def _apply_reproduction_protocol(record_data: dict):
     original_encoder = train.SequenceEncoder
     original_bundle = train.build_bundle
     original_payload = train._build_run_payload
+    is_pathfinder = record_data['resolved_arguments']['task'] == 'pathfinder'
 
     def build_bundle(args):
-        bundle = original_bundle(args)
-        assert args.task == 'pathfinder' and bundle.input_kind == 'values'
-        return replace(
-            bundle,
-            value_masking='nonzero',
-            metadata={**bundle.metadata, 'value_masking': 'nonzero-pixels'},
-        )
+        formal_args = argparse.Namespace(**{**vars(args), 'formal': True})
+        bundle = original_bundle(formal_args)
+        if is_pathfinder:
+            assert args.task == 'pathfinder' and bundle.input_kind == 'values'
+            bundle = replace(
+                bundle,
+                value_masking='nonzero',
+                metadata={**bundle.metadata, 'value_masking': 'nonzero-pixels'},
+            )
+        _verify_recorded_bundle(bundle, record_data)
+        return bundle
 
     def payload(*args, **kwargs):
         result = original_payload(*args, **kwargs)
@@ -82,9 +141,10 @@ def _apply_pathfinder_pixel_protocol():
         }
         return result
 
-    train.SequenceEncoder = PixelEncoder
     train.build_bundle = build_bundle
-    train._build_run_payload = payload
+    if is_pathfinder:
+        train.SequenceEncoder = PixelEncoder
+        train._build_run_payload = payload
     try:
         yield
     finally:
@@ -103,9 +163,9 @@ def main():
     opts = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     record = root / 'results/lra' / opts.record / 'config.json'
-    recorded = json.loads(record.read_text())['resolved_arguments']
-    protocol = _apply_pathfinder_pixel_protocol() if recorded['task'] == 'pathfinder' else nullcontext()
-    with protocol:
+    record_data = json.loads(record.read_text())
+    recorded = record_data['resolved_arguments']
+    with _apply_reproduction_protocol(record_data):
         args = train.resolve_args(train.parse_args([
             '--config', str(root / 'experiments/configs/lra_rove.toml'),
             '--task', recorded['task'], '--output', str(opts.output)]))
@@ -116,7 +176,7 @@ def main():
         args.cache_root = opts.cache_root.resolve()
         args.output = opts.output.resolve()
         args.config = root / 'experiments/configs/lra_rove.toml'
-        args.formal = False  # Published config and data provenance are stored separately.
+        args.formal = False  # Source tree may be modified; data provenance is verified against record_data.
         args.prepare_only = opts.prepare_only
         args.resume = False
         train._validate_resolved_args(args)

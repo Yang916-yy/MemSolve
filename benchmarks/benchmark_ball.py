@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=3)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--core-mode", choices=[mode.value for mode in CoreMode], default="equilibrium")
+    parser.add_argument(
+        "--recompute-readout",
+        choices=("false", "true", "auto"),
+        default="false",
+        help="Readout recomputation policy for MemSolve backward (default: false for uncheckpointed mixer parity).",
+    )
     parser.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--graph", action="store_true", help="Capture a complete gradient-accumulation cycle.")
     parser.add_argument("--warmup", type=int, default=10)
@@ -110,6 +116,11 @@ def run(args: argparse.Namespace) -> None:
     torch.backends.cuda.matmul.fp32_precision = "tf32" if args.tf32 else "ieee"
     torch.backends.cudnn.fp32_precision = "tf32" if args.tf32 else "ieee"
     if args.operator == "memsolve":
+        recompute_readout: bool | str = {
+            "false": False,
+            "true": True,
+            "auto": "auto",
+        }[args.recompute_readout]
         mixer: nn.Module = MemSolve(
             MemSolveConfig(
                 dim=args.dim,
@@ -117,6 +128,7 @@ def run(args: argparse.Namespace) -> None:
                 rank=args.rank,
                 core_mode=args.core_mode,
                 bias=args.bias,
+                recompute_readout=recompute_readout,
             )
         ).to(device)
     elif args.operator == "flashattention":

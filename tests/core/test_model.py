@@ -780,3 +780,55 @@ def test_unrotated_operator_is_token_permutation_equivariant(mode: CoreMode) -> 
     actual = layer(x[:, permutation], valid_mask=mask[:, permutation])
     torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-10)
 
+
+def test_recompute_readout_config_and_runtime_property_validation() -> None:
+    default_cfg = MemSolveConfig(16, 2, rank=16)
+    assert default_cfg.recompute_readout == "auto"
+    layer = MemSolve(default_cfg)
+    assert layer.recompute_readout == "auto"
+
+    for policy in ("auto", True, False):
+        cfg = MemSolveConfig(16, 2, rank=16, recompute_readout=policy)
+        assert cfg.recompute_readout == policy and type(cfg.recompute_readout) is type(policy)
+        m = MemSolve(cfg)
+        assert m.recompute_readout == policy and type(m.recompute_readout) is type(policy)
+
+    for policy in (False, True, "auto"):
+        layer.recompute_readout = policy
+        assert layer.recompute_readout == policy and type(layer.recompute_readout) is type(policy)
+        assert layer.config.recompute_readout == "auto"
+
+    for bad_str in ("invalid", "true", "false", "AUTO", ""):
+        with pytest.raises(ValueError, match="recompute_readout"):
+            MemSolveConfig(16, 2, rank=16, recompute_readout=bad_str)
+        with pytest.raises(ValueError, match="recompute_readout"):
+            layer.recompute_readout = bad_str
+
+    for bad_type in (1, 0, None, 1.0, ["auto"]):
+        with pytest.raises(TypeError, match="recompute_readout"):
+            MemSolveConfig(16, 2, rank=16, recompute_readout=bad_type)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="recompute_readout"):
+            layer.recompute_readout = bad_type  # type: ignore[assignment]
+
+
+def test_recompute_readout_preserves_v26_checkpoint_contract_across_modes() -> None:
+    torch.manual_seed(209)
+    models = {
+        mode: MemSolve(MemSolveConfig(16, 2, rank=16, bias=True, recompute_readout=mode))
+        for mode in ("auto", True, False)
+    }
+    for mode, source in models.items():
+        extra = source.get_extra_state()
+        assert extra["version"] == 26
+        assert "recompute_readout" not in extra
+        state = copy.deepcopy(source.state_dict())
+        for target_mode in ("auto", True, False):
+            target = MemSolve(
+                MemSolveConfig(16, 2, rank=16, bias=True, recompute_readout=target_mode)
+            )
+            target.load_state_dict(state, strict=True)
+            assert target.recompute_readout == target_mode and type(target.recompute_readout) is type(target_mode)
+            x = torch.randn(2, 7, 16)
+            torch.testing.assert_close(target(x), source(x), rtol=0, atol=0)
+
+

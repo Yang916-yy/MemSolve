@@ -298,6 +298,15 @@ def test_small_recipe_uses_plain_vit3_training(tmp_path: Path) -> None:
     }
 
 
+def test_imagenet_rejects_swiglu_config(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    config = Path(args.config)
+    config.write_text(config.read_text().replace(
+        "[defaults]", '[defaults]\nffn = "swiglu"', 1))
+    with pytest.raises(ValueError, match="requires ffn='gelu'"):
+        load_run(args)
+
+
 def test_worker_counts_are_independently_overridable(tmp_path: Path) -> None:
     run = load_run(_args(tmp_path, "--train-workers", "7", "--val-workers", "0"))
     assert (run.train["train_workers"], run.train["val_workers"]) == (7, 0)

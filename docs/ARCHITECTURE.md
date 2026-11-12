@@ -8,21 +8,22 @@ Two core modes are supported:
 
 ## Vision (`MemSolve-ViT`)
 
-`MemSolve-ViT` follows the 12-layer isotropic [ViT³](https://github.com/LeapLabTHU/ViTTT/blob/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt/models/vittt.py) backbone layout:
+`MemSolve-ViT` follows the isotropic [ViT³](https://github.com/LeapLabTHU/ViTTT/blob/e3477587d099e6b9e83e9e7c80b1b999e0989a20/vittt/models/vittt.py) backbone layout:
 
 1. **Patch embedding**: $16 \times 16$ patch projection without a `[CLS]` token or fixed 2D position table.
-2. **Local positional encoding**: a residual $3 \times 3$ depthwise convolution (CPE) at the start of every block.
-3. **Token mixer**: `LayerNorm -> MemSolve -> DropPath + residual`.
+2. **Local positional encoding**: a residual $3 \times 3$ depthwise convolution (CPE) at the start of every block (retaining zero-copy `channels_last` `NHWC` views in eager and static `torch.compile`, and materializing contiguous `NCHW` tensors under dynamic symbolic shapes).
+3. **Token mixer**: `LayerNorm -> MemSolve -> DropPath + residual` (`norm_type="rmsnorm"` optionally switches block and final norms to `RMSNorm`; `rotary_2d=True` optionally enables 2D axial RoVE inside the mixer).
 4. **Channel MLP**: `LayerNorm -> GELU FFN -> DropPath + residual`.
-5. **Classifier head**: per-token `LayerNorm` followed by masked mean pooling over valid patches and a linear classifier.
+5. **Classifier head**: per-token `LayerNorm` (or `RMSNorm`) followed by masked mean pooling over valid patches and a linear classifier.
 
 | Model | Width | Depth | Heads | Rank | MLP Width (Ratio) | DropPath | Parameters (1K classes) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `MemSolve-ViT-T` | 192 | 12 | 6 | 16 | 768 (4.0) | 0.0 | 5,053,936 |
 | `MemSolve-ViT-S` | 384 | 12 | 6 | 32 | 1584 (4.125) | 0.1 | 19,876,336 |
 | `MemSolve-ViT-B` | 768 | 12 | 12 | 48 | 3072 (4.0) | 0.4 | 77,980,792 |
+| `MemSolve-ViT-L` | 1024 | 24 | 16 | 64 | 4096 (4.0) | 0.45 | 280,752,488 |
 
-For detection and segmentation, the pretrained backbone connects to a standard `ViT-Adapter` via `VisionTokenLayout` to handle arbitrary rectangular feature grids (see [DOWNSTREAM_PROTOCOLS.md](DOWNSTREAM_PROTOCOLS.md)).
+All four scales register with `timm` (`memsolve_vit_{tiny,small,base,large}`) and `integrations.timm.create_memsolve_vit_variant`; the paper's 300-epoch ImageNet-1K experiments evaluate `T`, `S`, and `B`. For detection and segmentation, the pretrained backbone connects to a standard `ViT-Adapter` via `VisionTokenLayout` to handle arbitrary rectangular feature grids (see [DOWNSTREAM_PROTOCOLS.md](DOWNSTREAM_PROTOCOLS.md)).
 
 ## Language (`MemSolve-BERT`)
 

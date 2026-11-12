@@ -203,11 +203,25 @@ def test_cuda_require_available_caches_a_verified_explicit_load(
 
 
 def test_default_cuda_library_path_is_arch_specific(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MEMSOLVE_CUDA_LIBRARY", raising=False)
     monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
+    monkeypatch.setattr(
+        cuda,
+        "_development_library_path",
+        lambda architecture: tmp_path / f"memsolve_equilibrium_sm{architecture}.so",
+    )
     assert cuda._default_library_path().name == "memsolve_equilibrium_sm80.so"
+
+    per_sm = tmp_path / "memsolve_equilibrium_sm80.so"
+    per_sm.touch()
+    assert cuda._default_library_path() == per_sm
+
+    unified = tmp_path / "memsolve_equilibrium.so"
+    unified.touch()
+    assert cuda._default_library_path() == unified
 
 
 def test_default_cuda_library_path_discovers_a_matching_runtime_wheel(
@@ -263,17 +277,23 @@ def test_runtime_wheel_rejects_a_mismatched_torch_contract(
         cuda._default_library_path()
 
 
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((10, 3), 100), ((11, 0), 100), ((12, 1), 120)],
+)
 def test_cuda_architecture_normalizes_sm121(
     monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    expected: int,
 ) -> None:
     monkeypatch.setattr(cuda.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(cuda.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         cuda.torch.cuda,
         "get_device_capability",
-        lambda device: (12, 1),
+        lambda device: capability,
     )
-    assert cuda._device_architecture() == 120
+    assert cuda._device_architecture() == expected
 
 
 def test_cuda_architecture_rejects_turing_without_bf16(
@@ -342,12 +362,122 @@ def test_cuda_loader_rejects_a_misnamed_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for wrong_name in ("memsolve_equilibrium_sm89.so", "memsolve_wrong.so"):
+        library = tmp_path / wrong_name
+        library.touch()
+        monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
+        monkeypatch.setattr(cuda, "is_available", lambda: False)
+        with pytest.raises(
+            RuntimeError,
+            match="requires memsolve_equilibrium_sm80.so or memsolve_equilibrium.so",
+        ):
+            cuda.load(path=library)
+
+
+def test_cuda_loader_accepts_explicit_unified_library_and_multi_arch_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     library = tmp_path / "memsolve_equilibrium.so"
     library.touch()
+    namespace = SimpleNamespace()
+
+    def load_library(path: str) -> None:
+        assert path == str(library.resolve())
+        namespace.contract_version = lambda: cuda._NATIVE_CONTRACT_VERSION
+        namespace.supported_architectures = lambda: [80, 86, 87, 89, 90, 100, 120]
+        namespace.compact_lu = object()
+        namespace.compact_getrs = object()
+        namespace.compact_inverse = object()
+        namespace.linear_weight_bias = object()
+
+    monkeypatch.setattr(cuda, "_LOADED_ARCHITECTURE", None)
+    monkeypatch.setattr(
+        cuda,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(
+                memsolve_equilibrium=namespace,
+                load_library=load_library,
+            )
+        ),
+    )
     monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
-    monkeypatch.setattr(cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="requires memsolve_equilibrium_sm80.so"):
-        cuda.load(path=library)
+    cuda.load(path=library)
+    assert cuda._LOADED_ARCHITECTURE == 0
+
+    for second_arch in (86, 89, 90, 100, 120):
+        monkeypatch.setattr(cuda, "_device_architecture", lambda device=None, a=second_arch: a)
+        cuda.load(device=second_arch)
+
+
+def test_cuda_loader_tracks_compiled_multi_arch_subset_even_via_sm_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias = tmp_path / "memsolve_equilibrium_sm80.so"
+    alias.touch()
+    namespace = SimpleNamespace()
+
+    def load_library(path: str) -> None:
+        assert path == str(alias.resolve())
+        namespace.contract_version = lambda: cuda._NATIVE_CONTRACT_VERSION
+        namespace.supported_architectures = lambda: [80, 90]
+        namespace.compact_lu = object()
+        namespace.compact_getrs = object()
+        namespace.compact_inverse = object()
+        namespace.linear_weight_bias = object()
+
+    monkeypatch.setattr(cuda, "_LOADED_ARCHITECTURE", None)
+    monkeypatch.setattr(
+        cuda,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(
+                memsolve_equilibrium=namespace,
+                load_library=load_library,
+            )
+        ),
+    )
+    monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 80)
+    cuda.load(path=alias)
+    assert cuda._LOADED_ARCHITECTURE == frozenset({80, 90})
+
+    monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 90)
+    cuda.load(device=90)
+
+    monkeypatch.setattr(cuda, "_device_architecture", lambda device=None: 120)
+    with pytest.raises(RuntimeError, match="targets SM80, SM90, not requested SM120"):
+        cuda.load(device=120)
+
+
+def test_cuda_loader_real_unified_artifact_subprocesses() -> None:
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[2]
+    unified = repo_root / "build" / "cuda" / "lib" / "memsolve_equilibrium.so"
+    if not unified.is_file():
+        pytest.skip("unified native CUDA extension is not built")
+
+    for stmt in (
+        f"cuda.load({str(unified)!r})",
+        "assert cuda._default_library_path().name == 'memsolve_equilibrium.so'; cuda.load()",
+        f"cuda.load({str(unified.with_name('memsolve_equilibrium_sm80.so'))!r})",
+    ):
+        script = (
+            "from memsolve.ball import cuda\n"
+            f"{stmt}\n"
+            "assert cuda.is_available()\n"
+            "assert cuda._LOADED_ARCHITECTURE == 0\n"
+            "for arch in (80, 86, 89, 90, 100, 120):\n"
+            "    cuda._device_architecture = lambda device=None, a=arch: a\n"
+            "    cuda.load(device=arch)\n"
+        )
+        subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            check=True,
+        )
 
 
 def test_reference_is_default_and_cuda_is_explicit(
@@ -741,7 +871,7 @@ def test_native_cuda_complement_tail_stays_inside_the_oracle_envelope() -> None:
         (1, 64, 1, 17, 4096),
         # LRA defaults: N=4096, D=256, H=8, r=32.
         (1, 32, 8, 32, 4096),
-        # GenomicBenchmarks Mouse reaches N=4776 with the paper DNA width.
+        # Non-power-of-two multi-chunk length (N=4776) at r=16, H=4, d=32.
         (1, 16, 4, 32, 4776),
         # Cross-state groups cross the bounded producer-workspace boundary.
         (1, 32, 1, 17, 8193),
@@ -1995,3 +2125,142 @@ def test_compact_chain_and_conjugate_match_fp64_with_zero_spills(rank, columns, 
         for cache in kernel.device_caches.values():
             for compiled in cache[0].values():
                 assert compiled.n_spills == 0
+
+
+@pytest.mark.parametrize("mode", list(CoreMode))
+@pytest.mark.parametrize("rotary", [False, True])
+def test_recompute_readout_modes_match_gradients_cudagraph_and_retain_graph(
+    mode: CoreMode,
+    rotary: bool,
+) -> None:
+    _require_native_cuda()
+    torch.manual_seed(941)
+    base_model = MemSolve(
+        MemSolveConfig(
+            64, 2, rank=16, bias=True, core_mode=mode, rotary=rotary, recompute_readout=False
+        )
+    ).cuda()
+    if base_model.core_base_raw is not None:
+        with torch.no_grad():
+            base_model.core_base_raw.normal_(std=0.1)
+
+    x0 = torch.randn(4, 160, 64, device="cuda", dtype=torch.bfloat16)
+    mask = torch.rand(4, 160, device="cuda") > 0.15
+    mask[0, -8:] = False
+    upstream = torch.randn_like(x0)
+
+    eager_results: dict[object, tuple[torch.Tensor, ...]] = {}
+    for policy in (False, "auto", True):
+        layer = copy.deepcopy(base_model)
+        layer.recompute_readout = policy
+        x = x0.detach().clone().requires_grad_(True)
+        out = layer(x, mask, implementation="cuda")
+        grads_first = torch.autograd.grad(
+            out, (x, *layer.parameters()), upstream, retain_graph=True
+        )
+        grads_second = torch.autograd.grad(out, (x, *layer.parameters()), upstream)
+        for g1, g2 in zip(grads_first, grads_second):
+            torch.testing.assert_close(g1, g2, rtol=0, atol=0)
+        eager_results[policy] = (out.detach(), *(g.detach() for g in grads_second))
+
+        del out
+
+        # Verify CUDA Graph capture + replay parity for each recompute_readout policy.
+        graph_layer = copy.deepcopy(base_model)
+        graph_layer.recompute_readout = policy
+        gx = x0.detach().clone().requires_grad_(True)
+        gu = upstream.detach().clone()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                graph_layer.zero_grad(set_to_none=False)
+                if gx.grad is not None:
+                    gx.grad.zero_()
+                gout = graph_layer(gx, mask, implementation="cuda")
+                gout.backward(gu)
+                del gout
+        torch.cuda.current_stream().wait_stream(s)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            graph_layer.zero_grad(set_to_none=False)
+            gx.grad.zero_()
+            gout = graph_layer(gx, mask, implementation="cuda")
+            gout.backward(gu)
+        gx.detach().copy_(x0)
+        gu.copy_(upstream)
+        graph.replay()
+        graph_grads = (gx.grad, *(p.grad for p in graph_layer.parameters()))
+        torch.testing.assert_close(gout, eager_results[policy][0], rtol=1e-4, atol=1e-4)
+        for gg, eg in zip(graph_grads, eager_results[policy][1:]):
+            assert gg is not None
+            _assert_mixed_close(gg, eg, limit=2e-4)
+
+    for policy in ("auto", True):
+        for got, ref in zip(eager_results[policy], eager_results[False]):
+            torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_recompute_readout_saved_activation_memory_and_auto_threshold() -> None:
+    _require_native_cuda()
+    torch.manual_seed(947)
+    dim, heads, rank = 512, 8, 32
+    layer = MemSolve(MemSolveConfig(dim, heads, rank=rank, bias=True, recompute_readout=False)).cuda()
+
+    def measure_saved_bytes(batch: int, length: int, policy: bool | str) -> tuple[int, int]:
+        layer.recompute_readout = policy
+        layer.zero_grad(set_to_none=True)
+        x = torch.randn(batch, length, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        # Warm up once
+        y_warm = layer(x, implementation="cuda")
+        y_warm.sum().backward()
+        layer.zero_grad(set_to_none=True)
+        x.grad = None
+        torch.cuda.synchronize()
+
+        storages: dict[int, int] = {}
+
+        def pack(t: torch.Tensor) -> torch.Tensor:
+            ptr = t.untyped_storage().data_ptr()
+            if ptr:
+                storages[ptr] = max(storages.get(ptr, 0), t.untyped_storage().nbytes())
+            return t
+
+        base_alloc = torch.cuda.memory_allocated()
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            out = layer(x, implementation="cuda")
+        # Exclude output tensor storage if shared, measure live allocator delta while graph is held
+        live_alloc = torch.cuda.memory_allocated() - base_alloc - out.untyped_storage().nbytes()
+        hook_bytes = sum(storages.values())
+        out.sum().backward()
+        return hook_bytes, live_alloc
+
+    # 1. Below auto threshold: N = 256 <= 512 (even when B*N = 4*256 = 1024 > 512)
+    small_false_hook, small_false_alloc = measure_saved_bytes(4, 256, False)
+    small_auto_hook, small_auto_alloc = measure_saved_bytes(4, 256, "auto")
+    small_true_hook, small_true_alloc = measure_saved_bytes(4, 256, True)
+    expected_small_saving = 2 * 4 * 256 * dim  # 1,048,576 B (BF16 mixed [4, 256, 512])
+    assert small_auto_hook == small_false_hook
+    assert small_auto_alloc == small_false_alloc
+    assert small_false_hook - small_true_hook == expected_small_saving
+    assert small_false_alloc - small_true_alloc == expected_small_saving
+
+    # 2. Above auto threshold: N = 1024 > 512
+    large_false_hook, large_false_alloc = measure_saved_bytes(2, 1024, False)
+    large_auto_hook, large_auto_alloc = measure_saved_bytes(2, 1024, "auto")
+    large_true_hook, large_true_alloc = measure_saved_bytes(2, 1024, True)
+    expected_large_saving = 2 * 2 * 1024 * dim  # 2,097,152 B (2.0 MiB)
+    assert large_auto_hook == large_true_hook
+    assert large_auto_alloc == large_true_alloc
+    assert large_false_hook - large_true_hook == expected_large_saving
+    assert large_false_alloc - large_true_alloc == expected_large_saving
+
+    # 3. Verify wide-rank + wide-head _readout has 0 register spills (e.g. r=64, head_dim=128)
+    wide = MemSolve(MemSolveConfig(256, 2, rank=64, rotary=True, recompute_readout=True)).cuda()
+    xw = torch.randn(2, 129, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    wide(xw, implementation="cuda").sum().backward()
+    readout_kernel = cuda._no_frame_kernels()[1]
+    for cache in readout_kernel.device_caches.values():
+        for compiled in cache[0].values():
+            assert compiled.n_spills == 0
+

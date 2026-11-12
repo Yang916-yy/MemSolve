@@ -23,18 +23,20 @@ Because $I_r + A^\top A$ and $I_r + J$ are strictly positive/accretive ($r \time
 - **Vision Backbone & Dense Prediction**: With a plain non-hierarchical 12-layer ViT backbone, **MemSolve-ViT** reaches **74.7%** (Tiny, 5M), **81.0%** (Small, 20M), and **82.7%** (Base, 78M) Top-1 accuracy on ImageNet-1K. Paired with ViT-Adapter, it achieves **44.7 / 40.6** (Small) and **46.6 / 41.8** (Base) box / mask AP on COCO (Mask R-CNN 1×), and **47.2** (Small) / **48.3** (Base) mIoU on ADE20K (UPerNet 160k).
 - **Bidirectional Language Pretraining**: Pretrained on C4 and fine-tuned on GLUE under the LION M2-BERT budget, **MemSolve-BERT** (112M) achieves an average GLUE score of **81.9** (**81.5** with parameter-free RoVE, 111M).
 - **Long Range Arena (LRA)**: Across all 5 LRA tasks under a controlled encoder with Rotary Value Encoding (RoVE), MemSolve reaches **67.35%** mean accuracy—outperforming softmax attention (66.71%) and every tested linear, kernel, and token-routing baseline.
-- **Hardware Efficiency**: On an NVIDIA A800-80GB GPU under BF16 autocast and CUDA Graphs, full forward+backward execution at 8,192 tokens is **7.8× faster than FlashAttention-2** and **8.1× faster than BiMamba** (and **28.9×** / **9.2×** faster at 32,768 tokens).
+- **Hardware Efficiency**: On an NVIDIA A800-80GB GPU under BF16 autocast and CUDA Graphs, full forward+backward execution (`recompute_readout=False`) is **7.9×** and **8.3×** faster than FlashAttention-2 and fused BiMamba-v2 at 8,192 tokens, and **29.0×** and **9.2×** faster at 32,768 tokens—outperforming FlashAttention-2 across all tested lengths from 128 to 32,768 tokens while using **11%** and **57%** less peak memory at 32,768 tokens (optional `recompute_readout="auto"` reduces 32,768-token peak memory by **17%** and **60%** at **28.2×** speedup).
 
 ## Installation
 
-Requires Python 3.10–3.12 and PyTorch 2.14 with CUDA 13.2, NVIDIA MathDx 26.06.1, and CMake $\ge 3.25$ to build the native cuSOLVERDx/cuBLASLt extension (the pure-PyTorch reference implementation works out of the box without compiling):
+Requires Python 3.10–3.12 and PyTorch 2.14. Building the native CUDA C++/cuBLASLt extension requires a matching CUDA toolkit ($\ge 12.0$) and CMake $\ge 3.25$, with no external SDK required by default (`MEMSOLVE_USE_MATHDX=ON` optionally builds with NVIDIA MathDx 26.06.1 on CUDA 13.2; the pure-PyTorch reference implementation works out of the box without compiling):
 
 ```bash
 git clone https://github.com/Yang916-yy/MemSolve.git
 cd MemSolve
 python -m pip install -e '.[vision]'
-PYTHON=python MEMSOLVE_CUDA_ARCHITECTURES=80 bash tools/build_cuda.sh
+PYTHON=python bash tools/build_cuda.sh
 ```
+
+By default, `bash tools/build_cuda.sh` compiles a self-contained multi-arch `80;90a` fatbinary (Ampere `SM80` + Hopper `SM90a` + embedded PTX) on both `x86_64` and `aarch64` (`MEMSOLVE_CUDA_ARCHITECTURES` overrides the target SMs).
 
 Optional extras:
 - `pip install -e '.[nlp]'` for C4 MLM pretraining and GLUE fine-tuning.
@@ -76,7 +78,7 @@ model = timm.create_model(
 ).cuda()
 ```
 
-To train on ImageNet-1K (see [docs/IMAGENET_VIT3.md](docs/IMAGENET_VIT3.md)):
+Registered `timm` entrypoints cover `memsolve_vit_tiny`, `memsolve_vit_small`, `memsolve_vit_base`, and `memsolve_vit_large` (also available via `integrations.timm.create_memsolve_vit_variant`). To train on ImageNet-1K (see [docs/IMAGENET_VIT3.md](docs/IMAGENET_VIT3.md)):
 
 ```bash
 torchrun --standalone --nproc_per_node=2 experiments/train_imagenet.py \
@@ -107,6 +109,8 @@ python -m benchmarks.benchmark_ball --operator memsolve --mode train \
   --dtype bfloat16 --graph --warmup 20 --steps 50 --repeats 7
 ```
 
+`benchmark_ball` defaults to `--recompute-readout false` to match uncheckpointed FlashAttention-2 and BiMamba-v2; pass `--recompute-readout auto` (the `MemSolveConfig` default for $N > 512$) or `true` to benchmark readout recomputation.
+
 Run the test suite (see [tests/README.md](tests/README.md)):
 
 ```bash
@@ -117,7 +121,7 @@ python -m pytest -q
 
 | Path | Description |
 | --- | --- |
-| [`memsolve/`](memsolve/), [`csrc/`](csrc/) | Core `MemSolve` module, exact PyTorch reference, and Triton/cuSOLVERDx/cuBLASLt CUDA fast path |
+| [`memsolve/`](memsolve/), [`csrc/`](csrc/) | Core `MemSolve` module, exact PyTorch reference, and Triton + native CUDA C++ (SM80/SM90a, cuBLASLt, optional MathDx) fast path |
 | [`integrations/`](integrations/) | `timm` vision backbones, Hugging Face `MemSolveBert`, OpenMMLab ViT-Adapter, and `SequenceParallel` |
 | [`experiments/`](experiments/) | Training & evaluation entrypoints for ImageNet, COCO/ADE20K, C4 MLM, GLUE, and LRA |
 | [`benchmarks/`](benchmarks/), [`tests/`](tests/) | Operator latency/memory benchmark harness and unit/numerical test suite |

@@ -144,17 +144,13 @@ class _MLMSumLoss(torch.nn.Module):
 
 
 def prepare_nlp_compile(model):
-    """Fuse the BERT scaffold while retaining MemSolve's native precision policy."""
-    from memsolve import MemSolve
+    """Fuse full BERT blocks including MemSolve custom ops while preserving precision casts."""
     import torch._functorch.config as functorch_config
     import torch._dynamo.config as dynamo_config
     import torch._inductor.config as inductor_config
     functorch_config.backward_pass_autocast = "off"
     dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 2 * model.config.num_hidden_layers + 4)
     inductor_config.emulate_precision_casts = True
-    for module in model.modules():
-        if isinstance(module, MemSolve):
-            module.forward = torch.compiler.disable(module.forward)
 
 
 def prepare_mlm_graph(model, sample_batch, *, compile_model=True):
